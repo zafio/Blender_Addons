@@ -51,10 +51,6 @@ class TIME_HT_header(Header):
             row.prop(scene, "frame_current", text="")
             row.prop(scene, "frame_preview_end", text="")
 
-
-
-        layout.separator()
-
         row = layout.row(align=True)
         row.operator("screen.frame_jump", text="", icon='REW').end = False
         row.operator("screen.keyframe_jump", text="", icon='PREV_KEYFRAME').next = False
@@ -76,7 +72,7 @@ class TIME_HT_header(Header):
         row.operator("screen.keyframe_jump", text="", icon='NEXT_KEYFRAME').next = True
         row.operator("screen.frame_jump", text="", icon='FF').end = True
 
-        layout.prop(scene.render, "fps", text="") 
+        layout.prop(scene.render, "fps", text="")
 
         layout.prop(scene, "sync_mode", text="")
 
