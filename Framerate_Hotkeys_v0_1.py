@@ -3,7 +3,7 @@ bl_info = {
     'author': 'Julio Iglesias',
     'version': (0.1),
     'blender': (2, 75, 2),
-    'location': 'Z & X keys at Timeline',
+    'location': 'Q & W keys at Timeline',
     'warning': '',
     'description': 'Increases / Decreases Framerate',
     'wiki_url': '',
@@ -69,14 +69,14 @@ def register():
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
-        kmi = km.keymap_items.new('render.set_fps_increase', 'X', 'PRESS')
+        kmi = km.keymap_items.new('render.set_fps_increase', 'W', 'PRESS')
 
     bpy.utils.register_class(RENDER_OT_set_fps_decrement)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
-        kmi = km.keymap_items.new('render.set_fps_decrease', 'Z', 'PRESS')
+        kmi = km.keymap_items.new('render.set_fps_decrease', 'Q', 'PRESS')
 
 def unregister():
     bpy.utils.unregister_class(RENDER_OT_set_fps_increment)
