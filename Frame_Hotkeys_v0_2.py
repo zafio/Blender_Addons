@@ -3,9 +3,9 @@ bl_info = {
     'author': 'Julio Iglesias',
     'version': (0, 2),
     'blender': (2, 75, 2),
-    'location': '1/2 (framerate), W/E (previous/next frame) at Timeline',
+    'location': '1/2 (framerate), W/E (previous/next frame), Q (toggle preview range) at Timeline',
     'warning': '',
-    'description': 'Adds hotkeys to Increase/Decrease Framerate & Previous/Next Frame',
+    'description': 'Adds hotkeys to Increase/Decrease Framerate, Previous/Next Frame and toggle Preview Range',
     'wiki_url': '',
     'tracker_url': '',
     'category': 'Render'}
@@ -61,9 +61,26 @@ class RENDER_OT_set_fps_decrease(bpy.types.Operator):
 
         return {'FINISHED'}
 
-class SCREEN_OT_next_frame(bpy.types.Operator):
+class TIMELINE_OT_toggle_preview_range(bpy.types.Operator):
+    '''Toggle Preview Range'''
+    bl_idname = "timeline.toggle_preview_range"
+    bl_label = "Toggle Preview Range"
+
+    def execute(self, context):
+
+        scene = bpy.context.scene
+
+        if context.area.type != 'VIEW_3D' and scene.use_preview_range == True:
+            scene.use_preview_range = False
+
+        elif context.area.type != 'VIEW_3D' and scene.use_preview_range == False:
+            scene.use_preview_range = True
+
+        return {'FINISHED'}
+
+class TIMELINE_OT_next_frame(bpy.types.Operator):
     '''Next Frame'''
-    bl_idname = "screen.next_frame"
+    bl_idname = "timeline.next_frame"
     bl_label = "Next Frame"
 
     def execute(self, context):
@@ -84,9 +101,9 @@ class SCREEN_OT_next_frame(bpy.types.Operator):
 
         return {'FINISHED'}
 
-class SCREEN_OT_previous_frame(bpy.types.Operator):
+class TIMELINE_OT_previous_frame(bpy.types.Operator):
     '''Next Frame'''
-    bl_idname = "screen.previous_frame"
+    bl_idname = "timeline.previous_frame"
     bl_label = "Previous Frame"
 
     def execute(self, context):
@@ -108,6 +125,7 @@ class SCREEN_OT_previous_frame(bpy.types.Operator):
         return {'FINISHED'}
 
 def register():
+
     bpy.utils.register_class(RENDER_OT_set_fps_increase)
 
     kc = bpy.context.window_manager.keyconfigs.addon
@@ -122,20 +140,27 @@ def register():
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
         kmi = km.keymap_items.new('render.set_fps_decrease', 'TWO', 'PRESS')
 
-    bpy.utils.register_class(SCREEN_OT_next_frame)
+    bpy.utils.register_class(TIMELINE_OT_toggle_preview_range)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
-        kmi = km.keymap_items.new('screen.next_frame', 'E', 'PRESS')
+        kmi = km.keymap_items.new('timeline.toggle_preview_range', 'Q', 'PRESS')
 
-
-    bpy.utils.register_class(SCREEN_OT_previous_frame)
+    bpy.utils.register_class(TIMELINE_OT_next_frame)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
-        kmi = km.keymap_items.new('screen.previous_frame', 'W', 'PRESS')
+        kmi = km.keymap_items.new('timeline.next_frame', 'E', 'PRESS')
+
+
+    bpy.utils.register_class(TIMELINE_OT_previous_frame)
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
+        kmi = km.keymap_items.new('timeline.previous_frame', 'W', 'PRESS')
 
 def unregister():
     bpy.utils.unregister_class(RENDER_OT_set_fps_increase)
@@ -156,16 +181,25 @@ def unregister():
                 km.keymap_items.remove(kmi)
                 break
 
-    bpy.utils.unregister_class(SCREEN_OT_next_frame)
+    bpy.utils.unregister_class(TIMELINE_OT_toggle_preview_range)
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps["Timeline"]
         for kmi in km.keymap_items:
-            if kmi.idname == 'screen.next_frame':
+            if kmi.idname == 'timeline.toggle_preview_range':
                 km.keymap_items.remove(kmi)
                 break
 
-    bpy.utils.unregister_class(SCREEN_OT_previous_frame)
+    bpy.utils.unregister_class(TIMELINE_OT_next_frame)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Timeline"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'timeline.next_frame':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_previous_frame)
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps["Timeline"]
