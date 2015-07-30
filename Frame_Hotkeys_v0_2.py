@@ -3,7 +3,7 @@ bl_info = {
     'author': 'Julio Iglesias',
     'version': (0, 2),
     'blender': (2, 75, 2),
-    'location': '1/2 (framerate), W/E (previous/next frame), Q (toggle preview range) at Timeline',
+    'location': '1/2 (framerate), W/E (previous/next frame), Q (toggle preview range) at Timeline, Graph & Dopesheet editors',
     'warning': '',
     'description': 'Adds hotkeys to Increase/Decrease Framerate, Previous/Next Frame and toggle Preview Range',
     'wiki_url': '',
@@ -133,11 +133,31 @@ def register():
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
         kmi = km.keymap_items.new('render.set_fps_increase', 'THREE', 'PRESS')
 
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Graph Editor", space_type="GRAPH_EDITOR")
+        kmi = km.keymap_items.new('render.set_fps_increase', 'THREE', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
+        kmi = km.keymap_items.new('render.set_fps_increase', 'THREE', 'PRESS')
+
     bpy.utils.register_class(RENDER_OT_set_fps_decrease)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
+        kmi = km.keymap_items.new('render.set_fps_decrease', 'TWO', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Graph Editor", space_type="GRAPH_EDITOR")
+        kmi = km.keymap_items.new('render.set_fps_decrease', 'TWO', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
         kmi = km.keymap_items.new('render.set_fps_decrease', 'TWO', 'PRESS')
 
     bpy.utils.register_class(TIMELINE_OT_toggle_preview_range)
@@ -147,6 +167,16 @@ def register():
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
         kmi = km.keymap_items.new('timeline.toggle_preview_range', 'Q', 'PRESS')
 
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Graph Editor", space_type="GRAPH_EDITOR")
+        kmi = km.keymap_items.new('timeline.toggle_preview_range', 'Q', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
+        kmi = km.keymap_items.new('timeline.toggle_preview_range', 'Q', 'PRESS')
+
     bpy.utils.register_class(TIMELINE_OT_next_frame)
 
     kc = bpy.context.window_manager.keyconfigs.addon
@@ -154,6 +184,15 @@ def register():
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
         kmi = km.keymap_items.new('timeline.next_frame', 'E', 'PRESS')
 
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Graph Editor", space_type="GRAPH_EDITOR")
+        kmi = km.keymap_items.new('timeline.next_frame', 'E', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
+        kmi = km.keymap_items.new('timeline.next_frame', 'E', 'PRESS')
 
     bpy.utils.register_class(TIMELINE_OT_previous_frame)
 
@@ -162,11 +201,39 @@ def register():
         km = kc.keymaps.new(name="Timeline", space_type="TIMELINE")
         kmi = km.keymap_items.new('timeline.previous_frame', 'W', 'PRESS')
 
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Graph Editor", space_type="GRAPH_EDITOR")
+        kmi = km.keymap_items.new('timeline.previous_frame', 'W', 'PRESS')
+
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
+        kmi = km.keymap_items.new('timeline.previous_frame', 'W', 'PRESS')
+
 def unregister():
     bpy.utils.unregister_class(RENDER_OT_set_fps_increase)
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps["Timeline"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'render.set_fps_increase':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(RENDER_OT_set_fps_increase)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Graph Editor"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'render.set_fps_increase':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(RENDER_OT_set_fps_increase)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Dopesheet"]
         for kmi in km.keymap_items:
             if kmi.idname == 'render.set_fps_increase':
                 km.keymap_items.remove(kmi)
@@ -181,10 +248,46 @@ def unregister():
                 km.keymap_items.remove(kmi)
                 break
 
+    bpy.utils.unregister_class(RENDER_OT_set_fps_decrease)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Graph Editor"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'render.set_fps_decrease':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(RENDER_OT_set_fps_decrease)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Dopesheet"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'render.set_fps_decrease':
+                km.keymap_items.remove(kmi)
+                break
+
     bpy.utils.unregister_class(TIMELINE_OT_toggle_preview_range)
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps["Timeline"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'timeline.toggle_preview_range':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_toggle_preview_range)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Graph Editor"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'timeline.toggle_preview_range':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_toggle_preview_range)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Dopesheet"]
         for kmi in km.keymap_items:
             if kmi.idname == 'timeline.toggle_preview_range':
                 km.keymap_items.remove(kmi)
@@ -199,10 +302,46 @@ def unregister():
                 km.keymap_items.remove(kmi)
                 break
 
+    bpy.utils.unregister_class(TIMELINE_OT_next_frame)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Graph Editor"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'timeline.next_frame':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_next_frame)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Dopesheet"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'timeline.next_frame':
+                km.keymap_items.remove(kmi)
+                break
+
     bpy.utils.unregister_class(TIMELINE_OT_previous_frame)
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps["Timeline"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'previous.next_frame':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_previous_frame)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Graph Editor"]
+        for kmi in km.keymap_items:
+            if kmi.idname == 'previous.next_frame':
+                km.keymap_items.remove(kmi)
+                break
+
+    bpy.utils.unregister_class(TIMELINE_OT_previous_frame)
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        km = kc.keymaps["Dopesheet"]
         for kmi in km.keymap_items:
             if kmi.idname == 'previous.next_frame':
                 km.keymap_items.remove(kmi)
