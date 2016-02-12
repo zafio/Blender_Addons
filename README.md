@@ -1,3 +1,10 @@
+####RENAME TOOLS (coded by Luca Scheller)
+Adds a modal operator to rename objects, and automatically renames object suffixes (based on Unity3D LOD naming) when duplicating an object: HI > LOD0 > LOD1 > LOD2... renaming also the mesh data name.
+
+- CTRL+ALT+R = runs the rename tool (CTRL+ALT+R again deletes the whole name)
+- Enter & LMB = Accept
+- Esc & RMB = Cancel
+
 ####FRAME HOTKEYS
 Adds hotkeys to improve control over animation playback. At Timeline, Graph or Dopesheet Editors:
 
