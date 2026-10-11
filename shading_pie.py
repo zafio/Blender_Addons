@@ -189,6 +189,11 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         # West
         row = pie.row(align=True)
         row.scale_y = 1.5
+        # Square swatch: the 3D Viewport theme "Wire" color, which is what
+        # Wireframe shading (and the wireframe overlay) draws with.
+        swatch = row.row(align=True)
+        swatch.ui_units_x = 1.5
+        swatch.prop(context.preferences.themes[0].view_3d, "wire", text="")
         row.operator('sna.set_wiresolid', text='WireSolid', icon='SHADING_WIRE',
                      depress=(space.shading.type == 'SOLID' and space.overlay.show_wireframes))
         row.operator('sna.set_wireframe_shad_5cd18', text='Wire')
