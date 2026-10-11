@@ -346,6 +346,11 @@ def register():
         kmi.properties.name = PIE_MENU_ID
         addon_keymaps.append((km, kmi))
 
+        # Ctrl + Alt + W: toggle WireSolid
+        kmi = km.keymap_items.new('sna.set_wiresolid', 'W', 'PRESS',
+                                  ctrl=True, alt=True, shift=False)
+        addon_keymaps.append((km, kmi))
+
 
 def unregister():
     _remove_keymaps()
