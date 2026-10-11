@@ -142,6 +142,20 @@ class SNA_OT_Set_Wireframe_Shad_5Cd18(_ShadingOperator):
         space.shading.type = 'WIREFRAME'
 
 
+class SNA_OT_Set_Wiresolid(_ShadingOperator):
+    bl_idname = "sna.set_wiresolid"
+    bl_label = "WireSolid"
+    bl_description = "Solid shading with the wireframe overlay on top (toggle)"
+
+    def apply(self, space):
+        active = space.shading.type == 'SOLID' and space.overlay.show_wireframes
+        if active:
+            space.overlay.show_wireframes = False
+        else:
+            space.shading.type = 'SOLID'
+            space.overlay.show_wireframes = True
+
+
 class SNA_OT_Set_Solid_Shad_A809D(_ShadingOperator):
     bl_idname = "sna.set_solid_shad_a809d"
     bl_label = "Solid"
@@ -173,7 +187,11 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         pie = self.layout.menu_pie()
 
         # West
-        pie.operator('sna.set_wireframe_shad_5cd18', text='Wireframe', icon='SHADING_WIRE')
+        row = pie.row(align=True)
+        row.scale_y = 1.5
+        row.operator('sna.set_wiresolid', text='WireSolid',
+                     depress=(space.shading.type == 'SOLID' and space.overlay.show_wireframes))
+        row.operator('sna.set_wireframe_shad_5cd18', text='Wireframe', icon='SHADING_WIRE')
 
         # East
         row = pie.row(align=True)
@@ -221,6 +239,7 @@ classes = (
     SNA_OT_Set_Flat_Shad_0E168,
     SNA_OT_Set_Matcap_94Fb0,
     SNA_OT_Set_Wireframe_Shad_5Cd18,
+    SNA_OT_Set_Wiresolid,
     SNA_OT_Set_Solid_Shad_A809D,
     SNA_OT_Set_Solid_Vcol_75D4A,
 )
