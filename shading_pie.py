@@ -189,9 +189,9 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         # West
         row = pie.row(align=True)
         row.scale_y = 1.5
-        row.operator('sna.set_wiresolid', text='WireSolid',
+        row.operator('sna.set_wiresolid', text='WireSolid', icon='SHADING_WIRE',
                      depress=(space.shading.type == 'SOLID' and space.overlay.show_wireframes))
-        row.operator('sna.set_wireframe_shad_5cd18', text='Wireframe', icon='SHADING_WIRE')
+        row.operator('sna.set_wireframe_shad_5cd18', text='Wire')
 
         # East
         row = pie.row(align=True)
