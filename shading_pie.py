@@ -326,7 +326,7 @@ def register():
         start = (0.0, 0.0, 0.0)
     bpy.types.WindowManager.sna_wire_color = bpy.props.FloatVectorProperty(
         name="Wire Color", description="Wire color used in Wireframe mode",
-        subtype='COLOR', size=3, min=0.0, max=1.0, default=start,
+        subtype='COLOR', size=3, min=0.0, max=1.0, default=_hex_to_linear('#A1D08B'),
         update=_on_wire_color_update)
     bpy.types.WindowManager.sna_wiresolid_color = bpy.props.FloatVectorProperty(
         name="WireSolid Color", description="Wire color used in WireSolid mode",
