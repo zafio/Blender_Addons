@@ -1,93 +1,97 @@
 import bpy
 
 bl_info = {
-    "name": "Wire Toggle (OJB display TYPE)",
-    "author": "Various",
-    "version": (1, 1),
-    "blender": (2, 80, 0),
-    "location": "W & ALT + W",
-    "description": "Toggles wire object display type and over solid",
+    "name": "Wire Toggle (OBJ display TYPE)",
+    "author": "Zafio",
+    "version": (1, 2),
+    "blender": (4, 5, 0),
+    "location": "3D Viewport: W / Alt + W",
+    "description": "Toggles object display type (Wire/Textured) and wire over solid",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "",
     "tracker_url": "",
-    "category": "View3D"
-    }
+    "category": "3D View",
+}
+
+# (keymap, keymap_item) pairs created by this add-on, so we only ever remove our own.
+addon_keymaps = []
+
 
 class OBJECT_OT_displaytype_toggle(bpy.types.Operator):
-    '''Toggle wire display type'''
+    """Toggle wire display type"""
     bl_idname = "object.displaytype_toggle"
     bl_label = "Toggle Wire Display Type"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return context.active_object
+        return context.active_object is not None
 
     def execute(self, context):
-
         ob = context.active_object
-
-        if ob.display_type == 'WIRE':
-            ob.display_type = 'TEXTURED'
-        else:
-            ob.display_type = 'WIRE'
-
+        ob.display_type = 'TEXTURED' if ob.display_type == 'WIRE' else 'WIRE'
         return {'FINISHED'}
 
 
 class OBJECT_OT_wire_toggle(bpy.types.Operator):
-    '''Toggle wire over solid'''
+    """Toggle wire over solid"""
     bl_idname = "object.wire_toggle"
     bl_label = "Toggle Wire over Solid"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return context.active_object
+        return context.active_object is not None
 
     def execute(self, context):
-
         ob = context.active_object
-
-        if ob.show_wire == False:
-            ob.show_wire = True
-        else:
-            ob.show_wire = False
-
+        ob.show_wire = not ob.show_wire
         return {'FINISHED'}
 
+
+classes = (
+    OBJECT_OT_displaytype_toggle,
+    OBJECT_OT_wire_toggle,
+)
+
+
+def _remove_keymaps():
+    """Remove only the keymap items this add-on created."""
+    for km, kmi in addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except (RuntimeError, ReferenceError):
+            # Item already gone (e.g. keymap was reset by the user).
+            pass
+    addon_keymaps.clear()
+
+
 def register():
-    bpy.utils.register_class(OBJECT_OT_displaytype_toggle)
+    for cls in classes:
+        bpy.utils.register_class(cls)
 
-    kc = bpy.context.window_manager.keyconfigs.addon
+    # Make sure a previous registration (script re-run, failed unregister)
+    # can never leave duplicate entries behind.
+    _remove_keymaps()
+
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon if wm else None
     if kc:
-        km = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
-        kmi = km.keymap_items.new('object.displaytype_toggle', 'W', 'PRESS', alt=False)
-
-    bpy.utils.register_class(OBJECT_OT_wire_toggle)
-
-    kc = bpy.context.window_manager.keyconfigs.addon
-    if kc:
-        km = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
-        kmi = km.keymap_items.new('object.wire_toggle', 'W', 'PRESS', alt=True)
+        km = kc.keymaps.new(name="Object Mode", space_type='EMPTY')
+        for idname, alt in (
+            ("object.displaytype_toggle", False),
+            ("object.wire_toggle", True),
+        ):
+            kmi = km.keymap_items.new(idname, 'W', 'PRESS', alt=alt)
+            addon_keymaps.append((km, kmi))
 
 
 def unregister():
-    bpy.utils.unregister_class(OBJECT_OT_displaytype_toggle)
-    kc = bpy.context.window_manager.keyconfigs.addon
-    if kc:
-        km = kc.keymaps["3D View"]
-        for kmi in km.keymap_items:
-            if kmi.idname == 'object.displaytype_toggle':
-                km.keymap_items.remove(kmi)
+    _remove_keymaps()
 
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
 
-    bpy.utils.unregister_class(OBJECT_OT_wire_toggle)
-    kc = bpy.context.window_manager.keyconfigs.addon
-    if kc:
-        km = kc.keymaps["3D View"]
-        for kmi in km.keymap_items:
-            if kmi.idname == 'object.wire_toggle':
-                km.keymap_items.remove(kmi)
-                break
 
 if __name__ == "__main__":
     register()
