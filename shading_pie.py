@@ -79,6 +79,7 @@ def _on_solid_color_update(self, context):
     space.shading.type = 'SOLID'
     space.shading.color_type = 'SINGLE'
     space.shading.single_color = self.sna_solid_color
+    space.overlay.show_wireframes = False  # leave WireSolid
 
 
 class _ShadingOperator(bpy.types.Operator):
@@ -213,6 +214,7 @@ class SNA_OT_Set_Solid_Shad_A809D(_ShadingOperator):
         space.shading.type = 'SOLID'
         space.shading.light = 'STUDIO'
         space.shading.color_type = 'MATERIAL'
+        space.overlay.show_wireframes = False  # leave WireSolid
 
 
 class SNA_OT_Set_Solid_Vcol_75D4A(_ShadingOperator):
