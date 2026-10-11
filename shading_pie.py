@@ -223,14 +223,14 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         swatch = row.row(align=True)
         swatch.ui_units_x = 1.5
         swatch.prop(wm, "sna_wiresolid_color", text="")
-        row.operator('sna.set_wiresolid', text='WireSolid', icon='SHADING_WIRE',
+        row.operator('sna.set_wiresolid', text='WireSolid',
                      depress=(space.shading.type == 'SOLID' and space.overlay.show_wireframes))
 
         # Square swatch: wire color used in Wireframe mode only
         swatch = row.row(align=True)
         swatch.ui_units_x = 1.5
         swatch.prop(wm, "sna_wire_color", text="")
-        row.operator('sna.set_wireframe_shad_5cd18', text='Wire')
+        row.operator('sna.set_wireframe_shad_5cd18', text='Wireframe')
 
         # East
         row = pie.row(align=True)
