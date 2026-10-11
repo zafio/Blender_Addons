@@ -61,6 +61,16 @@ def _on_wire_color_update(self, context):
     _apply_wire_color(context)
 
 
+def _on_solid_color_update(self, context):
+    """Picking a Solid color turns on the viewport's Single color mode."""
+    space = context.space_data
+    if space is None or space.type != 'VIEW_3D':
+        return
+    space.shading.type = 'SOLID'
+    space.shading.color_type = 'SINGLE'
+    space.shading.single_color = self.sna_solid_color
+
+
 class _ShadingOperator(bpy.types.Operator):
     """Base class: only runs inside a 3D Viewport."""
     bl_options = {"REGISTER", "UNDO"}
@@ -212,13 +222,12 @@ class SNA_MT_E8F7C(bpy.types.Menu):
 
     def draw(self, context):
         space = context.space_data
+        wm = context.window_manager
         pie = self.layout.menu_pie()
 
         # West
         row = pie.row(align=True)
         row.scale_y = 1.5
-        wm = context.window_manager
-
         # Square swatch: wire color used in WireSolid mode only
         swatch = row.row(align=True)
         swatch.ui_units_x = 1.5
@@ -235,6 +244,10 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         row = pie.row(align=True)
         row.scale_x = 0.95
         row.scale_y = 1.5
+        # Square swatch: picking a color switches Solid to a custom Single color
+        swatch = row.row(align=True)
+        swatch.ui_units_x = 1.5
+        swatch.prop(wm, "sna_solid_color", text="")
         row.operator('sna.set_solid_shad_a809d', text='Solid')
         row.operator('sna.set_solid_vcol_75d4a', text='SVcol')
         row.operator('sna.set_matcap_94fb0', text='Matcap')
@@ -310,6 +323,11 @@ def register():
         subtype='COLOR', size=3, min=0.0, max=1.0, default=start,
         update=_on_wire_color_update)
 
+    bpy.types.WindowManager.sna_solid_color = bpy.props.FloatVectorProperty(
+        name="Solid Color", description="Custom Single color for Solid mode",
+        subtype='COLOR', size=3, min=0.0, max=1.0, default=(0.8, 0.8, 0.8),
+        update=_on_solid_color_update)
+
     _remove_keymaps()
 
     wm = bpy.context.window_manager
@@ -327,6 +345,7 @@ def unregister():
 
     del bpy.types.WindowManager.sna_wire_color
     del bpy.types.WindowManager.sna_wiresolid_color
+    del bpy.types.WindowManager.sna_solid_color
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
