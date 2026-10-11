@@ -34,6 +34,33 @@ addon_keymaps = []
 PIE_MENU_ID = "SNA_MT_E8F7C"
 
 
+def _apply_wire_color(context):
+    """Copy the swatch color for the active wire mode into the theme's Wire color.
+
+    Blender has one wire color (3D Viewport theme "Wire") shared by Wireframe
+    shading and the wireframe overlay, so the two swatches are stored by this
+    add-on and swapped into the theme depending on which mode is showing.
+    """
+    space = context.space_data
+    if space is None or space.type != 'VIEW_3D':
+        return
+    wm = context.window_manager
+    if space.shading.type == 'WIREFRAME':
+        color = wm.sna_wire_color
+    elif space.shading.type == 'SOLID' and space.overlay.show_wireframes:
+        color = wm.sna_wiresolid_color
+    else:
+        return
+    try:
+        context.preferences.themes[0].view_3d.wire = color
+    except (AttributeError, IndexError):
+        pass
+
+
+def _on_wire_color_update(self, context):
+    _apply_wire_color(context)
+
+
 class _ShadingOperator(bpy.types.Operator):
     """Base class: only runs inside a 3D Viewport."""
     bl_options = {"REGISTER", "UNDO"}
@@ -47,6 +74,7 @@ class _ShadingOperator(bpy.types.Operator):
 
     def execute(self, context):
         self.apply(context.space_data)
+        _apply_wire_color(context)
         return {"FINISHED"}
 
 
@@ -189,13 +217,19 @@ class SNA_MT_E8F7C(bpy.types.Menu):
         # West
         row = pie.row(align=True)
         row.scale_y = 1.5
-        # Square swatch: the 3D Viewport theme "Wire" color, which is what
-        # Wireframe shading (and the wireframe overlay) draws with.
+        wm = context.window_manager
+
+        # Square swatch: wire color used in WireSolid mode only
         swatch = row.row(align=True)
         swatch.ui_units_x = 1.5
-        swatch.prop(context.preferences.themes[0].view_3d, "wire", text="")
+        swatch.prop(wm, "sna_wiresolid_color", text="")
         row.operator('sna.set_wiresolid', text='WireSolid', icon='SHADING_WIRE',
                      depress=(space.shading.type == 'SOLID' and space.overlay.show_wireframes))
+
+        # Square swatch: wire color used in Wireframe mode only
+        swatch = row.row(align=True)
+        swatch.ui_units_x = 1.5
+        swatch.prop(wm, "sna_wire_color", text="")
         row.operator('sna.set_wireframe_shad_5cd18', text='Wire')
 
         # East
@@ -263,6 +297,20 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    # Start both swatches at the current theme wire color so nothing jumps.
+    try:
+        start = tuple(bpy.context.preferences.themes[0].view_3d.wire)[:3]
+    except (AttributeError, IndexError):
+        start = (0.0, 0.0, 0.0)
+    bpy.types.WindowManager.sna_wire_color = bpy.props.FloatVectorProperty(
+        name="Wire Color", description="Wire color used in Wireframe mode",
+        subtype='COLOR', size=3, min=0.0, max=1.0, default=start,
+        update=_on_wire_color_update)
+    bpy.types.WindowManager.sna_wiresolid_color = bpy.props.FloatVectorProperty(
+        name="WireSolid Color", description="Wire color used in WireSolid mode",
+        subtype='COLOR', size=3, min=0.0, max=1.0, default=start,
+        update=_on_wire_color_update)
+
     _remove_keymaps()
 
     wm = bpy.context.window_manager
@@ -277,6 +325,9 @@ def register():
 
 def unregister():
     _remove_keymaps()
+
+    del bpy.types.WindowManager.sna_wire_color
+    del bpy.types.WindowManager.sna_wiresolid_color
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
