@@ -61,6 +61,16 @@ def _on_wire_color_update(self, context):
     _apply_wire_color(context)
 
 
+def _hex_to_linear(hex_color):
+    """'#RRGGBB' -> linear RGB floats, so the picker shows the same hex."""
+    hex_color = hex_color.lstrip('#')
+    out = []
+    for i in (0, 2, 4):
+        c = int(hex_color[i:i + 2], 16) / 255.0
+        out.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    return tuple(out)
+
+
 def _on_solid_color_update(self, context):
     """Picking a Solid color turns on the viewport's Single color mode."""
     space = context.space_data
@@ -325,7 +335,7 @@ def register():
 
     bpy.types.WindowManager.sna_solid_color = bpy.props.FloatVectorProperty(
         name="Solid Color", description="Custom Single color for Solid mode",
-        subtype='COLOR', size=3, min=0.0, max=1.0, default=(0.8, 0.8, 0.8),
+        subtype='COLOR', size=3, min=0.0, max=1.0, default=_hex_to_linear('#81898E'),
         update=_on_solid_color_update)
 
     _remove_keymaps()
