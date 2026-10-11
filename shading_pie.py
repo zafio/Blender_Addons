@@ -5,371 +5,258 @@
 #
 # This program is distributed in the hope that it will be useful, but
 # WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 # General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 bl_info = {
-    "name" : "ShadingPieZ",
-    "author" : "Zafio", 
-    "description" : "Custom Shading Pie",
-    "blender" : (3, 0, 0),
-    "version" : (2, 0, 1),
-    "location" : "Z key",
-    "warning" : "",
-    "doc_url": "", 
-    "tracker_url": "", 
-    "category" : "3D View" 
+    "name": "ShadingPieZ",
+    "author": "Zafio",
+    "description": "Custom Shading Pie",
+    "blender": (4, 5, 0),
+    "version": (2, 1, 0),
+    "location": "Z key",
+    "warning": "",
+    "doc_url": "",
+    "tracker_url": "",
+    "category": "3D View",
 }
 
 
 import bpy
-import bpy.utils.previews
 
 
-addon_keymaps = {}
-_icons = None
-shadingpiez = {'sna_backfacebool': False, 'sna_faceorientbool': False, }
-class SNA_OT_Toggle_Overlays_519F3(bpy.types.Operator):
+# (keymap, keymap_item) pairs created by this add-on.
+addon_keymaps = []
+
+PIE_MENU_ID = "SNA_MT_E8F7C"
+
+
+class _ShadingOperator(bpy.types.Operator):
+    """Base class: only runs inside a 3D Viewport."""
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.space_data is not None and context.space_data.type == 'VIEW_3D'
+
+    def apply(self, space):
+        raise NotImplementedError
+
+    def execute(self, context):
+        self.apply(context.space_data)
+        return {"FINISHED"}
+
+
+class SNA_OT_Toggle_Overlays_519F3(_ShadingOperator):
     bl_idname = "sna.toggle_overlays_519f3"
-    bl_label = "toggle_overlays"
+    bl_label = "Toggle Overlays"
     bl_description = "Toggle Overlays"
-    bl_options = {"REGISTER", "UNDO"}
 
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        if bpy.context.area.spaces[0].overlay.show_overlays:
-            bpy.context.area.spaces[0].overlay.show_overlays = False
-        else:
-            bpy.context.area.spaces[0].overlay.show_overlays = True
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+    def apply(self, space):
+        space.overlay.show_overlays = not space.overlay.show_overlays
 
 
-class SNA_OT_Set_Mat_Shad_E3C82(bpy.types.Operator):
+class SNA_OT_Set_Mat_Shad_E3C82(_ShadingOperator):
     bl_idname = "sna.set_mat_shad_e3c82"
-    bl_label = "Set_Mat_Shad"
-    bl_description = "Set Material Shad"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Material Preview"
+    bl_description = "Set Material Preview shading"
 
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'MATERIAL'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+    def apply(self, space):
+        space.shading.type = 'MATERIAL'
 
 
-class SNA_OT_Set_Render_Shad_02048(bpy.types.Operator):
+class SNA_OT_Set_Render_Shad_02048(_ShadingOperator):
     bl_idname = "sna.set_render_shad_02048"
-    bl_label = "Set_Render_Shad"
-    bl_description = "Set Render Shad"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Rendered"
+    bl_description = "Set Rendered shading"
 
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'RENDERED'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+    def apply(self, space):
+        space.shading.type = 'RENDERED'
 
 
-class SNA_OT_Toggle_Backfacecull_8E93F(bpy.types.Operator):
+class SNA_OT_Toggle_Backfacecull_8E93F(_ShadingOperator):
     bl_idname = "sna.toggle_backfacecull_8e93f"
-    bl_label = "Toggle_BackfaceCull"
-    bl_description = "Toggle Backface Cull"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Toggle Backface Culling"
+    bl_description = "Toggle Backface Culling"
 
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        if bpy.context.area.spaces[0].shading.show_backface_culling:
-            bpy.context.area.spaces[0].shading.show_backface_culling = False
-            shadingpiez['sna_backfacebool'] = False
-        else:
-            bpy.context.area.spaces[0].shading.show_backface_culling = True
-            shadingpiez['sna_backfacebool'] = True
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+    def apply(self, space):
+        space.shading.show_backface_culling = not space.shading.show_backface_culling
 
 
-class SNA_OT_Toggle_Faceorient_Def8B(bpy.types.Operator):
+class SNA_OT_Toggle_Faceorient_Def8B(_ShadingOperator):
     bl_idname = "sna.toggle_faceorient_def8b"
-    bl_label = "Toggle_FaceOrient"
-    bl_description = "ToggleFaceOrient"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_label = "Toggle Face Orientation"
+    bl_description = "Toggle Face Orientation overlay"
 
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
+    def apply(self, space):
+        space.overlay.show_face_orientation = not space.overlay.show_face_orientation
 
-    def execute(self, context):
-        if bpy.context.area.spaces[0].overlay.show_face_orientation:
-            bpy.context.area.spaces[0].overlay.show_face_orientation = False
-            shadingpiez['sna_faceorientbool'] = False
-        else:
-            bpy.context.area.spaces[0].overlay.show_face_orientation = True
-            shadingpiez['sna_faceorientbool'] = True
-        return {"FINISHED"}
 
-    def invoke(self, context, event):
-        return self.execute(context)
+class SNA_OT_Set_Vertex_Color_50C8A(_ShadingOperator):
+    bl_idname = "sna.set_vertex_color_50c8a"
+    bl_label = "Flat Vertex Color"
+    bl_description = "Flat lighting with vertex color"
+
+    def apply(self, space):
+        space.shading.type = 'SOLID'
+        space.shading.light = 'FLAT'
+        space.shading.color_type = 'VERTEX'
+
+
+class SNA_OT_Set_Flat_Shad_0E168(_ShadingOperator):
+    bl_idname = "sna.set_flat_shad_0e168"
+    bl_label = "Flat Texture"
+    bl_description = "Flat lighting with texture color"
+
+    def apply(self, space):
+        space.shading.type = 'SOLID'
+        space.shading.light = 'FLAT'
+        space.shading.color_type = 'TEXTURE'
+
+
+class SNA_OT_Set_Matcap_94Fb0(_ShadingOperator):
+    bl_idname = "sna.set_matcap_94fb0"
+    bl_label = "Matcap"
+    bl_description = "Set Matcap lighting"
+
+    def apply(self, space):
+        space.shading.type = 'SOLID'
+        space.shading.light = 'MATCAP'
+        space.shading.color_type = 'MATERIAL'
+        try:
+            space.shading.studio_light = 'clay_brown.exr'
+        except TypeError:
+            # Matcap not available in this install; keep the current one.
+            pass
+
+
+class SNA_OT_Set_Wireframe_Shad_5Cd18(_ShadingOperator):
+    bl_idname = "sna.set_wireframe_shad_5cd18"
+    bl_label = "Wireframe"
+    bl_description = "Set Wireframe shading"
+
+    def apply(self, space):
+        space.shading.type = 'WIREFRAME'
+
+
+class SNA_OT_Set_Solid_Shad_A809D(_ShadingOperator):
+    bl_idname = "sna.set_solid_shad_a809d"
+    bl_label = "Solid"
+    bl_description = "Set Solid shading"
+
+    def apply(self, space):
+        space.shading.type = 'SOLID'
+        space.shading.light = 'STUDIO'
+        space.shading.color_type = 'MATERIAL'
+
+
+class SNA_OT_Set_Solid_Vcol_75D4A(_ShadingOperator):
+    bl_idname = "sna.set_solid_vcol_75d4a"
+    bl_label = "Solid Vertex Color"
+    bl_description = "Studio lighting with vertex color"
+
+    def apply(self, space):
+        space.shading.type = 'SOLID'
+        space.shading.light = 'STUDIO'
+        space.shading.color_type = 'VERTEX'
 
 
 class SNA_MT_E8F7C(bpy.types.Menu):
-    bl_idname = "SNA_MT_E8F7C"
+    bl_idname = PIE_MENU_ID
     bl_label = "Shading"
 
-    @classmethod
-    def poll(cls, context):
-        return not (False)
-
     def draw(self, context):
-        layout = self.layout.menu_pie()
-        op = layout.operator('sna.set_wireframe_shad_5cd18', text='Wireframe', icon_value=625, emboss=True, depress=False)
-        row_519A8 = layout.row(heading='', align=True)
-        row_519A8.alert = False
-        row_519A8.enabled = True
-        row_519A8.active = True
-        row_519A8.use_property_split = False
-        row_519A8.use_property_decorate = False
-        row_519A8.scale_x = 0.949999988079071
-        row_519A8.scale_y = 1.5
-        row_519A8.alignment = 'Expand'.upper()
-        if not True: row_519A8.operator_context = "EXEC_DEFAULT"
-        op = row_519A8.operator('sna.set_solid_shad_a809d', text='Solid', icon_value=0, emboss=True, depress=False)
-        op = row_519A8.operator('sna.set_solid_vcol_75d4a', text='SVcol', icon_value=0, emboss=True, depress=False)
-        op = row_519A8.operator('sna.set_matcap_94fb0', text='Matcap', icon_value=0, emboss=True, depress=False)
-        op = layout.operator('view3d.toggle_xray', text='Xray', icon_value=630, emboss=True, depress=False)
-        op = layout.operator('sna.toggle_overlays_519f3', text='Overlays', icon_value=630, emboss=True, depress=False)
-        op = layout.operator('sna.set_mat_shad_e3c82', text='Material', icon_value=79, emboss=True, depress=False)
-        op = layout.operator('sna.set_render_shad_02048', text='Render', icon_value=627, emboss=True, depress=False)
-        col_6944D = layout.column(heading='asdasd', align=True)
-        col_6944D.alert = False
-        col_6944D.enabled = True
-        col_6944D.active = True
-        col_6944D.use_property_split = False
-        col_6944D.use_property_decorate = True
-        col_6944D.scale_x = 1.0
-        col_6944D.scale_y = 1.25
-        col_6944D.alignment = 'Expand'.upper()
-        if not True: col_6944D.operator_context = "EXEC_DEFAULT"
-        op = col_6944D.operator('sna.toggle_backfacecull_8e93f', text='BackFaceCull', icon_value=0, emboss=True, depress=shadingpiez['sna_backfacebool'])
-        op = col_6944D.operator('sna.toggle_faceorient_def8b', text='FaceOrient', icon_value=0, emboss=True, depress=shadingpiez['sna_faceorientbool'])
-        row_C18EE = layout.row(heading='', align=True)
-        row_C18EE.alert = False
-        row_C18EE.enabled = True
-        row_C18EE.active = True
-        row_C18EE.use_property_split = False
-        row_C18EE.use_property_decorate = False
-        row_C18EE.scale_x = 1.0
-        row_C18EE.scale_y = 1.5
-        row_C18EE.alignment = 'Expand'.upper()
-        if not True: row_C18EE.operator_context = "EXEC_DEFAULT"
-        op = row_C18EE.operator('sna.set_flat_shad_0e168', text='Flat', icon_value=0, emboss=True, depress=False)
-        op = row_C18EE.operator('sna.set_vertex_color_50c8a', text='Vcol', icon_value=0, emboss=True, depress=False)
+        space = context.space_data
+        pie = self.layout.menu_pie()
+
+        # West
+        pie.operator('sna.set_wireframe_shad_5cd18', text='Wireframe', icon='SHADING_WIRE')
+
+        # East
+        row = pie.row(align=True)
+        row.scale_x = 0.95
+        row.scale_y = 1.5
+        row.operator('sna.set_solid_shad_a809d', text='Solid')
+        row.operator('sna.set_solid_vcol_75d4a', text='SVcol')
+        row.operator('sna.set_matcap_94fb0', text='Matcap')
+
+        # South
+        pie.operator('view3d.toggle_xray', text='Xray', icon='XRAY')
+
+        # North
+        pie.operator('sna.toggle_overlays_519f3', text='Overlays', icon='OVERLAY')
+
+        # North-west
+        pie.operator('sna.set_mat_shad_e3c82', text='Material', icon='MATERIAL')
+
+        # North-east
+        pie.operator('sna.set_render_shad_02048', text='Render', icon='SHADING_RENDERED')
+
+        # South-west
+        col = pie.column(align=True)
+        col.scale_y = 1.25
+        col.operator('sna.toggle_backfacecull_8e93f', text='BackFaceCull',
+                     depress=space.shading.show_backface_culling)
+        col.operator('sna.toggle_faceorient_def8b', text='FaceOrient',
+                     depress=space.overlay.show_face_orientation)
+
+        # South-east
+        row = pie.row(align=True)
+        row.scale_y = 1.5
+        row.operator('sna.set_flat_shad_0e168', text='Flat')
+        row.operator('sna.set_vertex_color_50c8a', text='Vcol')
 
 
-class SNA_OT_Set_Vertex_Color_50C8A(bpy.types.Operator):
-    bl_idname = "sna.set_vertex_color_50c8a"
-    bl_label = "Set_Vertex_Color"
-    bl_description = "Set vertex color"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'SOLID'
-        bpy.context.area.spaces[0].shading.light = 'FLAT'
-        bpy.context.area.spaces[0].shading.color_type = 'VERTEX'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+classes = (
+    SNA_OT_Toggle_Overlays_519F3,
+    SNA_OT_Set_Mat_Shad_E3C82,
+    SNA_OT_Set_Render_Shad_02048,
+    SNA_OT_Toggle_Backfacecull_8E93F,
+    SNA_OT_Toggle_Faceorient_Def8B,
+    SNA_MT_E8F7C,
+    SNA_OT_Set_Vertex_Color_50C8A,
+    SNA_OT_Set_Flat_Shad_0E168,
+    SNA_OT_Set_Matcap_94Fb0,
+    SNA_OT_Set_Wireframe_Shad_5Cd18,
+    SNA_OT_Set_Solid_Shad_A809D,
+    SNA_OT_Set_Solid_Vcol_75D4A,
+)
 
 
-class SNA_OT_Set_Flat_Shad_0E168(bpy.types.Operator):
-    bl_idname = "sna.set_flat_shad_0e168"
-    bl_label = "Set_Flat_Shad"
-    bl_description = "SetFlatShad"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'SOLID'
-        bpy.context.area.spaces[0].shading.light = 'FLAT'
-        bpy.context.area.spaces[0].shading.color_type = 'TEXTURE'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
-
-
-class SNA_OT_Set_Matcap_94Fb0(bpy.types.Operator):
-    bl_idname = "sna.set_matcap_94fb0"
-    bl_label = "Set_Matcap"
-    bl_description = "Set Matcap"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'SOLID'
-        bpy.context.area.spaces[0].shading.light = 'MATCAP'
-        bpy.context.area.spaces[0].shading.color_type = 'MATERIAL'
-        exec("bpy.context.space_data.shading.studio_light = 'clay_brown.exr'")
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
-
-
-class SNA_OT_Set_Wireframe_Shad_5Cd18(bpy.types.Operator):
-    bl_idname = "sna.set_wireframe_shad_5cd18"
-    bl_label = "Set_Wireframe_Shad"
-    bl_description = ""
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'WIREFRAME'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
-
-
-class SNA_OT_Set_Solid_Shad_A809D(bpy.types.Operator):
-    bl_idname = "sna.set_solid_shad_a809d"
-    bl_label = "Set_Solid_Shad"
-    bl_description = "Set Solid"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'SOLID'
-        bpy.context.area.spaces[0].shading.light = 'STUDIO'
-        bpy.context.area.spaces[0].shading.color_type = 'MATERIAL'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
-
-
-class SNA_OT_Set_Solid_Vcol_75D4A(bpy.types.Operator):
-    bl_idname = "sna.set_solid_vcol_75d4a"
-    bl_label = "Set_Solid_Vcol"
-    bl_description = "Set Solid & Vcol"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        if bpy.app.version >= (3, 0, 0) and True:
-            cls.poll_message_set('')
-        return not False
-
-    def execute(self, context):
-        bpy.context.area.spaces[0].shading.type = 'SOLID'
-        bpy.context.area.spaces[0].shading.light = 'STUDIO'
-        bpy.context.area.spaces[0].shading.color_type = 'VERTEX'
-        return {"FINISHED"}
-
-    def invoke(self, context, event):
-        return self.execute(context)
+def _remove_keymaps():
+    for km, kmi in addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except (RuntimeError, ReferenceError):
+            pass
+    addon_keymaps.clear()
 
 
 def register():
-    global _icons
-    _icons = bpy.utils.previews.new()
-    bpy.utils.register_class(SNA_OT_Toggle_Overlays_519F3)
-    bpy.utils.register_class(SNA_OT_Set_Mat_Shad_E3C82)
-    bpy.utils.register_class(SNA_OT_Set_Render_Shad_02048)
-    bpy.utils.register_class(SNA_OT_Toggle_Backfacecull_8E93F)
-    bpy.utils.register_class(SNA_OT_Toggle_Faceorient_Def8B)
-    bpy.utils.register_class(SNA_MT_E8F7C)
-    bpy.utils.register_class(SNA_OT_Set_Vertex_Color_50C8A)
-    bpy.utils.register_class(SNA_OT_Set_Flat_Shad_0E168)
-    bpy.utils.register_class(SNA_OT_Set_Matcap_94Fb0)
-    bpy.utils.register_class(SNA_OT_Set_Wireframe_Shad_5Cd18)
-    bpy.utils.register_class(SNA_OT_Set_Solid_Shad_A809D)
-    bpy.utils.register_class(SNA_OT_Set_Solid_Vcol_75D4A)
-    kc = bpy.context.window_manager.keyconfigs.addon
-    km = kc.keymaps.new(name='3D View', space_type='VIEW_3D')
-    kmi = km.keymap_items.new('wm.call_menu_pie', 'Z', 'PRESS',
-        ctrl=False, alt=False, shift=False, repeat=False)
-    kmi.properties.name = 'SNA_MT_E8F7C'
-    addon_keymaps['AE749'] = (km, kmi)
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    _remove_keymaps()
+
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon if wm else None
+    if kc:
+        km = kc.keymaps.new(name='3D View', space_type='VIEW_3D')
+        kmi = km.keymap_items.new('wm.call_menu_pie', 'Z', 'PRESS',
+                                  ctrl=False, alt=False, shift=False, repeat=False)
+        kmi.properties.name = PIE_MENU_ID
+        addon_keymaps.append((km, kmi))
 
 
 def unregister():
-    global _icons
-    bpy.utils.previews.remove(_icons)
-    wm = bpy.context.window_manager
-    kc = wm.keyconfigs.addon
-    for km, kmi in addon_keymaps.values():
-        km.keymap_items.remove(kmi)
-    addon_keymaps.clear()
-    bpy.utils.unregister_class(SNA_OT_Toggle_Overlays_519F3)
-    bpy.utils.unregister_class(SNA_OT_Set_Mat_Shad_E3C82)
-    bpy.utils.unregister_class(SNA_OT_Set_Render_Shad_02048)
-    bpy.utils.unregister_class(SNA_OT_Toggle_Backfacecull_8E93F)
-    bpy.utils.unregister_class(SNA_OT_Toggle_Faceorient_Def8B)
-    bpy.utils.unregister_class(SNA_MT_E8F7C)
-    bpy.utils.unregister_class(SNA_OT_Set_Vertex_Color_50C8A)
-    bpy.utils.unregister_class(SNA_OT_Set_Flat_Shad_0E168)
-    bpy.utils.unregister_class(SNA_OT_Set_Matcap_94Fb0)
-    bpy.utils.unregister_class(SNA_OT_Set_Wireframe_Shad_5Cd18)
-    bpy.utils.unregister_class(SNA_OT_Set_Solid_Shad_A809D)
-    bpy.utils.unregister_class(SNA_OT_Set_Solid_Vcol_75D4A)
+    _remove_keymaps()
+
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()
