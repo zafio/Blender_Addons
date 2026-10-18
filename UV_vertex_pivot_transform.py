@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 5, 1),
+    "version": (1, 6, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
@@ -425,7 +425,7 @@ class UV_OT_vertex_pivot_rotate(_PivotTransform, bpy.types.Operator):
         delta = math.atan2(ax * cy - ay * cx, ax * cx + ay * cy)   # CCW positive
         self.prev_vec = (cx, cy)
         if self.shift:
-            delta *= 0.1
+            delta *= 1.0 / 30.0         # Blender's angle precision factor
         self.raw += delta * self.sign
 
     # -- events -------------------------------------------------------------
@@ -595,18 +595,26 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
     pivot: FloatVectorProperty(name="Pivot", size=2, default=(0.0, 0.0))
 
     def setup(self, context, event):
-        # Same as Blender's resize input (INPUT_SPRING_FLIP): factor = current
-        # mouse distance from the pivot / initial distance, negated once the
-        # mouse crosses to the opposite side of the pivot from where it started.
-        px, py = self._pivot_region()
-        vx, vy = self.mouse[0] - px, self.mouse[1] - py
-        d = math.hypot(vx, vy)
-        if d < 1.0:                     # started exactly on the pivot
-            vx, vy, d = 1.0, 0.0, 1.0
-        self.ref = (vx, vy)
-        self.ref_len = d
+        # Port of Blender's resize input (transform_input.cc):
+        #   INPUT_SPRING_FLIP: factor = |M - C| / |I - C|, negated when
+        #   (M - C) points away from (I - C)  (mouse crossed the pivot).
+        #   Virtual mouse: M = I + accumulated mouse motion, where motion is
+        #   scaled by 1/10 while Shift (precision) is held.
+        # Positions are kept in "texel space" (UV * image size) so panning /
+        # zooming the view mid-transform doesn't change the result.
+        img = getattr(context.space_data, "image", None)
+        if img is not None and img.size[0] > 0 and img.size[1] > 0:
+            self._tex = (float(img.size[0]), float(img.size[1]))
+        else:
+            self._tex = (256.0, 256.0)      # Blender's UV editor default
+        self.c = (self.pivot[0] * self._tex[0], self.pivot[1] * self._tex[1])
+        self.imval = self._to_texel(*self.mouse)
+        rx, ry = self.imval[0] - self.c[0], self.imval[1] - self.c[1]
+        self.factor = math.hypot(rx, ry) or 1.0     # Blender: prevent inf
+        self.ref = (rx, ry)
+        self.v_prev = (0.0, 0.0)            # virtual_mval.prev
+        self.v_accum = (0.0, 0.0)           # virtual_mval.accum
         self.raw = 1.0
-        self.prev_spring = 1.0
         self.constraint = None          # None, 'X' or 'Y'
         self.num_active = False
         self.buf = ""
@@ -647,29 +655,38 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
 
     # -- mouse -> factor ----------------------------------------------------
 
-    def _spring(self, mx, my):
-        cx, cy = self._pivot_region()
-        vx, vy = mx - cx, my - cy
-        f = math.hypot(vx, vy) / self.ref_len
-        if vx * self.ref[0] + vy * self.ref[1] < 0.0:
-            f = -f
-        return f
+    def _to_texel(self, mx, my):
+        u, v = self.region.view2d.region_to_view(mx, my)
+        return (u * self._tex[0], v * self._tex[1])
+
+    def _spring_flip(self, mx, my):
+        """Blender's InputSpringFlip on the virtual mouse position."""
+        cx, cy = self.c
+        dx, dy = mx - cx, my - cy
+        ratio = math.hypot(dx, dy) / self.factor
+        if dx * self.ref[0] + dy * self.ref[1] < 0.0:
+            ratio = -ratio
+        return ratio
 
     def _track(self, mx, my):
         self.mouse = (mx, my)
-        spring = self._spring(mx, my)
+        m = self._to_texel(mx, my)
+        off = (m[0] - self.imval[0], m[1] - self.imval[1])
         if self._resync:
-            # View was panned/zoomed: keep the current factor, no jump.
-            self.prev_spring = spring
+            # View was panned/zoomed: re-base so the mouse doesn't "jump".
+            self.v_prev = off
             self._resync = False
             return
-        # Accumulate changes so Shift precision (x0.1) can kick in mid-drag
-        # without jumps; without Shift this equals Blender's plain ratio.
-        delta = spring - self.prev_spring
-        self.prev_spring = spring
+        # applyMouseInput(): delta = (M - I) - prev; prev += delta;
+        # delta *= 1/10 with precision; accum += delta; mval = I + accum
+        dx, dy = off[0] - self.v_prev[0], off[1] - self.v_prev[1]
+        self.v_prev = off
         if self.shift:
-            delta *= 0.1
-        self.raw += delta
+            dx *= 0.1
+            dy *= 0.1
+        self.v_accum = (self.v_accum[0] + dx, self.v_accum[1] + dy)
+        self.raw = self._spring_flip(self.imval[0] + self.v_accum[0],
+                                     self.imval[1] + self.v_accum[1])
 
     def handle(self, context, event):
         et, val = event.type, event.value
