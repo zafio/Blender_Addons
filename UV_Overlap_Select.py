@@ -8,9 +8,9 @@ In the UV Editor, press the key of the select mode you are ALREADY in
       (same UV position) selected as well.
     * Deselecting an element deselects its overlapped partners too.
     * While active, the UV selection color turns RED.
-    * While active, stacked faces (identical UV footprint) are tinted pale green and
-      overlapping faces (partly covering another face) pale blue. Toggle and colors
-      in the N panel.
+    * While active, the wire edges of stacked faces (identical UV footprint) are drawn
+      pale green and those of overlapping faces (partly covering another face) pale
+      blue. Toggle, colors and line width in the N panel.
 
 Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
@@ -23,12 +23,12 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
                    "elements (vertex, edge, face, island). Selection turns red while active; "
-                   "stacked faces show pale green, overlapping faces pale blue.",
+                   "stacked faces get a pale green wire, overlapping faces a pale blue one.",
     "category": "UV",
 }
 
@@ -740,8 +740,9 @@ def _tri_area2(t):
 
 
 def _compute_overlay(entries, sync, inv, eps):
-    """Returns (stacked_tris, overlap_tris, n_stacked, n_overlap, overlap_checked)."""
-    keys, face_tris = [], []
+    """Returns (stacked_lines, overlap_lines, n_stacked, n_overlap, overlap_checked).
+    Lines are pairs of (u, v, 0) points along each face's outline (wire edges)."""
+    keys, face_tris, face_rims = [], [], []
     for oi, (me, bm, acc) in enumerate(entries):
         by_face = {}
         for tri in bm.calc_loop_triangles():
@@ -751,6 +752,7 @@ def _compute_overlay(entries, sync, inv, eps):
                 continue
             keys.append(tuple(sorted(acc.pos(l, inv) for l in f.loops)))
             face_tris.append([tuple(acc.raw(l) for l in tri) for tri in by_face.get(f, ())])
+            face_rims.append([acc.raw(l) for l in f.loops])
 
     count = {}
     for k in keys:
@@ -819,17 +821,22 @@ def _compute_overlay(entries, sync, inv, eps):
                 if j != i and face_tris[j] and (j not in big_set or j > i):
                     test(i, j)
 
+    def rim_lines(out, rim):
+        n = len(rim)
+        for k in range(n):
+            a, b = rim[k], rim[(k + 1) % n]
+            out.append((a[0], a[1], 0.0))
+            out.append((b[0], b[1], 0.0))
+
     green, blue = [], []
     n_st = n_ov = 0
-    for fi, ts in enumerate(face_tris):
+    for fi, rim in enumerate(face_rims):
         if stacked[fi]:
             n_st += 1
-            for t in ts:
-                green.extend(t)
+            rim_lines(green, rim)
         elif overlap[fi]:
             n_ov += 1
-            for t in ts:
-                blue.extend(t)
+            rim_lines(blue, rim)
     return green, blue, n_st, n_ov, checked
 
 
@@ -880,11 +887,19 @@ def _draw_overlay():
         x1, y1 = v2d.view_to_region(10.0, 10.0, clip=False)
         sx, sy = (x1 - x0) / 10.0, (y1 - y0) / 10.0
 
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        width = float(getattr(wm, "uv_overlap_line_width", 2.0))
+        # Thick lines: the polyline shader (works on every GPU backend); plain
+        # UNIFORM_COLOR + line_width_set as a fallback.
+        try:
+            shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+            poly = True
+        except Exception:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            poly = False
         if S.ov_batches is None:
             S.ov_batches = (
-                batch_for_shader(shader, 'TRIS', {"pos": S.ov_green}) if S.ov_green else None,
-                batch_for_shader(shader, 'TRIS', {"pos": S.ov_blue}) if S.ov_blue else None,
+                batch_for_shader(shader, 'LINES', {"pos": S.ov_green}) if S.ov_green else None,
+                batch_for_shader(shader, 'LINES', {"pos": S.ov_blue}) if S.ov_blue else None,
             )
         b_green, b_blue = S.ov_batches
 
@@ -893,6 +908,11 @@ def _draw_overlay():
         gpu.matrix.translate((x0, y0))
         gpu.matrix.scale((sx, sy))
         shader.bind()
+        if poly:
+            shader.uniform_float("viewportSize", (region.width, region.height))
+            shader.uniform_float("lineWidth", width)
+        else:
+            gpu.state.line_width_set(width)
         if b_blue is not None:
             shader.uniform_float("color", tuple(wm.uv_overlap_color_overlap))
             b_blue.draw(shader)
@@ -901,6 +921,8 @@ def _draw_overlay():
             b_green.draw(shader)
         gpu.matrix.pop()
         gpu.state.blend_set('NONE')
+        if not poly:
+            gpu.state.line_width_set(1.0)
     except Exception:
         pass
 
@@ -1165,6 +1187,7 @@ class UV_PT_overlap_select(bpy.types.Panel):
         row.prop(wm, "uv_overlap_color_stacked", text="Stacked")
         row = sub.row()
         row.prop(wm, "uv_overlap_color_overlap", text="Overlapping")
+        sub.prop(wm, "uv_overlap_line_width")
         if active and wm.uv_overlap_show:
             n_st, n_ov, checked = S.ov_counts
             sub.label(text="Stacked faces: %d" % n_st)
@@ -1234,10 +1257,13 @@ def register():
         default=True, update=_overlay_prop_update)
     wm_t.uv_overlap_color_stacked = FloatVectorProperty(
         name="Stacked Color", subtype='COLOR', size=4, min=0.0, max=1.0,
-        default=(0.55, 1.0, 0.6, 0.35), update=_overlay_prop_update)
+        default=(0.6, 1.0, 0.65, 1.0), update=_overlay_prop_update)
     wm_t.uv_overlap_color_overlap = FloatVectorProperty(
         name="Overlapping Color", subtype='COLOR', size=4, min=0.0, max=1.0,
-        default=(0.55, 0.78, 1.0, 0.35), update=_overlay_prop_update)
+        default=(0.6, 0.8, 1.0, 1.0), update=_overlay_prop_update)
+    wm_t.uv_overlap_line_width = FloatProperty(
+        name="Line Width", description="Thickness of the stacked / overlapping wire",
+        default=2.0, min=1.0, max=8.0, update=_overlay_prop_update)
 
     global _draw_handle
     if gpu is not None and _draw_handle is None:
@@ -1290,7 +1316,8 @@ def unregister():
 
     wm_t = bpy.types.WindowManager
     for name in ("uv_overlap_active", "uv_overlap_keep", "uv_overlap_tolerance",
-                 "uv_overlap_show", "uv_overlap_color_stacked", "uv_overlap_color_overlap"):
+                 "uv_overlap_show", "uv_overlap_color_stacked", "uv_overlap_color_overlap",
+                 "uv_overlap_line_width"):
         if hasattr(wm_t, name):
             delattr(wm_t, name)
 
