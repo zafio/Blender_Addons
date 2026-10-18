@@ -20,7 +20,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 2),
+    "version": (1, 0, 3),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -69,8 +69,7 @@ class _State:
         self.last_check = 0.0
         self.interval = 0.4
         self.geo = {}           # unit -> UV position signature at our last snapshot
-        self.mouse_down = False
-        self.mouse_time = 0.0
+        self.status = "Off"     # shown in the N panel
 
 
 S = _State()
@@ -242,16 +241,33 @@ class _Model:
 _WATCH_IDS = {"UV_OT_overlap_watch", "uv.overlap_watch"}
 
 
-def _foreign_modal_running(context):
-    """True while another modal operator (move, rotate, box select...) is running."""
+_BUSY_WORDS = ("transform", "translate", "rotate", "resize", "scale", "shear",
+               "move", "drag", "slide", "grab", "pivot", "collision", "mirror")
+
+
+def _transform_running(context):
+    """Name of a running modal transform-like operator, or None.
+
+    Only tools that MOVE UVs count: other add-ons that keep a modal running in the
+    background (and Blender's own box/circle select) must not pause overlap select."""
     win = context.window
     mods = getattr(win, "modal_operators", None) if win else None
-    if mods is None:
-        return False
+    if not mods:
+        return None
     for op in mods:
-        if getattr(op, "bl_idname", "") not in _WATCH_IDS:
-            return True
-    return False
+        name = getattr(op, "bl_idname", "") or ""
+        if name in _WATCH_IDS:
+            continue
+        low = name.lower()
+        if low.startswith("transform_ot_") or any(w in low for w in _BUSY_WORDS):
+            return name
+    return None
+
+
+def _set_status(context, text):
+    if S.status != text:
+        S.status = text
+        _tag_redraw(context)
 
 
 def _is_uv_editor(context):
@@ -520,10 +536,11 @@ def _snapshot(model, sel, topo):
 
 
 def _process(context):
-    # Never read or write the mesh while something else is working on it
-    # (move / rotate / scale / box select / a held mouse button) - touching the
-    # mesh mid-transform is what tore the UVs apart.
-    if S.mouse_down or _foreign_modal_running(context):
+    # Never touch the mesh while a move / rotate / scale is running - that is what
+    # tore the UVs apart. (The "moved" check below is a second safety net.)
+    busy = _transform_running(context)
+    if busy:
+        _set_status(context, "Paused while %s runs" % busy)
         return
 
     wm = context.window_manager
@@ -551,10 +568,13 @@ def _process(context):
         for u in now:
             if geo_now.get(u) != geo_old.get(u):
                 _snapshot(model, now, topo)
+                _set_status(context, "Selection moved - ready")
                 return
 
     if now == prev:
         _snapshot(model, now, topo)
+        if S.status.startswith("Paused"):
+            _set_status(context, "Ready")
         return
 
     key_of, groups = model.key_of, model.groups
@@ -575,6 +595,9 @@ def _process(context):
         for oi in touched:
             bmesh.update_edit_mesh(entries[oi][0], loop_triangles=False, destructive=False)
         _tag_redraw(context)
+        _set_status(context, "Added %d / removed %d overlapped" % (len(to_sel), len(to_desel)))
+    else:
+        _set_status(context, "Nothing overlapped under the selection")
 
     _snapshot(model, final, topo)
 
@@ -719,9 +742,6 @@ class UV_OT_overlap_watch(bpy.types.Operator):
             now = time.monotonic()
             S.heartbeat = now
             ts = context.tool_settings
-            # A release that happened outside the window never reaches us
-            if S.mouse_down and now - S.mouse_time > 15.0:
-                S.mouse_down = False
 
             if context.mode != 'EDIT_MESH':
                 set_overlap_active(context, False)
@@ -757,16 +777,9 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     return self._stop(context)
                 S.interval = max(0.4, (time.perf_counter() - t0) * 10.0)
 
-        else:
-            if event.type in _MOUSE_BUTTONS:
-                if event.value == 'PRESS':
-                    S.mouse_down = True
-                    S.mouse_time = time.monotonic()
-                elif event.value == 'RELEASE':
-                    S.mouse_down = False
-            if event.value in _ACTIVE_VALUES:
-                S.dirty = True
-                S.dirty_time = time.monotonic()
+        elif event.value in _ACTIVE_VALUES:
+            S.dirty = True
+            S.dirty_time = time.monotonic()
 
         return {'PASS_THROUGH'}
 
@@ -798,6 +811,8 @@ class UV_PT_overlap_select(bpy.types.Panel):
         row.operator("uv.overlap_toggle",
                      text="Overlap Select: ON" if active else "Overlap Select: OFF",
                      icon='SELECT_INTERSECT', depress=active)
+        if active:
+            layout.label(text=S.status, icon='INFO')
         layout.prop(wm, "uv_overlap_tolerance")
         layout.prop(wm, "uv_overlap_keep")
         col = layout.column(align=True)
