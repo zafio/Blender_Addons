@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
@@ -14,7 +14,8 @@ import math
 import bpy
 import bmesh
 import gpu
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
+                       IntProperty)
 from gpu_extras.batch import batch_for_shader
 
 ADDON_ID = __package__ or __name__
@@ -67,11 +68,19 @@ class UVPivotPrefs(bpy.types.AddonPreferences):
         default=True,
     )
 
+    scale_reference_px: IntProperty(
+        name="Scale Reference Distance",
+        description="Mouse distance (screen pixels) that equals a scale of 1.0 when "
+                    "you start scaling close to the pivot. Larger = slower scaling",
+        default=100, min=20, max=1000, subtype='PIXEL',
+    )
+
     def draw(self, context):
         col = self.layout.column()
         col.prop(self, "pivot_source")
         col.prop(self, "angle_direction")
         col.prop(self, "mirror_cycle_off")
+        col.prop(self, "scale_reference_px")
 
 
 def _pref(name, default):
@@ -594,14 +603,27 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
     value: FloatVectorProperty(name="Scale", size=2, default=(1.0, 1.0))
     pivot: FloatVectorProperty(name="Pivot", size=2, default=(0.0, 0.0))
 
-    MIN_START_DIST = 10.0   # px; avoids huge jumps when starting right on the pivot
-
     def setup(self, context, event):
+        # Blender-style "spring" input: factor = current mouse distance from the
+        # scale centre / initial distance, negative once the mouse crosses to the
+        # opposite side of the centre. Because the pivot is the vertex nearest
+        # the mouse, the start distance is usually tiny, so when it is shorter
+        # than the reference distance a virtual centre is placed that far away
+        # (behind the pivot, as seen from the mouse) to keep the speed sane.
         px, py = self._pivot_region()
-        d = math.hypot(self.mouse[0] - px, self.mouse[1] - py)
-        self.d0 = max(d, self.MIN_START_DIST)
-        self.prev_d = d
+        vx, vy = self.mouse[0] - px, self.mouse[1] - py
+        d = math.hypot(vx, vy)
+        ref_len = float(_pref("scale_reference_px", 100))
+        if d >= ref_len:
+            self.c_off = (0.0, 0.0)
+            self.ref = (vx, vy)
+        else:
+            dx, dy = (vx / d, vy / d) if d > 1.0 else (1.0, 0.0)
+            self.ref = (dx * ref_len, dy * ref_len)
+            self.c_off = (vx - self.ref[0], vy - self.ref[1])
+        self.ref_len = math.hypot(*self.ref)
         self.raw = 1.0
+        self.prev_spring = 1.0
         self.constraint = None          # None, 'X' or 'Y'
         self.num_active = False
         self.buf = ""
@@ -640,20 +662,32 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
             return ev
         return max(eu, ev)
 
-    # -- mouse -> factor (incremental so Shift precision works mid-drag) ----
+    # -- mouse -> factor ----------------------------------------------------
+
+    def _center_region(self):
+        px, py = self._pivot_region()
+        return px + self.c_off[0], py + self.c_off[1]
+
+    def _spring(self, mx, my):
+        cx, cy = self._center_region()
+        vx, vy = mx - cx, my - cy
+        f = math.hypot(vx, vy) / self.ref_len
+        if vx * self.ref[0] + vy * self.ref[1] < 0.0:
+            f = -f
+        return f
 
     def _track(self, mx, my):
-        px, py = self._pivot_region()
-        d = math.hypot(mx - px, my - py)
         self.mouse = (mx, my)
+        spring = self._spring(mx, my)
         if self._resync:
-            # View was panned/zoomed: keep the current factor, re-base distances.
-            self.d0 = max(d / max(abs(self.raw), 1e-6), self.MIN_START_DIST) if d > 0 else self.d0
-            self.prev_d = d
+            # View was panned/zoomed: keep the current factor, no jump.
+            self.prev_spring = spring
             self._resync = False
             return
-        delta = (d - self.prev_d) / self.d0
-        self.prev_d = d
+        # Accumulate changes so Shift precision (x0.1) can kick in mid-drag
+        # without jumps; without Shift this equals Blender's plain ratio.
+        delta = spring - self.prev_spring
+        self.prev_spring = spring
         if self.shift:
             delta *= 0.1
         self.raw += delta
@@ -742,7 +776,8 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
 
     def draw_lines(self, px, py):
         mx, my = self.mouse
-        lines = [((px, py), (mx, my), (1.0, 1.0, 1.0, 0.55))]
+        cx, cy = px + self.c_off[0], py + self.c_off[1]
+        lines = [((cx, cy), (mx, my), (1.0, 1.0, 1.0, 0.55))]
         w, h = self.region.width, self.region.height
         if self.constraint == 'X':
             lines.append(((0, py), (w, py), (0.86, 0.22, 0.30, 0.9)))
