@@ -20,7 +20,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 4),
+    "version": (1, 0, 5),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -364,17 +364,68 @@ def _model_vertex(entries, inv):
     return _Model(key_of, groups, sel, apply, key_of)
 
 
-def _model_edge(entries, inv):
+class _Sticky:
+    """Mimics Blender's UV sticky selection for edge / face mode.
+
+    Selecting an edge or face in Blender also selects the touching corners of the
+    neighbouring faces (same mesh vertex, same UV spot), so a move keeps the island
+    connected. Without this, overlapped edges / faces we add get torn off."""
+
+    def __init__(self, sticky):
+        if sticky == 'DISABLED':
+            self.fn = None
+        elif sticky == 'SHARED_VERTEX':
+            self.fn = lambda oi, vi, p: (oi, vi)
+        else:                                     # 'SHARED_LOCATION' (default)
+            self.fn = lambda oi, vi, p: (oi, vi, p)
+        self.clusters = {}                        # sticky key -> [(oi, loop)]
+        self.face_cks = {}                        # (oi, fi) -> [sticky key per corner]
+
+    def add_face(self, oi, fi, f, ps, vidx):
+        if self.fn is None:
+            return
+        cks = []
+        for l, p in zip(f.loops, ps):
+            ck = self.fn(oi, vidx[l.vert], p)
+            self.clusters.setdefault(ck, []).append((oi, l))
+            cks.append(ck)
+        self.face_cks[(oi, fi)] = cks
+
+    def flush(self, entries, face_keys):
+        """Corner (vertex) selection of every cluster touched by these faces =
+        'some selected edge in the cluster ends here'."""
+        cks = set()
+        for key in face_keys:
+            cks.update(self.face_cks.get(key, ()))
+        for ck in cks:
+            members = self.clusters[ck]
+            on = False
+            for oi, l in members:
+                acc = entries[oi][2]
+                if acc.esel(l) or acc.esel(l.link_loop_prev):
+                    on = True
+                    break
+            for oi, l in members:
+                entries[oi][2].set_vsel(l, on)
+
+
+def _model_edge(entries, inv, sticky):
     """UV sync OFF, edge mode. Unit = face corner edge, group = same pair of UV positions."""
     key_of, groups, loop_of, sel = {}, {}, {}, set()
+    st = _Sticky(sticky)
     for oi, (me, bm, acc) in enumerate(entries):
         pos, esel = acc.pos, acc.esel
+        vidx = {v: i for i, v in enumerate(bm.verts)} if st.fn else None
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
-            for k, l in enumerate(f.loops):
+            ls = list(f.loops)
+            ps = [pos(l, inv) for l in ls]
+            st.add_face(oi, fi, f, ps, vidx)
+            n = len(ls)
+            for k, l in enumerate(ls):
                 u = (oi, fi, k)
-                a, b = pos(l, inv), pos(l.link_loop_next, inv)
+                a, b = ps[k], ps[(k + 1) % n]
                 key = (a, b) if a <= b else (b, a)
                 key_of[u] = key
                 groups.setdefault(key, []).append(u)
@@ -389,16 +440,19 @@ def _model_edge(entries, inv):
                 l = loop_of[u]
                 entries[u[0]][2].set_esel(l, state)
                 faces[(u[0], u[1])] = l.face
-        for (oi, _fi), f in faces.items():
-            acc = entries[oi][2]
-            for l in f.loops:
-                acc.set_vsel(l, acc.esel(l) or acc.esel(l.link_loop_prev))
+        if st.fn is not None:
+            st.flush(entries, faces.keys())
+        else:
+            for (oi, _fi), f in faces.items():
+                acc = entries[oi][2]
+                for l in f.loops:
+                    acc.set_vsel(l, acc.esel(l) or acc.esel(l.link_loop_prev))
         return {oi for oi, _fi in faces}
 
     return _Model(key_of, groups, sel, apply, key_of)
 
 
-def _apply_faces(entries, face_of):
+def _apply_faces(entries, face_of, sticky=None):
     def apply(to_sel, to_desel):
         touched = set()
         for units, state in ((to_desel, False), (to_sel, True)):
@@ -408,27 +462,34 @@ def _apply_faces(entries, face_of):
                     acc.set_vsel(l, state)
                     acc.set_esel(l, state)
                 touched.add(u[0])
+        if sticky is not None and sticky.fn is not None:
+            sticky.flush(entries, list(to_sel) + list(to_desel))
         return touched
     return apply
 
 
-def _model_face(entries, inv):
-    """UV sync OFF, face mode. Unit = face, group = identical UV footprint."""
+def _model_face(entries, inv, sticky):
+    """UV sync OFF, face mode. Unit = face, group = identical UV footprint.
+    (In edge/face mode Blender treats a face as selected when all its EDGES are.)"""
     key_of, groups, face_of, sel = {}, {}, {}, set()
+    st = _Sticky(sticky)
     for oi, (me, bm, acc) in enumerate(entries):
-        pos, vsel = acc.pos, acc.vsel
+        pos, esel = acc.pos, acc.esel
+        vidx = {v: i for i, v in enumerate(bm.verts)} if st.fn else None
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
             u = (oi, fi)
             ls = list(f.loops)
-            key = tuple(sorted(pos(l, inv) for l in ls))
+            ps = [pos(l, inv) for l in ls]
+            st.add_face(oi, fi, f, ps, vidx)
+            key = tuple(sorted(ps))
             key_of[u] = key
             groups.setdefault(key, []).append(u)
             face_of[u] = f
-            if all(vsel(l) for l in ls):
+            if all(esel(l) for l in ls):
                 sel.add(u)
-    return _Model(key_of, groups, sel, _apply_faces(entries, face_of), key_of)
+    return _Model(key_of, groups, sel, _apply_faces(entries, face_of, st), key_of)
 
 
 def _model_island(entries, inv):
@@ -516,15 +577,15 @@ def _model_sync(mode, entries, inv):
     return _Model(key_of, groups, sel, apply, geo)
 
 
-def _build_model(mode, sync, entries, inv):
+def _build_model(mode, sync, entries, inv, sticky='SHARED_LOCATION'):
     if sync:
         return _model_sync(mode, entries, inv)
     if mode == 'VERTEX':
         return _model_vertex(entries, inv)
     if mode == 'EDGE':
-        return _model_edge(entries, inv)
+        return _model_edge(entries, inv, sticky)
     if mode == 'FACE':
-        return _model_face(entries, inv)
+        return _model_face(entries, inv, sticky)
     return _model_island(entries, inv)
 
 
@@ -557,7 +618,8 @@ def _process(context):
     topo = (mode, sync, round(inv)) + tuple(
         (len(bm.verts), len(bm.edges), len(bm.faces)) for _me, bm, _acc in entries)
 
-    model = _build_model(mode, sync, entries, inv)
+    sticky = getattr(ts, "uv_sticky_select_mode", 'SHARED_LOCATION')
+    model = _build_model(mode, sync, entries, inv, sticky)
     now = model.selected
 
     if S.prev is None or S.topo != topo:
