@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
@@ -587,7 +587,8 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
     bl_idname = "uv.vertex_pivot_scale"
     bl_label = "Scale Around Nearest Vertex"
     bl_description = ("Scale the selected UVs from the UV vertex closest to the mouse. "
-                      "Type a value, hold Ctrl to snap, Shift for precision, X/Y to constrain")
+                      "Type a value, hold Ctrl to snap to texture pixels, Shift for precision, "
+                      "X/Y to constrain")
     bl_options = {'REGISTER', 'UNDO'}
 
     value: FloatVectorProperty(name="Scale", size=2, default=(1.0, 1.0))
@@ -605,9 +606,39 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
         self.num_active = False
         self.buf = ""
         self.neg = False
-        self.status_text = ("Scale  |  Mouse / type value: factor  |  Ctrl: snap 0.1  |  "
+        self._measure_extent(context)
+        snap_label = "snap 1 px" if self.tex_size else "snap 0.1"
+        self.status_text = ("Scale  |  Mouse / type value: factor  |  "
+                            f"Ctrl: {snap_label}  |  "
                             "Shift: precision  |  X/Y: constrain axis  |  "
                             "LMB/Enter: confirm  |  Esc/RMB: cancel")
+
+    # -- texture pixel extent (for Ctrl pixel snapping) ----------------------
+
+    def _measure_extent(self, context):
+        """Pixel distance from the pivot to the farthest selected UV, per axis."""
+        img = getattr(context.space_data, "image", None)
+        if img is not None and img.size[0] > 0 and img.size[1] > 0:
+            self.tex_size = (img.size[0], img.size[1])
+        else:
+            self.tex_size = None
+        w, h = self.tex_size or (1, 1)
+        pu, pv = self.pivot
+        eu = ev = 0.0
+        for _me, _bm, items in self.objs:
+            for _luv, u0, v0 in items:
+                eu = max(eu, abs(u0 - pu) * w)
+                ev = max(ev, abs(v0 - pv) * h)
+        self.extent = (eu, ev)
+
+    def _pixel_extent(self):
+        """Extent (px) of the axis that drives the pixel snap, or 0 if none."""
+        eu, ev = self.extent
+        if self.constraint == 'X':
+            return eu
+        if self.constraint == 'Y':
+            return ev
+        return max(eu, ev)
 
     # -- mouse -> factor (incremental so Shift precision works mid-drag) ----
 
@@ -657,7 +688,13 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
                 self.num_active = False
 
     def _factor(self):
-        """Returns (factor, snap increment or None)."""
+        """Returns (factor, snap label or None).
+
+        Ctrl with a texture loaded snaps in whole texture pixels: the farthest
+        selected vertex from the pivot (along the constrained axis, or the
+        larger axis when unconstrained) always lands a whole number of pixels
+        from the pivot. Without a texture it falls back to 0.1 / 0.01 steps.
+        """
         if self.num_active:
             try:
                 f = float(self.buf) if self.buf else 1.0
@@ -665,8 +702,12 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
                 f = 1.0
             return (-f if self.neg else f), None
         if self.ctrl:
+            ext = self._pixel_extent() if self.tex_size else 0.0
+            if ext >= 0.5:
+                px = round(self.raw * ext)
+                return px / ext, f"snap 1 px: {px} px"
             inc = 0.01 if self.shift else 0.1
-            return round(self.raw / inc) * inc, inc
+            return round(self.raw / inc) * inc, f"snap {inc:g}"
         return self.raw, None
 
     def _axes(self, f):
@@ -689,7 +730,7 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
         else:
             text = f"{label}: {f:.4f}"
         if inc is not None:
-            text += f"   (snap {inc:g})"
+            text += f"   ({inc})"
         self.area.header_text_set(text)
         self.area.tag_redraw()
 

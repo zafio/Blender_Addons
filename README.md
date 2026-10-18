@@ -33,6 +33,6 @@ Rotates, mirrors and scales the UV selection using the closest vertex below the 
 
 - CTRL+R = Rotate around the nearest vertex
 - CTRL+X = Mirror around the nearest vertex (X again switches to Y axis, again turns mirror off)
-- < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps 0.1)
+- < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps in whole texture pixels, or 0.1 steps without a texture)
 - Enter & LMB = Accept
 - Esc & RMB = Cancel
