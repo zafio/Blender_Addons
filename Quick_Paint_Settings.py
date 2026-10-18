@@ -2,7 +2,7 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 10),
+    "version": (0, 0, 11),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor",
     "warning": "",
@@ -914,7 +914,9 @@ def paint_size_target(context, area):
         return 'VIEW3D' if context.mode == 'PAINT_TEXTURE' else None
     if area.type == 'IMAGE_EDITOR':
         space = area.spaces.active
-        mode = getattr(space, "ui_mode", None) or getattr(space, "mode", None)
+        # Read space.mode, not space.ui_mode: ui_mode has no 'UV' item, so reading it
+        # in the UV Editor prints "current value '3' matches no enum" warnings.
+        mode = getattr(space, "mode", None)
         return 'IMAGE' if mode == 'PAINT' else None
     return None
 
