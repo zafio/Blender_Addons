@@ -8,13 +8,15 @@ In the UV Editor, press the key of the select mode you are ALREADY in
       (same UV position) selected as well.
     * Deselecting an element deselects its overlapped partners too.
     * While active, the UV selection color turns RED.
-    * While active, the wire edges of stacked faces (identical UV footprint) are drawn
-      pale green and those of overlapping faces (partly covering another face) pale
-      blue. Toggle, colors and line width in the N panel.
 
 Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
 (unless "Keep On When Changing Mode" is enabled in the sidebar panel).
+
+Shift + 1 / 2 / 3 / 4 toggles a wire display (independent of overlap selection):
+    * stacked faces (identical UV footprint) get a pale green wire,
+    * overlapping faces (partly covering another face) a mauve wire.
+    Colors and line width in the N panel.
 
 Works with UV Sync Selection on or off (island mode only exists with sync off).
 Sidebar: UV Editor > N panel > "Overlap" tab.
@@ -23,12 +25,12 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 1, 2),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
-    "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
+    "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
-                   "elements (vertex, edge, face, island). Selection turns red while active; "
-                   "stacked faces get a pale green wire, overlapping faces a pale blue one.",
+                   "elements (vertex, edge, face, island). Selection turns red while active. "
+                   "Shift+1/2/3/4 shows stacked (green) / overlapping (mauve) faces.",
     "category": "UV",
 }
 
@@ -69,6 +71,11 @@ class _State:
     def __init__(self):
         self.token = 0          # id of the current watcher
         self.heartbeat = 0.0    # last time the watcher ticked
+        self.ov_green = []      # wire lines (UV coords): stacked faces
+        self.ov_blue = []       # wire lines (UV coords): overlapping faces (mauve)
+        self.ov_batches = None
+        self.ov_sig = None
+        self.ov_counts = (0, 0, True)
         self.reset()
 
     def reset(self):
@@ -84,11 +91,6 @@ class _State:
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
         self.mouse_time = 0.0
-        self.ov_green = []      # overlay triangles (UV coords): stacked faces
-        self.ov_blue = []       # overlay triangles (UV coords): overlapping faces
-        self.ov_batches = None
-        self.ov_sig = None
-        self.ov_counts = (0, 0, True)
 
 
 S = _State()
@@ -647,6 +649,9 @@ def _process(context):
     model = _build_model(mode, sync, entries, inv, sticky)
     now = model.selected
     _update_overlay(context, entries, sync, inv, topo, model)
+    if not wm.uv_overlap_active:          # only the Shift wire display is on
+        S.prev = None
+        return
 
     if S.prev is None or S.topo != topo:
         prev = set()
@@ -873,7 +878,7 @@ def _draw_overlay():
     try:
         ctx = bpy.context
         wm = ctx.window_manager
-        if not wm.uv_overlap_active or not wm.uv_overlap_show:
+        if not wm.uv_overlap_show:
             return
         if not S.ov_green and not S.ov_blue:
             return
@@ -1023,6 +1028,34 @@ class UV_OT_overlap_toggle(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class UV_OT_overlap_wire_toggle(bpy.types.Operator):
+    """Show / hide the wire of stacked (green) and overlapping (mauve) faces"""
+    bl_idname = "uv.overlap_wire_toggle"
+    bl_label = "Toggle Stacked / Overlapping Wire"
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        wm = context.window_manager
+        on = not wm.uv_overlap_show
+        wm.uv_overlap_show = on
+        try:
+            if on:
+                S.ov_sig = None
+                if not wm.uv_overlap_active:     # overlap select keeps its own watcher
+                    bpy.ops.uv.overlap_watch('INVOKE_DEFAULT')
+                _process(context)
+        except Exception as ex:
+            traceback.print_exc()
+            self.report({'ERROR'}, "UV Overlap Select: %s" % ex)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Stacked / overlapping wire %s" % ("ON" if on else "OFF"))
+        return {'FINISHED'}
+
+
 def _last_op_deselects(wm):
     """True if the last operator was a deselecting click (toggle / deselect)."""
     try:
@@ -1080,7 +1113,7 @@ class UV_OT_overlap_watch(bpy.types.Operator):
 
     def modal(self, context, event):
         wm = context.window_manager
-        if self._token != S.token or not wm.uv_overlap_active:
+        if self._token != S.token or not (wm.uv_overlap_active or wm.uv_overlap_show):
             return self._stop(context)
 
         if event.type == 'TIMER':
@@ -1089,16 +1122,20 @@ class UV_OT_overlap_watch(bpy.types.Operator):
             ts = context.tool_settings
 
             if context.mode != 'EDIT_MESH':
-                set_overlap_active(context, False)
-                return self._stop(context)
+                if wm.uv_overlap_active:
+                    set_overlap_active(context, False)
+                if not wm.uv_overlap_show:
+                    return self._stop(context)
+                return {'PASS_THROUGH'}
 
             armed = (_current_mode(ts), bool(ts.use_uv_select_sync))
-            if S.armed is not None and S.armed != armed:
+            if wm.uv_overlap_active and S.armed is not None and S.armed != armed:
                 if wm.uv_overlap_keep:
                     S.armed, S.prev = armed, None
                 else:
                     set_overlap_active(context, False)
-                    return self._stop(context)
+                    if not wm.uv_overlap_show:
+                        return self._stop(context)
 
             # Blender selects on press AND again on click (release); expanding in
             # between gets undone by the second pass, so wait for the click to end.
@@ -1180,23 +1217,27 @@ class UV_PT_overlap_select(bpy.types.Panel):
         layout.prop(wm, "uv_overlap_keep")
 
         box = layout.box()
-        box.prop(wm, "uv_overlap_show")
+        show = wm.uv_overlap_show
+        box.operator("uv.overlap_wire_toggle",
+                     text="Stacked / Overlapping Wire: %s" % ("ON" if show else "OFF"),
+                     icon='MOD_WIREFRAME', depress=show)
         sub = box.column()
-        sub.enabled = wm.uv_overlap_show
+        sub.enabled = show
         row = sub.row()
         row.prop(wm, "uv_overlap_color_stacked", text="Stacked")
         row = sub.row()
         row.prop(wm, "uv_overlap_color_overlap", text="Overlapping")
         sub.prop(wm, "uv_overlap_line_width")
-        if active and wm.uv_overlap_show:
+        if show:
             n_st, n_ov, checked = S.ov_counts
             sub.label(text="Stacked faces: %d" % n_st)
             sub.label(text=("Overlapping faces: %d" % n_ov) if checked
                       else "Overlapping: mesh too dense, skipped")
         col = layout.column(align=True)
         col.scale_y = 0.85
-        col.label(text="Press 1/2/3/4 again on the")
-        col.label(text="active mode to toggle.")
+        col.label(text="1/2/3/4 again on the active")
+        col.label(text="mode: overlap select.")
+        col.label(text="Shift+1/2/3/4: wire display.")
 
 
 class UVOVERLAP_Prefs(bpy.types.AddonPreferences):
@@ -1222,6 +1263,7 @@ def _on_load_post(_dummy):
     S.token += 1
     try:
         bpy.context.window_manager.uv_overlap_active = False
+        bpy.context.window_manager.uv_overlap_show = False
         _theme_restore(bpy.context)
     except Exception:
         pass
@@ -1231,6 +1273,7 @@ _classes = (
     UVOVERLAP_Prefs,
     UV_OT_overlap_mode_key,
     UV_OT_overlap_toggle,
+    UV_OT_overlap_wire_toggle,
     UV_OT_overlap_watch,
     UV_PT_overlap_select,
 )
@@ -1251,16 +1294,16 @@ def register():
         description="Max UV distance for two elements to count as overlapped",
         default=0.0001, min=1e-7, max=0.01, precision=6)
     wm_t.uv_overlap_show = BoolProperty(
-        name="Show Stacked / Overlapping",
-        description="While overlap select is on, tint stacked faces (identical UV footprint) "
-                    "and overlapping faces (partly covering another face)",
-        default=True, update=_overlay_prop_update)
+        name="Show Stacked / Overlapping Wire",
+        description="Draw the wire of stacked faces (identical UV footprint, green) and "
+                    "overlapping faces (partly covering another face, mauve). Shift+1/2/3/4",
+        default=False, options={'SKIP_SAVE'}, update=_overlay_prop_update)
     wm_t.uv_overlap_color_stacked = FloatVectorProperty(
         name="Stacked Color", subtype='COLOR', size=4, min=0.0, max=1.0,
         default=(0.6, 1.0, 0.65, 1.0), update=_overlay_prop_update)
     wm_t.uv_overlap_color_overlap = FloatVectorProperty(
         name="Overlapping Color", subtype='COLOR', size=4, min=0.0, max=1.0,
-        default=(0.6, 0.8, 1.0, 1.0), update=_overlay_prop_update)
+        default=(0.88, 0.69, 1.0, 1.0), update=_overlay_prop_update)     # mauve
     wm_t.uv_overlap_line_width = FloatProperty(
         name="Line Width", description="Thickness of the stacked / overlapping wire",
         default=1.0, min=0.5, max=8.0, step=10, precision=1, update=_overlay_prop_update)
@@ -1277,6 +1320,8 @@ def register():
         for key, mode in (('ONE', 'VERTEX'), ('TWO', 'EDGE'), ('THREE', 'FACE'), ('FOUR', 'ISLAND')):
             kmi = km.keymap_items.new("uv.overlap_mode_key", key, 'PRESS')
             kmi.properties.mode = mode
+            _addon_keymaps.append((km, kmi))
+            kmi = km.keymap_items.new("uv.overlap_wire_toggle", key, 'PRESS', shift=True)
             _addon_keymaps.append((km, kmi))
 
     if _on_load_post not in bpy.app.handlers.load_post:
