@@ -21,7 +21,7 @@ bl_info = {
     "name": "Rename Tools",
     "author": "Julio Iglesias & Luca Scheller ",
     "version": (1,0),
-    "blender": (2, 74, 0),
+    "blender": (4, 5, 0),
     "location": "",
     "description": "",
     "warning": "",
@@ -31,7 +31,7 @@ bl_info = {
 }
 
 import bpy
-import bgl, blf, bmesh
+import blf, bmesh
 import math, time, os, re
 from bpy.app.handlers import persistent
 from math import floor,ceil,log10,radians,degrees
@@ -39,6 +39,28 @@ from random import uniform as rand
 from mathutils import Vector, Matrix, Color
 
 keyboard_inputs = ['NONE', 'LEFTMOUSE', 'MIDDLEMOUSE', 'RIGHTMOUSE', 'BUTTON4MOUSE', 'BUTTON5MOUSE', 'BUTTON6MOUSE', 'BUTTON7MOUSE', 'ACTIONMOUSE', 'SELECTMOUSE', 'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'TRACKPADPAN', 'TRACKPADZOOM', 'MOUSEROTATE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'WHEELINMOUSE', 'WHEELOUTMOUSE', 'EVT_TWEAK_L', 'EVT_TWEAK_M', 'EVT_TWEAK_R', 'EVT_TWEAK_A', 'EVT_TWEAK_S', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE', 'LEFT_CTRL', 'LEFT_ALT', 'LEFT_SHIFT', 'RIGHT_ALT', 'RIGHT_CTRL', 'RIGHT_SHIFT', 'OSKEY', 'GRLESS', 'TAB', 'SPACE', 'LINE_FEED', 'BACK_SPACE', 'DEL', 'SEMI_COLON', 'PERIOD', 'COMMA', 'QUOTE', 'ACCENT_GRAVE', 'MINUS', 'SLASH', 'BACK_SLASH', 'EQUAL', 'LEFT_BRACKET', 'RIGHT_BRACKET', 'LEFT_ARROW', 'DOWN_ARROW', 'RIGHT_ARROW', 'UP_ARROW', 'NUMPAD_2', 'NUMPAD_4', 'NUMPAD_6', 'NUMPAD_8', 'NUMPAD_1', 'NUMPAD_3', 'NUMPAD_5', 'NUMPAD_7', 'NUMPAD_9', 'NUMPAD_PERIOD', 'NUMPAD_SLASH', 'NUMPAD_ASTERIX', 'NUMPAD_0', 'NUMPAD_MINUS', 'NUMPAD_ENTER', 'NUMPAD_PLUS', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18', 'F19', 'PAUSE', 'INSERT', 'HOME', 'PAGE_UP', 'PAGE_DOWN', 'END', 'MEDIA_PLAY', 'MEDIA_STOP', 'MEDIA_FIRST', 'MEDIA_LAST', 'TEXTINPUT', 'WINDOW_DEACTIVATE', 'TIMER', 'TIMER0', 'TIMER1', 'TIMER2', 'TIMER_JOBS', 'TIMER_AUTOSAVE', 'TIMER_REPORT', 'TIMERREGION', 'NDOF_MOTION', 'NDOF_BUTTON_MENU', 'NDOF_BUTTON_FIT', 'NDOF_BUTTON_TOP', 'NDOF_BUTTON_BOTTOM', 'NDOF_BUTTON_LEFT', 'NDOF_BUTTON_RIGHT', 'NDOF_BUTTON_FRONT', 'NDOF_BUTTON_BACK', 'NDOF_BUTTON_ISO1', 'NDOF_BUTTON_ISO2', 'NDOF_BUTTON_ROLL_CW', 'NDOF_BUTTON_ROLL_CCW', 'NDOF_BUTTON_SPIN_CW', 'NDOF_BUTTON_SPIN_CCW', 'NDOF_BUTTON_TILT_CW', 'NDOF_BUTTON_TILT_CCW', 'NDOF_BUTTON_ROTATE', 'NDOF_BUTTON_PANZOOM', 'NDOF_BUTTON_DOMINANT', 'NDOF_BUTTON_PLUS', 'NDOF_BUTTON_MINUS', 'NDOF_BUTTON_ESC', 'NDOF_BUTTON_ALT', 'NDOF_BUTTON_SHIFT', 'NDOF_BUTTON_CTRL', 'NDOF_BUTTON_1', 'NDOF_BUTTON_2', 'NDOF_BUTTON_3', 'NDOF_BUTTON_4', 'NDOF_BUTTON_5', 'NDOF_BUTTON_6', 'NDOF_BUTTON_7', 'NDOF_BUTTON_8', 'NDOF_BUTTON_9', 'NDOF_BUTTON_10', 'NDOF_BUTTON_A', 'NDOF_BUTTON_B', 'NDOF_BUTTON_C']
+
+##################################################################################################################### Helpers
+
+def get_addon_prefs():
+    # The add-on entry may not exist yet while register() runs for the first time
+    addon = bpy.context.preferences.addons.get(__name__)
+    return addon.preferences if addon is not None else None
+
+def find_rename_keymap_item():
+    # Blender 2.8+ renamed the 'Blender User' keyconfig to 'user'. Look in the user
+    # keyconfig first (it holds the hotkey the user actually sees), then fall back.
+    kcs = bpy.context.window_manager.keyconfigs
+    for kc in (kcs.user, kcs.active, kcs.addon):
+        if kc is None:
+            continue
+        km = kc.keymaps.get('3D View')
+        if km is None:
+            continue
+        for kmi in km.keymap_items:
+            if kmi.idname == 'rt.rename':
+                return kmi
+    return None
 
 ##################################################################################################################### Operators
 
@@ -48,7 +70,7 @@ class RT_Rename(bpy.types.Operator):
     bl_description = "Rename Active Object"
     bl_options = {"REGISTER","BLOCKING","UNDO","INTERNAL"}
 
-    Rename_Name = bpy.props.StringProperty(name="Name",default="")
+    Rename_Name: bpy.props.StringProperty(name="Name",default="")
     Rename_Warning = False
     Rename_ExistingNames = []
     Modal_Timer_Invoke = 0
@@ -79,8 +101,18 @@ class RT_Rename(bpy.types.Operator):
         self.Rename_Name = active_object.name
         self.Rename_ExistingNames = bpy.data.objects.keys()
         self.Modal_Timer_Invoke = time.time()
-        KM = bpy.context.window_manager.keyconfigs['Blender User'].keymaps['3D View'].keymap_items['rt.rename']
-        self.KM_Input = {"type":KM.type,"shift":KM.shift,"ctrl":KM.ctrl,"alt":KM.alt}
+        KM = find_rename_keymap_item()
+        if KM is not None:
+            self.KM_Input = {"type":KM.type,"shift":KM.shift,"ctrl":KM.ctrl,"alt":KM.alt}
+        else:
+            # Hotkey not found: fall back to the add-on defaults so invoke never crashes
+            prefs = get_addon_prefs()
+            self.KM_Input = {
+                "type": prefs.RT_Rename_Hotkey_Ascii.upper() if prefs else "R",
+                "shift": prefs.RT_Rename_Hotkey_Shift if prefs else False,
+                "ctrl": prefs.RT_Rename_Hotkey_Ctrl if prefs else True,
+                "alt": prefs.RT_Rename_Hotkey_Alt if prefs else True,
+            }
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
@@ -128,7 +160,7 @@ class RT_Rename(bpy.types.Operator):
             context.area.header_text_set()
             return {'FINISHED'}
         else:
-            self.Rename_Name += event.ascii
+            self.Rename_Name += (event.unicode or "")
             modal_feedback(self,context)
             return {'RUNNING_MODAL'}
 
@@ -192,31 +224,32 @@ class RT_DuplicateRename_Macro(bpy.types.Macro):
 ##################################################################################################################### Add-on Prefs
 
 def Hotkey_Update(self,context):
-    #user_preferences = context.user_preferences
-    #addon_prefs = user_preferences.addons[__name__].preferences
-    bpy.context.window_manager.keyconfigs['Blender User'].keymaps['3D View'].keymap_items['rt.rename'].type = self.RT_Rename_Hotkey_Ascii[0].upper()
-    bpy.context.window_manager.keyconfigs['Blender User'].keymaps['3D View'].keymap_items['rt.rename'].shift = self.RT_Rename_Hotkey_Shift
-    bpy.context.window_manager.keyconfigs['Blender User'].keymaps['3D View'].keymap_items['rt.rename'].ctrl = self.RT_Rename_Hotkey_Ctrl
-    bpy.context.window_manager.keyconfigs['Blender User'].keymaps['3D View'].keymap_items['rt.rename'].alt = self.RT_Rename_Hotkey_Alt
+    kmi = find_rename_keymap_item()
+    if kmi is None or not self.RT_Rename_Hotkey_Ascii:
+        return
+    kmi.type = self.RT_Rename_Hotkey_Ascii[0].upper()
+    kmi.shift = self.RT_Rename_Hotkey_Shift
+    kmi.ctrl = self.RT_Rename_Hotkey_Ctrl
+    kmi.alt = self.RT_Rename_Hotkey_Alt
 
 class RT_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
-    RT_Rename_Hotkey_Ascii = bpy.props.StringProperty(name="Rename Hotkey",default="R",maxlen=1,update = Hotkey_Update)
-    RT_Rename_Hotkey_Shift = bpy.props.BoolProperty(name="Rename Hotkey Shift",default=False,update = Hotkey_Update)
-    RT_Rename_Hotkey_Ctrl = bpy.props.BoolProperty(name="Rename Hotkey Ctrl",default=True,update = Hotkey_Update)
-    RT_Rename_Hotkey_Alt = bpy.props.BoolProperty(name="Rename Hotkey Alt",default=True,update = Hotkey_Update)
+    RT_Rename_Hotkey_Ascii: bpy.props.StringProperty(name="Rename Hotkey",default="R",maxlen=1,update = Hotkey_Update)
+    RT_Rename_Hotkey_Shift: bpy.props.BoolProperty(name="Rename Hotkey Shift",default=False,update = Hotkey_Update)
+    RT_Rename_Hotkey_Ctrl: bpy.props.BoolProperty(name="Rename Hotkey Ctrl",default=True,update = Hotkey_Update)
+    RT_Rename_Hotkey_Alt: bpy.props.BoolProperty(name="Rename Hotkey Alt",default=True,update = Hotkey_Update)
 
     def draw(self, context):
         layout = self.layout
         col = layout.column()
         row = col.row()
-        split = row.split(percentage=0.2)
+        split = row.split(factor=0.2)
         col_left = split.column()
         col_left.label(text = "Rename Hotkey:")
         col_right = split.column()
         row = col_right.row()
-        split = row.split(percentage=0.5)
+        split = row.split(factor=0.5)
         col_left = split.row()
         col_left.prop(self, 'RT_Rename_Hotkey_Ascii',text="")
         col_right = split.row()
@@ -243,11 +276,14 @@ def register():
     RT_DuplicateRename_Macro.define("TRANSFORM_OT_translate")
 
     # KeyMaps
-    user_preferences = bpy.context.user_preferences
-    addon_prefs = user_preferences.addons[__name__].preferences
+    addon_prefs = get_addon_prefs()
+    hk_ascii = addon_prefs.RT_Rename_Hotkey_Ascii if addon_prefs else 'R'
+    hk_ctrl = addon_prefs.RT_Rename_Hotkey_Ctrl if addon_prefs else True
+    hk_alt = addon_prefs.RT_Rename_Hotkey_Alt if addon_prefs else True
+    hk_shift = addon_prefs.RT_Rename_Hotkey_Shift if addon_prefs else False
     global RT_addon_keymaps
     km = bpy.context.window_manager.keyconfigs.addon.keymaps.new(name='3D View', space_type='VIEW_3D')
-    kmi = km.keymap_items.new('rt.rename',addon_prefs.RT_Rename_Hotkey_Ascii,'PRESS',ctrl=addon_prefs.RT_Rename_Hotkey_Ctrl,alt=addon_prefs.RT_Rename_Hotkey_Alt,shift=addon_prefs.RT_Rename_Hotkey_Shift)
+    kmi = km.keymap_items.new('rt.rename',hk_ascii.upper(),'PRESS',ctrl=hk_ctrl,alt=hk_alt,shift=hk_shift)
     RT_addon_keymaps.append(km)
     km = bpy.context.window_manager.keyconfigs.addon.keymaps.new(name='Object Mode', space_type='EMPTY')
     kmi = km.keymap_items.new('rt.duplicaterename_macro','D','PRESS',shift=True)
