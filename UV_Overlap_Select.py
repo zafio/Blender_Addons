@@ -20,7 +20,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 1),
+    "version": (1, 0, 2),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -45,6 +45,7 @@ _RED = (1.0, 0.10, 0.10)
 _THEME_PROPS = ("vertex_select", "edge_select", "face_select", "face_dot")
 _MESH_MODE = {'VERTEX': 'VERT', 'EDGE': 'EDGE', 'FACE': 'FACE'}
 _ACTIVE_VALUES = {'PRESS', 'RELEASE', 'CLICK', 'DOUBLE_CLICK', 'CLICK_DRAG'}
+_MOUSE_BUTTONS = {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'PEN', 'ERASER'}
 
 _saved_theme = {}
 _addon_keymaps = []
@@ -67,6 +68,9 @@ class _State:
         self.ops_sig = None
         self.last_check = 0.0
         self.interval = 0.4
+        self.geo = {}           # unit -> UV position signature at our last snapshot
+        self.mouse_down = False
+        self.mouse_time = 0.0
 
 
 S = _State()
@@ -228,10 +232,26 @@ def _groups_from_dsu(dsu):
 
 
 class _Model:
-    __slots__ = ("key_of", "groups", "selected", "apply")
+    __slots__ = ("key_of", "groups", "selected", "apply", "geo")
 
-    def __init__(self, key_of, groups, selected, apply):
+    def __init__(self, key_of, groups, selected, apply, geo):
         self.key_of, self.groups, self.selected, self.apply = key_of, groups, selected, apply
+        self.geo = geo          # unit -> UV position signature (to detect moves)
+
+
+_WATCH_IDS = {"UV_OT_overlap_watch", "uv.overlap_watch"}
+
+
+def _foreign_modal_running(context):
+    """True while another modal operator (move, rotate, box select...) is running."""
+    win = context.window
+    mods = getattr(win, "modal_operators", None) if win else None
+    if mods is None:
+        return False
+    for op in mods:
+        if getattr(op, "bl_idname", "") not in _WATCH_IDS:
+            return True
+    return False
 
 
 def _is_uv_editor(context):
@@ -280,9 +300,8 @@ def _collect(context):
         acc = _make_access(bm)
         if acc is None:
             continue
-        bm.verts.index_update()
-        bm.edges.index_update()
-        bm.faces.index_update()
+        # NOTE: never call index_update() here - it writes to the mesh and breaks
+        # running transforms. Units are identified by enumeration order instead.
         out.append((me, bm, acc))
     return out
 
@@ -298,10 +317,9 @@ def _model_vertex(entries, inv):
     key_of, groups, loop_of, sel = {}, {}, {}, set()
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
-        for f in bm.faces:
+        for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
-            fi = f.index
             for k, l in enumerate(f.loops):
                 u = (oi, fi, k)
                 key = pos(l, inv)
@@ -324,7 +342,7 @@ def _model_vertex(entries, inv):
                 acc.set_esel(l, acc.vsel(l) and acc.vsel(l.link_loop_next))
         return {oi for oi, _fi in faces}
 
-    return _Model(key_of, groups, sel, apply)
+    return _Model(key_of, groups, sel, apply, key_of)
 
 
 def _model_edge(entries, inv):
@@ -332,10 +350,9 @@ def _model_edge(entries, inv):
     key_of, groups, loop_of, sel = {}, {}, {}, set()
     for oi, (me, bm, acc) in enumerate(entries):
         pos, esel = acc.pos, acc.esel
-        for f in bm.faces:
+        for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
-            fi = f.index
             for k, l in enumerate(f.loops):
                 u = (oi, fi, k)
                 a, b = pos(l, inv), pos(l.link_loop_next, inv)
@@ -359,7 +376,7 @@ def _model_edge(entries, inv):
                 acc.set_vsel(l, acc.esel(l) or acc.esel(l.link_loop_prev))
         return {oi for oi, _fi in faces}
 
-    return _Model(key_of, groups, sel, apply)
+    return _Model(key_of, groups, sel, apply, key_of)
 
 
 def _apply_faces(entries, face_of):
@@ -381,10 +398,10 @@ def _model_face(entries, inv):
     key_of, groups, face_of, sel = {}, {}, {}, set()
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
-        for f in bm.faces:
+        for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
-            u = (oi, f.index)
+            u = (oi, fi)
             ls = list(f.loops)
             key = tuple(sorted(pos(l, inv) for l in ls))
             key_of[u] = key
@@ -392,20 +409,21 @@ def _model_face(entries, inv):
             face_of[u] = f
             if all(vsel(l) for l in ls):
                 sel.add(u)
-    return _Model(key_of, groups, sel, _apply_faces(entries, face_of))
+    return _Model(key_of, groups, sel, _apply_faces(entries, face_of), key_of)
 
 
 def _model_island(entries, inv):
     """UV sync OFF, island mode. Unit = face; group = UV island plus every island
     that shares an identical face footprint with it (stacked / mirrored islands)."""
     dsu = _DSU()
-    seen_v, seen_sig, face_of, sel = {}, {}, {}, set()
+    seen_v, seen_sig, face_of, sel, geo = {}, {}, {}, set(), {}
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
-        for f in bm.faces:
+        vidx = {v: i for i, v in enumerate(bm.verts)}
+        for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
-            fu = (oi, f.index)
+            fu = (oi, fi)
             dsu.add(fu)
             face_of[fu] = f
             ps = []
@@ -413,47 +431,53 @@ def _model_island(entries, inv):
             for l in f.loops:
                 p = pos(l, inv)
                 ps.append(p)
-                _seen_union(dsu, seen_v, (oi, l.vert.index, p), fu)
+                _seen_union(dsu, seen_v, (oi, vidx[l.vert], p), fu)
                 if all_sel and not vsel(l):
                     all_sel = False
-            _seen_union(dsu, seen_sig, tuple(sorted(ps)), fu)
+            sig = tuple(sorted(ps))
+            geo[fu] = sig
+            _seen_union(dsu, seen_sig, sig, fu)
             if all_sel:
                 sel.add(fu)
     key_of, groups = _groups_from_dsu(dsu)
-    return _Model(key_of, groups, sel, _apply_faces(entries, face_of))
+    return _Model(key_of, groups, sel, _apply_faces(entries, face_of), geo)
 
 
 def _model_sync(mode, entries, inv):
     """UV sync ON. Unit = mesh vertex / edge / face. Units that share a UV position
     (or footprint) are chained into one overlap cluster."""
     dsu = _DSU()
-    seen, obj_of = {}, {}
+    seen, obj_of, geo = {}, {}, {}
     for oi, (me, bm, acc) in enumerate(entries):
         pos = acc.pos
-        for f in bm.faces:
+        if mode == 'VERTEX':
+            idx = {v: i for i, v in enumerate(bm.verts)}
+        elif mode == 'EDGE':
+            idx = {e: i for i, e in enumerate(bm.edges)}
+        for fi, f in enumerate(bm.faces):
             if f.hide:
                 continue
             if mode == 'FACE':
-                u = (oi, f.index)
-                if u not in obj_of:
-                    dsu.add(u)
-                    obj_of[u] = f
+                u = (oi, fi)
                 key = tuple(sorted(pos(l, inv) for l in f.loops))
+                dsu.add(u)
+                obj_of[u] = f
+                geo[u] = key
                 _seen_union(dsu, seen, key, u)
                 continue
             for l in f.loops:
                 if mode == 'VERTEX':
                     o = l.vert
-                    u = (oi, o.index)
                     key = pos(l, inv)
                 else:
                     o = l.edge
-                    u = (oi, o.index)
                     a, b = pos(l, inv), pos(l.link_loop_next, inv)
                     key = (a, b) if a <= b else (b, a)
+                u = (oi, idx[o])
                 if u not in obj_of:
                     dsu.add(u)
                     obj_of[u] = o
+                    geo[u] = key
                 _seen_union(dsu, seen, key, u)
     key_of, groups = _groups_from_dsu(dsu)
     sel = {u for u, o in obj_of.items() if o.select}
@@ -470,7 +494,7 @@ def _model_sync(mode, entries, inv):
             entries[oi][1].select_flush_mode()
         return touched
 
-    return _Model(key_of, groups, sel, apply)
+    return _Model(key_of, groups, sel, apply, geo)
 
 
 def _build_model(mode, sync, entries, inv):
@@ -489,7 +513,19 @@ def _build_model(mode, sync, entries, inv):
 # Core: expand / shrink the selection by overlap groups
 # --------------------------------------------------------------------------
 
+def _snapshot(model, sel, topo):
+    S.prev = set(sel)
+    S.geo = model.geo           # positions of ALL units, to tell moves from selections
+    S.topo = topo
+
+
 def _process(context):
+    # Never read or write the mesh while something else is working on it
+    # (move / rotate / scale / box select / a held mouse button) - touching the
+    # mesh mid-transform is what tore the UVs apart.
+    if S.mouse_down or _foreign_modal_running(context):
+        return
+
     wm = context.window_manager
     ts = context.tool_settings
     sync = bool(ts.use_uv_select_sync)
@@ -503,10 +539,22 @@ def _process(context):
 
     model = _build_model(mode, sync, entries, inv)
     now = model.selected
-    prev = S.prev if (S.prev is not None and S.topo == topo) else set()
+
+    if S.prev is None or S.topo != topo:
+        prev = set()
+    else:
+        prev = S.prev
+        # If any selected element moved since our last look, the change came from a
+        # transform (incl. click-drag), not a plain selection: just take a new snapshot
+        # so nothing at the drop position gets grabbed.
+        geo_now, geo_old = model.geo, S.geo
+        for u in now:
+            if geo_now.get(u) != geo_old.get(u):
+                _snapshot(model, now, topo)
+                return
 
     if now == prev:
-        S.prev, S.topo = prev, topo
+        _snapshot(model, now, topo)
         return
 
     key_of, groups = model.key_of, model.groups
@@ -528,7 +576,7 @@ def _process(context):
             bmesh.update_edit_mesh(entries[oi][0], loop_triangles=False, destructive=False)
         _tag_redraw(context)
 
-    S.prev, S.topo = final, topo
+    _snapshot(model, final, topo)
 
 
 def set_overlap_active(context, state):
@@ -671,6 +719,9 @@ class UV_OT_overlap_watch(bpy.types.Operator):
             now = time.monotonic()
             S.heartbeat = now
             ts = context.tool_settings
+            # A release that happened outside the window never reaches us
+            if S.mouse_down and now - S.mouse_time > 15.0:
+                S.mouse_down = False
 
             if context.mode != 'EDIT_MESH':
                 set_overlap_active(context, False)
@@ -706,9 +757,16 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     return self._stop(context)
                 S.interval = max(0.4, (time.perf_counter() - t0) * 10.0)
 
-        elif event.value in _ACTIVE_VALUES:
-            S.dirty = True
-            S.dirty_time = time.monotonic()
+        else:
+            if event.type in _MOUSE_BUTTONS:
+                if event.value == 'PRESS':
+                    S.mouse_down = True
+                    S.mouse_time = time.monotonic()
+                elif event.value == 'RELEASE':
+                    S.mouse_down = False
+            if event.value in _ACTIVE_VALUES:
+                S.dirty = True
+                S.dirty_time = time.monotonic()
 
         return {'PASS_THROUGH'}
 
