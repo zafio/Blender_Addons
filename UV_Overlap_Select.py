@@ -13,7 +13,7 @@ Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
 (unless "Keep On When Changing Mode" is enabled in the sidebar panel).
 
-Shift + 1 / 2 / 3 / 4 toggles a wire display (independent of overlap selection):
+Shift + 1 / 2 / 3 / 4 (or Shift + W) toggles a wire display (independent of overlap selection):
     * stacked faces (identical UV footprint) get a pale green wire,
     * overlapping faces (partly covering another face) a mauve wire.
     Colors and line width in the N panel.
@@ -25,12 +25,12 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (4, 5, 0),
-    "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 | N panel > Overlap",
+    "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
                    "elements (vertex, edge, face, island). Selection turns red while active. "
-                   "Shift+1/2/3/4 shows stacked (green) / overlapping (mauve) faces.",
+                   "Shift+1/2/3/4 or Shift+W shows stacked (green) / overlapping (mauve) faces.",
     "category": "UV",
 }
 
@@ -1237,7 +1237,8 @@ class UV_PT_overlap_select(bpy.types.Panel):
         col.scale_y = 0.85
         col.label(text="1/2/3/4 again on the active")
         col.label(text="mode: overlap select.")
-        col.label(text="Shift+1/2/3/4: wire display.")
+        col.label(text="Shift+1/2/3/4 or Shift+W:")
+        col.label(text="wire display.")
 
 
 class UVOVERLAP_Prefs(bpy.types.AddonPreferences):
@@ -1296,7 +1297,7 @@ def register():
     wm_t.uv_overlap_show = BoolProperty(
         name="Show Stacked / Overlapping Wire",
         description="Draw the wire of stacked faces (identical UV footprint, green) and "
-                    "overlapping faces (partly covering another face, mauve). Shift+1/2/3/4",
+                    "overlapping faces (partly covering another face, mauve). Shift+1/2/3/4 or Shift+W",
         default=False, options={'SKIP_SAVE'}, update=_overlay_prop_update)
     wm_t.uv_overlap_color_stacked = FloatVectorProperty(
         name="Stacked Color", subtype='COLOR', size=4, min=0.0, max=1.0,
@@ -1323,6 +1324,8 @@ def register():
             _addon_keymaps.append((km, kmi))
             kmi = km.keymap_items.new("uv.overlap_wire_toggle", key, 'PRESS', shift=True)
             _addon_keymaps.append((km, kmi))
+        kmi = km.keymap_items.new("uv.overlap_wire_toggle", 'W', 'PRESS', shift=True)
+        _addon_keymaps.append((km, kmi))
 
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
