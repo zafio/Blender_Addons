@@ -1,11 +1,11 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 5, 0),
-    "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror)",
-    "description": "Allows to rotate and mirror the selection using the closest vertex "
-                   "below the cursor as pivot. CTRL+R & CTRL+X (twice for Y)",
+    "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
+    "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
+                   "below the cursor as pivot. CTRL+R, CTRL+X (twice for Y) & <",
     "category": "UV",
 }
 
@@ -572,10 +572,150 @@ class UV_OT_vertex_pivot_mirror(_PivotTransform, bpy.types.Operator):
 
 
 # ----------------------------------------------------------------------------
+# Scale  (<)
+# ----------------------------------------------------------------------------
+
+def _scale_uvs(objs, pivot, sx, sy):
+    pu, pv = pivot
+    for _me, _bm, items in objs:
+        for luv, u0, v0 in items:
+            luv.uv = (pu + (u0 - pu) * sx, pv + (v0 - pv) * sy)
+    _update_meshes(objs)
+
+
+class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
+    bl_idname = "uv.vertex_pivot_scale"
+    bl_label = "Scale Around Nearest Vertex"
+    bl_description = ("Scale the selected UVs from the UV vertex closest to the mouse. "
+                      "Type a value, hold Ctrl to snap, Shift for precision, X/Y to constrain")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    value: FloatVectorProperty(name="Scale", size=2, default=(1.0, 1.0))
+    pivot: FloatVectorProperty(name="Pivot", size=2, default=(0.0, 0.0))
+
+    MIN_START_DIST = 10.0   # px; avoids huge jumps when starting right on the pivot
+
+    def setup(self, context, event):
+        px, py = self._pivot_region()
+        d = math.hypot(self.mouse[0] - px, self.mouse[1] - py)
+        self.d0 = max(d, self.MIN_START_DIST)
+        self.prev_d = d
+        self.raw = 1.0
+        self.constraint = None          # None, 'X' or 'Y'
+        self.num_active = False
+        self.buf = ""
+        self.neg = False
+        self.status_text = ("Scale  |  Mouse / type value: factor  |  Ctrl: snap 0.1  |  "
+                            "Shift: precision  |  X/Y: constrain axis  |  "
+                            "LMB/Enter: confirm  |  Esc/RMB: cancel")
+
+    # -- mouse -> factor (incremental so Shift precision works mid-drag) ----
+
+    def _track(self, mx, my):
+        px, py = self._pivot_region()
+        d = math.hypot(mx - px, my - py)
+        self.mouse = (mx, my)
+        if self._resync:
+            # View was panned/zoomed: keep the current factor, re-base distances.
+            self.d0 = max(d / max(abs(self.raw), 1e-6), self.MIN_START_DIST) if d > 0 else self.d0
+            self.prev_d = d
+            self._resync = False
+            return
+        delta = (d - self.prev_d) / self.d0
+        self.prev_d = d
+        if self.shift:
+            delta *= 0.1
+        self.raw += delta
+
+    def handle(self, context, event):
+        et, val = event.type, event.value
+
+        if et in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+            self._track(event.mouse_region_x, event.mouse_region_y)
+            return
+
+        if val != 'PRESS':
+            return
+
+        if et in {'X', 'Y'}:
+            self.constraint = None if self.constraint == et else et
+        elif et in NUM_KEYS:
+            ch = NUM_KEYS[et]
+            if ch == '.' and '.' in self.buf:
+                return
+            self.num_active = True
+            self.buf += ch
+        elif et in {'MINUS', 'NUMPAD_MINUS'}:
+            self.num_active = True
+            self.neg = not self.neg
+        elif et == 'BACK_SPACE':
+            if event.ctrl:
+                self.buf, self.neg = "", False
+            else:
+                self.buf = self.buf[:-1]
+            if not self.buf and not self.neg:
+                self.num_active = False
+
+    def _factor(self):
+        """Returns (factor, snap increment or None)."""
+        if self.num_active:
+            try:
+                f = float(self.buf) if self.buf else 1.0
+            except ValueError:
+                f = 1.0
+            return (-f if self.neg else f), None
+        if self.ctrl:
+            inc = 0.01 if self.shift else 0.1
+            return round(self.raw / inc) * inc, inc
+        return self.raw, None
+
+    def _axes(self, f):
+        if self.constraint == 'X':
+            return (f, 1.0)
+        if self.constraint == 'Y':
+            return (1.0, f)
+        return (f, f)
+
+    def refresh(self, context):
+        f, inc = self._factor()
+        sxy = self._axes(f)
+        if self._applied != sxy:
+            _scale_uvs(self.objs, self.pivot, sxy[0], sxy[1])
+            self._applied = sxy
+
+        label = "Scale" if self.constraint is None else f"Scale {self.constraint}"
+        if self.num_active:
+            text = f"{label}: " + ("-" if self.neg else "") + self.buf + "_"
+        else:
+            text = f"{label}: {f:.4f}"
+        if inc is not None:
+            text += f"   (snap {inc:g})"
+        self.area.header_text_set(text)
+        self.area.tag_redraw()
+
+    def store_props(self, context):
+        self.value = self._applied or (1.0, 1.0)
+
+    def apply_props(self, context, objs):
+        _scale_uvs(objs, self.pivot, self.value[0], self.value[1])
+
+    def draw_lines(self, px, py):
+        mx, my = self.mouse
+        lines = [((px, py), (mx, my), (1.0, 1.0, 1.0, 0.55))]
+        w, h = self.region.width, self.region.height
+        if self.constraint == 'X':
+            lines.append(((0, py), (w, py), (0.86, 0.22, 0.30, 0.9)))
+        elif self.constraint == 'Y':
+            lines.append(((px, 0), (px, h), (0.55, 0.86, 0.0, 0.9)))
+        return lines
+
+
+# ----------------------------------------------------------------------------
 # Registration
 # ----------------------------------------------------------------------------
 
-classes = (UVPivotPrefs, UV_OT_vertex_pivot_rotate, UV_OT_vertex_pivot_mirror)
+classes = (UVPivotPrefs, UV_OT_vertex_pivot_rotate, UV_OT_vertex_pivot_mirror,
+           UV_OT_vertex_pivot_scale)
 addon_keymaps = []
 
 
@@ -589,6 +729,9 @@ def register():
         kmi = km.keymap_items.new(UV_OT_vertex_pivot_rotate.bl_idname, 'R', 'PRESS', ctrl=True)
         addon_keymaps.append((km, kmi))
         kmi = km.keymap_items.new(UV_OT_vertex_pivot_mirror.bl_idname, 'X', 'PRESS', ctrl=True)
+        addon_keymaps.append((km, kmi))
+        # 'GRLESS' is the < > key (left of Z on ISO / Spanish keyboards).
+        kmi = km.keymap_items.new(UV_OT_vertex_pivot_scale.bl_idname, 'GRLESS', 'PRESS')
         addon_keymaps.append((km, kmi))
 
 

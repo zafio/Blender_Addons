@@ -29,9 +29,10 @@ Makes pixel-art texturing quicker: no more trips to the Shader Editor to set Ima
 - Interpolation dropdown in the Image Editor header and the Texture Slots panel
 
 ####UV VERTEX PIVOT TRANSFORM
-Rotates and mirrors the UV selection using the closest vertex below the cursor as pivot (UV Editor). Works like Blender's own transforms: type a value, hold Ctrl to snap the angle, Alt to snap to 90º, Shift for precision.
+Rotates, mirrors and scales the UV selection using the closest vertex below the cursor as pivot (UV Editor). Works like Blender's own transforms: type a value, hold Ctrl to snap the angle, Alt to snap to 90º, Shift for precision.
 
 - CTRL+R = Rotate around the nearest vertex
 - CTRL+X = Mirror around the nearest vertex (X again switches to Y axis, again turns mirror off)
+- < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps 0.1)
 - Enter & LMB = Accept
 - Esc & RMB = Cancel
