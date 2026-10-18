@@ -23,7 +23,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 1, 1),
+    "version": (1, 1, 2),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -887,7 +887,7 @@ def _draw_overlay():
         x1, y1 = v2d.view_to_region(10.0, 10.0, clip=False)
         sx, sy = (x1 - x0) / 10.0, (y1 - y0) / 10.0
 
-        width = float(getattr(wm, "uv_overlap_line_width", 2.0))
+        width = float(getattr(wm, "uv_overlap_line_width", 1.0))
         # Thick lines: the polyline shader (works on every GPU backend); plain
         # UNIFORM_COLOR + line_width_set as a fallback.
         try:
@@ -1263,7 +1263,7 @@ def register():
         default=(0.6, 0.8, 1.0, 1.0), update=_overlay_prop_update)
     wm_t.uv_overlap_line_width = FloatProperty(
         name="Line Width", description="Thickness of the stacked / overlapping wire",
-        default=2.0, min=1.0, max=8.0, update=_overlay_prop_update)
+        default=1.0, min=0.5, max=8.0, step=10, precision=1, update=_overlay_prop_update)
 
     global _draw_handle
     if gpu is not None and _draw_handle is None:
