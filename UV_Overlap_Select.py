@@ -26,7 +26,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -90,6 +90,7 @@ class _State:
         self.cache = None       # (key, model) - UV grouping kept between clicks
         self.geo_dirty = True   # UVs may have changed: rebuild the grouping
         self.dg_dirty = False   # Blender reported a mesh update
+        self.after_undo = False # undo/redo restored a selection without our partners
         self.geo = {}           # unit -> UV position signature at our last snapshot
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
@@ -820,7 +821,13 @@ def _process(context):
         S.prev = None
         return
 
-    if S.prev is None or S.topo != topo:
+    if S.after_undo:
+        # Our partner selections are not part of Blender's undo history, so undo /
+        # redo can bring back a selection without them (and the next move would leave
+        # them behind). Re-apply overlap selection to whatever is selected now.
+        S.after_undo = False
+        prev = set()
+    elif S.prev is None or S.topo != topo:
         prev = set()
     else:
         prev = S.prev
@@ -1265,10 +1272,23 @@ def _on_depsgraph_update(_scene, _depsgraph=None):
     S.dg_dirty = True
 
 
+def _mark_undo():
+    S.geo_dirty = True                    # undo restores old UVs / rebuilds the mesh
+    S.after_undo = True                   # ...and a selection without our partners
+    S.dg_dirty = True
+    S.prev = None
+
+
 @persistent
 def _on_undo_redo(*_args):
-    S.geo_dirty = True                    # undo rebuilds the mesh: re-group
-    S.dg_dirty = True
+    _mark_undo()
+
+
+def _is_undo_event(event):
+    """Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y (Cmd on macOS)."""
+    if event.value != 'PRESS' or not (getattr(event, "ctrl", False) or getattr(event, "oskey", False)):
+        return False
+    return event.type in {'Z', 'Y'}
 
 
 class UV_OT_overlap_watch(bpy.types.Operator):
@@ -1363,6 +1383,8 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     S.mouse_time = time.monotonic()
                 elif event.value == 'RELEASE':
                     S.mouse_down = False
+            if _is_undo_event(event):
+                _mark_undo()
             if event.value in _ACTIVE_VALUES and event.type not in _IGNORED_EVENTS \
                     and not event.type.startswith(('NDOF', 'TIMER')):
                 S.dirty = True
