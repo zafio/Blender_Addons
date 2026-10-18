@@ -44,4 +44,5 @@ Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press 
 - 1 / 2 / 3 / 4 again (on the active Vertex / Edge / Face / Island mode) = Toggles overlap selection
 - Selecting an element also selects everything sitting at the same UV position; deselecting it deselects the overlapped partners too
 - Works with UV Sync Selection on or off (Island mode only without sync)
+- While active, stacked faces are tinted pale green and overlapping faces pale blue (toggle and colors in the panel)
 - N panel > Overlap tab: on/off button, tolerance, and "Keep On When Changing Mode"

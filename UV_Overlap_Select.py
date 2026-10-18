@@ -8,6 +8,9 @@ In the UV Editor, press the key of the select mode you are ALREADY in
       (same UV position) selected as well.
     * Deselecting an element deselects its overlapped partners too.
     * While active, the UV selection color turns RED.
+    * While active, stacked faces (identical UV footprint) are tinted pale green and
+      overlapping faces (partly covering another face) pale blue. Toggle and colors
+      in the N panel.
 
 Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
@@ -20,11 +23,12 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 5),
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
-                   "elements (vertex, edge, face, island). Selection turns red while active.",
+                   "elements (vertex, edge, face, island). Selection turns red while active; "
+                   "stacked faces show pale green, overlapping faces pale blue.",
     "category": "UV",
 }
 
@@ -35,6 +39,13 @@ import bpy
 import bmesh
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty
+
+try:
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+except ImportError:      # background mode / tests
+    gpu = None
+    batch_for_shader = None
 
 
 # --------------------------------------------------------------------------
@@ -73,6 +84,11 @@ class _State:
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
         self.mouse_time = 0.0
+        self.ov_green = []      # overlay triangles (UV coords): stacked faces
+        self.ov_blue = []       # overlay triangles (UV coords): overlapping faces
+        self.ov_batches = None
+        self.ov_sig = None
+        self.ov_counts = (0, 0, True)
 
 
 S = _State()
@@ -142,6 +158,10 @@ class _AccLoopUV:
         p = l[self.uv].uv
         return (round(p[0] * inv), round(p[1] * inv))
 
+    def raw(self, l):
+        p = l[self.uv].uv
+        return (p[0], p[1])
+
     def vsel(self, l):
         return l[self.uv].select
 
@@ -163,6 +183,11 @@ class _AccBool:
         p = l[self.uv]
         p = getattr(p, "uv", p)
         return (round(p[0] * inv), round(p[1] * inv))
+
+    def raw(self, l):
+        p = l[self.uv]
+        p = getattr(p, "uv", p)
+        return (p[0], p[1])
 
     def vsel(self, l):
         return bool(l[self.vs])
@@ -621,6 +646,7 @@ def _process(context):
     sticky = getattr(ts, "uv_sticky_select_mode", 'SHARED_LOCATION')
     model = _build_model(mode, sync, entries, inv, sticky)
     now = model.selected
+    _update_overlay(context, entries, sync, inv, topo, model)
 
     if S.prev is None or S.topo != topo:
         prev = set()
@@ -674,6 +700,217 @@ def _process(context):
         _set_status(context, "Nothing overlapped under the selection")
 
     _snapshot(model, final, topo)
+
+
+# --------------------------------------------------------------------------
+# Overlay: tint stacked faces (pale green) and overlapping faces (pale blue)
+# --------------------------------------------------------------------------
+
+_MAX_OVERLAP_TRIS = 150000      # above this, only stacked faces are detected
+
+
+def _tri_overlap(t1, t2, eps):
+    """2D triangles overlap by more than eps (touching edges / corners don't count)."""
+    for tri in (t1, t2):
+        for i in range(3):
+            x1, y1 = tri[i]
+            x2, y2 = tri[(i + 1) % 3]
+            nx, ny = y1 - y2, x2 - x1
+            ln = (nx * nx + ny * ny) ** 0.5
+            if ln < 1e-12:
+                continue
+            nx /= ln
+            ny /= ln
+            a0 = nx * t1[0][0] + ny * t1[0][1]
+            a1 = nx * t1[1][0] + ny * t1[1][1]
+            a2 = nx * t1[2][0] + ny * t1[2][1]
+            b0 = nx * t2[0][0] + ny * t2[0][1]
+            b1 = nx * t2[1][0] + ny * t2[1][1]
+            b2 = nx * t2[2][0] + ny * t2[2][1]
+            amin, amax = min(a0, a1, a2), max(a0, a1, a2)
+            bmin, bmax = min(b0, b1, b2), max(b0, b1, b2)
+            if amax <= bmin + eps or bmax <= amin + eps:
+                return False
+    return True
+
+
+def _tri_area2(t):
+    return abs((t[1][0] - t[0][0]) * (t[2][1] - t[0][1])
+               - (t[2][0] - t[0][0]) * (t[1][1] - t[0][1]))
+
+
+def _compute_overlay(entries, sync, inv, eps):
+    """Returns (stacked_tris, overlap_tris, n_stacked, n_overlap, overlap_checked)."""
+    keys, face_tris = [], []
+    for oi, (me, bm, acc) in enumerate(entries):
+        by_face = {}
+        for tri in bm.calc_loop_triangles():
+            by_face.setdefault(tri[0].face, []).append(tri)
+        for f in bm.faces:
+            if f.hide or (not sync and not f.select):
+                continue
+            keys.append(tuple(sorted(acc.pos(l, inv) for l in f.loops)))
+            face_tris.append([tuple(acc.raw(l) for l in tri) for tri in by_face.get(f, ())])
+
+    count = {}
+    for k in keys:
+        count[k] = count.get(k, 0) + 1
+    stacked = [count[k] > 1 for k in keys]
+    overlap = [False] * len(keys)
+
+    # Broad phase on whole faces (bounding boxes in a grid), narrow phase on triangles.
+    nf = len(keys)
+    ntris = sum(len(ts) for ts in face_tris)
+    checked = ntris <= _MAX_OVERLAP_TRIS
+    if checked and nf > 1:
+        bbs = []
+        area = 0.0
+        for ts in face_tris:
+            xs = [p[0] for t in ts for p in t] or [0.0]
+            ys = [p[1] for t in ts for p in t] or [0.0]
+            bb = (min(xs), min(ys), max(xs), max(ys))
+            bbs.append(bb)
+            area += (bb[2] - bb[0]) * (bb[3] - bb[1])
+        cell = max((area / nf) ** 0.5, 1e-4)
+        grid, big = {}, []          # big: list of huge faces
+        for i, bb in enumerate(bbs):
+            if not face_tris[i]:
+                continue
+            ix0, iy0 = int(bb[0] // cell), int(bb[1] // cell)
+            ix1, iy1 = int(bb[2] // cell), int(bb[3] // cell)
+            if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > 256:
+                big.append(i)                    # huge face: tested against everyone
+                continue
+            for ix in range(ix0, ix1 + 1):
+                for iy in range(iy0, iy1 + 1):
+                    grid.setdefault((ix, iy), []).append(i)
+
+        def test(i, j):
+            if keys[i] == keys[j] or (overlap[i] and overlap[j]):
+                return                           # exact stack twins / already known
+            bi, bj = bbs[i], bbs[j]
+            if (bi[2] <= bj[0] + eps or bj[2] <= bi[0] + eps or
+                    bi[3] <= bj[1] + eps or bj[3] <= bi[1] + eps):
+                return
+            for ti in face_tris[i]:
+                for tj in face_tris[j]:
+                    if _tri_area2(ti) > 1e-14 and _tri_area2(tj) > 1e-14 \
+                            and _tri_overlap(ti, tj, eps):
+                        overlap[i] = overlap[j] = True
+                        return
+
+        for (cx, cy), members in grid.items():
+            n = len(members)
+            for a in range(n):
+                i = members[a]
+                bi = bbs[i]
+                for b in range(a + 1, n):
+                    j = members[b]
+                    bj = bbs[j]
+                    # handle each pair only in the cell holding the lower-left corner
+                    # of the two boxes' intersection (no "seen" set needed)
+                    if (int(max(bi[0], bj[0]) // cell) != cx or
+                            int(max(bi[1], bj[1]) // cell) != cy):
+                        continue
+                    test(i, j)
+        big_set = set(big)
+        for i in big:
+            for j in range(nf):
+                if j != i and face_tris[j] and (j not in big_set or j > i):
+                    test(i, j)
+
+    green, blue = [], []
+    n_st = n_ov = 0
+    for fi, ts in enumerate(face_tris):
+        if stacked[fi]:
+            n_st += 1
+            for t in ts:
+                green.extend(t)
+        elif overlap[fi]:
+            n_ov += 1
+            for t in ts:
+                blue.extend(t)
+    return green, blue, n_st, n_ov, checked
+
+
+def _update_overlay(context, entries, sync, inv, topo, model):
+    wm = context.window_manager
+    if not getattr(wm, "uv_overlap_show", False):
+        if S.ov_green or S.ov_blue:
+            S.ov_green, S.ov_blue, S.ov_batches, S.ov_sig = [], [], None, None
+            _tag_redraw(context)
+        return
+    sig = (topo, len(model.geo), hash(tuple(model.geo.items())))
+    if sig == S.ov_sig:
+        return
+    eps = max(wm.uv_overlap_tolerance, 1e-9)
+    green, blue, n_st, n_ov, checked = _compute_overlay(entries, sync, inv, eps)
+    S.ov_green, S.ov_blue = green, blue
+    S.ov_counts = (n_st, n_ov, checked)
+    S.ov_batches = None          # rebuilt in the draw callback
+    S.ov_sig = sig
+    _tag_redraw(context)
+
+
+def _space_is_uv(sd):
+    return sd is not None and sd.type == 'IMAGE_EDITOR' and (
+        getattr(sd, "mode", None) == 'UV' or bool(getattr(sd, "show_uvedit", False)))
+
+
+_draw_handle = None
+
+
+def _draw_overlay():
+    if gpu is None:
+        return
+    try:
+        ctx = bpy.context
+        wm = ctx.window_manager
+        if not wm.uv_overlap_active or not wm.uv_overlap_show:
+            return
+        if not S.ov_green and not S.ov_blue:
+            return
+        if ctx.mode != 'EDIT_MESH' or not _space_is_uv(ctx.space_data):
+            return
+        if _transform_running(ctx):
+            return                              # stale while moving: hide until the drop
+        region = ctx.region
+        v2d = region.view2d
+        x0, y0 = v2d.view_to_region(0.0, 0.0, clip=False)
+        x1, y1 = v2d.view_to_region(10.0, 10.0, clip=False)
+        sx, sy = (x1 - x0) / 10.0, (y1 - y0) / 10.0
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        if S.ov_batches is None:
+            S.ov_batches = (
+                batch_for_shader(shader, 'TRIS', {"pos": S.ov_green}) if S.ov_green else None,
+                batch_for_shader(shader, 'TRIS', {"pos": S.ov_blue}) if S.ov_blue else None,
+            )
+        b_green, b_blue = S.ov_batches
+
+        gpu.state.blend_set('ALPHA')
+        gpu.matrix.push()
+        gpu.matrix.translate((x0, y0))
+        gpu.matrix.scale((sx, sy))
+        shader.bind()
+        if b_blue is not None:
+            shader.uniform_float("color", tuple(wm.uv_overlap_color_overlap))
+            b_blue.draw(shader)
+        if b_green is not None:
+            shader.uniform_float("color", tuple(wm.uv_overlap_color_stacked))
+            b_green.draw(shader)
+        gpu.matrix.pop()
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+
+def _overlay_prop_update(self, context):
+    S.ov_sig = None
+    S.ov_batches = None
+    if not getattr(self, "uv_overlap_show", True):
+        S.ov_green, S.ov_blue = [], []
+    _tag_redraw(context)
 
 
 def set_overlap_active(context, state):
@@ -919,6 +1156,20 @@ class UV_PT_overlap_select(bpy.types.Panel):
             layout.label(text=S.status, icon='INFO')
         layout.prop(wm, "uv_overlap_tolerance")
         layout.prop(wm, "uv_overlap_keep")
+
+        box = layout.box()
+        box.prop(wm, "uv_overlap_show")
+        sub = box.column()
+        sub.enabled = wm.uv_overlap_show
+        row = sub.row()
+        row.prop(wm, "uv_overlap_color_stacked", text="Stacked")
+        row = sub.row()
+        row.prop(wm, "uv_overlap_color_overlap", text="Overlapping")
+        if active and wm.uv_overlap_show:
+            n_st, n_ov, checked = S.ov_counts
+            sub.label(text="Stacked faces: %d" % n_st)
+            sub.label(text=("Overlapping faces: %d" % n_ov) if checked
+                      else "Overlapping: mesh too dense, skipped")
         col = layout.column(align=True)
         col.scale_y = 0.85
         col.label(text="Press 1/2/3/4 again on the")
@@ -976,6 +1227,22 @@ def register():
         name="Tolerance",
         description="Max UV distance for two elements to count as overlapped",
         default=0.0001, min=1e-7, max=0.01, precision=6)
+    wm_t.uv_overlap_show = BoolProperty(
+        name="Show Stacked / Overlapping",
+        description="While overlap select is on, tint stacked faces (identical UV footprint) "
+                    "and overlapping faces (partly covering another face)",
+        default=True, update=_overlay_prop_update)
+    wm_t.uv_overlap_color_stacked = FloatVectorProperty(
+        name="Stacked Color", subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=(0.55, 1.0, 0.6, 0.35), update=_overlay_prop_update)
+    wm_t.uv_overlap_color_overlap = FloatVectorProperty(
+        name="Overlapping Color", subtype='COLOR', size=4, min=0.0, max=1.0,
+        default=(0.55, 0.78, 1.0, 0.35), update=_overlay_prop_update)
+
+    global _draw_handle
+    if gpu is not None and _draw_handle is None:
+        _draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+            _draw_overlay, (), 'WINDOW', 'POST_PIXEL')
 
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon if wm else None
@@ -1006,6 +1273,14 @@ def unregister():
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
 
+    global _draw_handle
+    if _draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        _draw_handle = None
+
     for km, kmi in _addon_keymaps:
         try:
             km.keymap_items.remove(kmi)
@@ -1014,7 +1289,8 @@ def unregister():
     _addon_keymaps.clear()
 
     wm_t = bpy.types.WindowManager
-    for name in ("uv_overlap_active", "uv_overlap_keep", "uv_overlap_tolerance"):
+    for name in ("uv_overlap_active", "uv_overlap_keep", "uv_overlap_tolerance",
+                 "uv_overlap_show", "uv_overlap_color_stacked", "uv_overlap_color_overlap"):
         if hasattr(wm_t, name):
             delattr(wm_t, name)
 
