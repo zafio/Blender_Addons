@@ -7,7 +7,8 @@ In the UV Editor, press the key of the select mode you are ALREADY in
     * Whatever you select gets every element that sits exactly on top of it
       (same UV position) selected as well.
     * Deselecting an element deselects its overlapped partners too.
-    * While active, the UV selection color turns RED.
+    * While active, the UV selection color turns RED whenever the selection
+      actually contains overlapped elements.
 
 Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
@@ -25,11 +26,11 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 2, 1),
+    "version": (1, 3, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
-                   "elements (vertex, edge, face, island). Selection turns red while active. "
+                   "elements (vertex, edge, face, island). Selection turns red when it holds overlaps. "
                    "Shift+1/2/3/4 or Shift+W shows stacked (green) / overlapping (mauve) faces.",
     "category": "UV",
 }
@@ -91,6 +92,7 @@ class _State:
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
         self.mouse_time = 0.0
+        self.red = False        # theme currently switched to red
 
 
 S = _State()
@@ -261,9 +263,10 @@ def _groups_from_dsu(dsu):
 
 
 class _Model:
-    __slots__ = ("key_of", "groups", "selected", "apply", "geo")
+    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count")
 
     def __init__(self, key_of, groups, selected, apply, geo):
+        self.sig_count = None   # island mode: footprint -> number of faces with it
         self.key_of, self.groups, self.selected, self.apply = key_of, groups, selected, apply
         self.geo = geo          # unit -> UV position signature (to detect moves)
 
@@ -547,7 +550,12 @@ def _model_island(entries, inv):
             if all_sel:
                 sel.add(fu)
     key_of, groups = _groups_from_dsu(dsu)
-    return _Model(key_of, groups, sel, _apply_faces(entries, face_of), geo)
+    model = _Model(key_of, groups, sel, _apply_faces(entries, face_of), geo)
+    cnt = {}
+    for g in geo.values():
+        cnt[g] = cnt.get(g, 0) + 1
+    model.sig_count = cnt       # an island group always has several faces; a real
+    return model                # overlap means some face footprint appears twice
 
 
 def _model_sync(mode, entries, inv):
@@ -620,10 +628,40 @@ def _build_model(mode, sync, entries, inv, sticky='SHARED_LOCATION'):
 # Core: expand / shrink the selection by overlap groups
 # --------------------------------------------------------------------------
 
+def _has_overlap(model, sel):
+    """Does anything in the selection actually have an overlapped partner?"""
+    if model.sig_count is not None:                       # island mode
+        cnt, geo = model.sig_count, model.geo
+        return any(cnt.get(geo.get(u), 0) > 1 for u in sel)
+    key_of, groups = model.key_of, model.groups
+    for u in sel:
+        k = key_of.get(u)
+        if k is not None and len(groups[k]) > 1:
+            return True
+    return False
+
+
+def _set_red(on):
+    """Selection turns red only while the selection really contains overlaps."""
+    if on == S.red:
+        return
+    try:
+        ctx = bpy.context
+        if on:
+            _theme_apply_red(ctx)
+        else:
+            _theme_restore(ctx)
+        S.red = on
+        _tag_redraw(ctx)
+    except Exception:
+        pass
+
+
 def _snapshot(model, sel, topo):
     S.prev = set(sel)
     S.geo = model.geo           # positions of ALL units, to tell moves from selections
     S.topo = topo
+    _set_red(_has_overlap(model, sel))
 
 
 def _process(context):
@@ -947,7 +985,7 @@ def set_overlap_active(context, state):
     if state:
         ts = context.tool_settings
         S.armed = (_current_mode(ts), bool(ts.use_uv_select_sync))
-        _theme_apply_red(context)
+        _theme_restore(context)          # red comes on only when an overlap is selected
         try:
             # Always start a fresh watcher (a new token makes any old one exit)
             bpy.ops.uv.overlap_watch('INVOKE_DEFAULT')
