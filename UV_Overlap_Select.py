@@ -26,7 +26,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -263,10 +263,11 @@ def _groups_from_dsu(dsu):
 
 
 class _Model:
-    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count")
+    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count", "elem_of")
 
     def __init__(self, key_of, groups, selected, apply, geo):
         self.sig_count = None   # island mode: footprint -> number of faces with it
+        self.elem_of = None     # vertex/edge mode: unit -> mesh vertex / edge it belongs to
         self.key_of, self.groups, self.selected, self.apply = key_of, groups, selected, apply
         self.geo = geo          # unit -> UV position signature (to detect moves)
 
@@ -363,9 +364,10 @@ def _collect(context):
 
 def _model_vertex(entries, inv):
     """UV sync OFF, vertex mode. Unit = face corner, group = same UV position."""
-    key_of, groups, loop_of, sel = {}, {}, {}, set()
+    key_of, groups, loop_of, sel, elem_of = {}, {}, {}, set(), {}
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
+        vidx = {v: i for i, v in enumerate(bm.verts)}
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
@@ -375,6 +377,7 @@ def _model_vertex(entries, inv):
                 key_of[u] = key
                 groups.setdefault(key, []).append(u)
                 loop_of[u] = l
+                elem_of[u] = (oi, vidx[l.vert])
                 if vsel(l):
                     sel.add(u)
 
@@ -391,7 +394,9 @@ def _model_vertex(entries, inv):
                 acc.set_esel(l, acc.vsel(l) and acc.vsel(l.link_loop_next))
         return {oi for oi, _fi in faces}
 
-    return _Model(key_of, groups, sel, apply, key_of)
+    model = _Model(key_of, groups, sel, apply, key_of)
+    model.elem_of = elem_of
+    return model
 
 
 class _Sticky:
@@ -441,11 +446,12 @@ class _Sticky:
 
 def _model_edge(entries, inv, sticky):
     """UV sync OFF, edge mode. Unit = face corner edge, group = same pair of UV positions."""
-    key_of, groups, loop_of, sel = {}, {}, {}, set()
+    key_of, groups, loop_of, sel, elem_of = {}, {}, {}, set(), {}
     st = _Sticky(sticky)
     for oi, (me, bm, acc) in enumerate(entries):
         pos, esel = acc.pos, acc.esel
         vidx = {v: i for i, v in enumerate(bm.verts)} if st.fn else None
+        eidx = {e: i for i, e in enumerate(bm.edges)}
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
@@ -460,6 +466,7 @@ def _model_edge(entries, inv, sticky):
                 key_of[u] = key
                 groups.setdefault(key, []).append(u)
                 loop_of[u] = l
+                elem_of[u] = (oi, eidx[l.edge])
                 if esel(l):
                     sel.add(u)
 
@@ -479,7 +486,9 @@ def _model_edge(entries, inv, sticky):
                     acc.set_vsel(l, acc.esel(l) or acc.esel(l.link_loop_prev))
         return {oi for oi, _fi in faces}
 
-    return _Model(key_of, groups, sel, apply, key_of)
+    model = _Model(key_of, groups, sel, apply, key_of)
+    model.elem_of = elem_of
+    return model
 
 
 def _apply_faces(entries, face_of, sticky=None):
@@ -633,11 +642,25 @@ def _has_overlap(model, sel):
     if model.sig_count is not None:                       # island mode
         cnt, geo = model.sig_count, model.geo
         return any(cnt.get(geo.get(u), 0) > 1 for u in sel)
-    key_of, groups = model.key_of, model.groups
+    key_of, groups, elem_of = model.key_of, model.groups, model.elem_of
+    done = set()
     for u in sel:
         k = key_of.get(u)
-        if k is not None and len(groups[k]) > 1:
+        if k is None or k in done:
+            continue
+        done.add(k)
+        members = groups[k]
+        if len(members) < 2:
+            continue
+        if elem_of is None:
             return True
+        # The corners of ONE vertex (or the two sides of ONE edge) share a UV spot
+        # inside every island - that is not an overlap. It is one only when the
+        # spot holds different mesh vertices / edges.
+        first = elem_of[members[0]]
+        for x in members:
+            if elem_of[x] != first:
+                return True
     return False
 
 
