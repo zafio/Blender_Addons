@@ -7,8 +7,8 @@ In the UV Editor, press the key of the select mode you are ALREADY in
     * Whatever you select gets every element that sits exactly on top of it
       (same UV position) selected as well.
     * Deselecting an element deselects its overlapped partners too.
-    * While active, the selected elements that actually are overlapped get a RED
-      highlight; the rest of the selection keeps Blender's normal color.
+    * While active, the UV selection color turns RED whenever the selection
+      actually contains overlapped elements.
 
 Press the same key again to go back to normal selection.
 Pressing a different mode key switches mode and turns overlap off
@@ -26,11 +26,11 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 4, 0),
+    "version": (1, 3, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
-                   "elements (vertex, edge, face, island). Overlapped selected elements are shown red. "
+                   "elements (vertex, edge, face, island). Selection turns red when it holds overlaps. "
                    "Shift+1/2/3/4 or Shift+W shows stacked (green) / overlapping (mauve) faces.",
     "category": "UV",
 }
@@ -92,9 +92,7 @@ class _State:
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
         self.mouse_time = 0.0
-        self.red = False        # selection currently holds overlaps
-        self.hl = ([], [], [])  # red highlight: points, lines, fill tris (UV coords)
-        self.hl_batches = None
+        self.red = False        # theme currently switched to red
 
 
 S = _State()
@@ -265,13 +263,11 @@ def _groups_from_dsu(dsu):
 
 
 class _Model:
-    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count", "elem_of",
-                 "draw_of")
+    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count", "elem_of")
 
     def __init__(self, key_of, groups, selected, apply, geo):
         self.sig_count = None   # island mode: footprint -> number of faces with it
         self.elem_of = None     # vertex/edge mode: unit -> mesh vertex / edge it belongs to
-        self.draw_of = None     # unit -> [('P', p) | ('L', a, b) | ('F', [p...])] in UV space
         self.key_of, self.groups, self.selected, self.apply = key_of, groups, selected, apply
         self.geo = geo          # unit -> UV position signature (to detect moves)
 
@@ -400,7 +396,6 @@ def _model_vertex(entries, inv):
 
     model = _Model(key_of, groups, sel, apply, key_of)
     model.elem_of = elem_of
-    model.draw_of = lambda u: [('P', entries[u[0]][2].raw(loop_of[u]))]
     return model
 
 
@@ -493,19 +488,7 @@ def _model_edge(entries, inv, sticky):
 
     model = _Model(key_of, groups, sel, apply, key_of)
     model.elem_of = elem_of
-
-    def draw_of(u):
-        acc, l = entries[u[0]][2], loop_of[u]
-        return [('L', acc.raw(l), acc.raw(l.link_loop_next))]
-    model.draw_of = draw_of
     return model
-
-
-def _face_draw_of(entries, face_of):
-    def draw_of(u):
-        acc = entries[u[0]][2]
-        return [('F', [acc.raw(l) for l in face_of[u].loops])]
-    return draw_of
 
 
 def _apply_faces(entries, face_of, sticky=None):
@@ -545,9 +528,7 @@ def _model_face(entries, inv, sticky):
             face_of[u] = f
             if all(esel(l) for l in ls):
                 sel.add(u)
-    model = _Model(key_of, groups, sel, _apply_faces(entries, face_of, st), key_of)
-    model.draw_of = _face_draw_of(entries, face_of)
-    return model
+    return _Model(key_of, groups, sel, _apply_faces(entries, face_of, st), key_of)
 
 
 def _model_island(entries, inv):
@@ -579,7 +560,6 @@ def _model_island(entries, inv):
                 sel.add(fu)
     key_of, groups = _groups_from_dsu(dsu)
     model = _Model(key_of, groups, sel, _apply_faces(entries, face_of), geo)
-    model.draw_of = _face_draw_of(entries, face_of)
     cnt = {}
     for g in geo.values():
         cnt[g] = cnt.get(g, 0) + 1
@@ -638,23 +618,7 @@ def _model_sync(mode, entries, inv):
             entries[oi][1].select_flush_mode()
         return touched
 
-    def draw_of(u):
-        acc, o = entries[u[0]][2], obj_of[u]
-        if mode == 'FACE':
-            return [('F', [acc.raw(l) for l in o.loops])]
-        out = []
-        for l in o.link_loops:
-            if l.face.hide:
-                continue
-            if mode == 'VERTEX':
-                out.append(('P', acc.raw(l)))
-            else:
-                out.append(('L', acc.raw(l), acc.raw(l.link_loop_next)))
-        return out
-
-    model = _Model(key_of, groups, sel, apply, geo)
-    model.draw_of = draw_of
-    return model
+    return _Model(key_of, groups, sel, apply, geo)
 
 
 def _build_model(mode, sync, entries, inv, sticky='SHARED_LOCATION'):
@@ -673,80 +637,54 @@ def _build_model(mode, sync, entries, inv, sticky='SHARED_LOCATION'):
 # Core: expand / shrink the selection by overlap groups
 # --------------------------------------------------------------------------
 
-def _partner_units(model, sel):
-    """Selected units that really have an overlapped partner."""
+def _has_overlap(model, sel):
+    """Does anything in the selection actually have an overlapped partner?"""
     if model.sig_count is not None:                       # island mode
         cnt, geo = model.sig_count, model.geo
-        return [u for u in sel if cnt.get(geo.get(u), 0) > 1]
+        return any(cnt.get(geo.get(u), 0) > 1 for u in sel)
     key_of, groups, elem_of = model.key_of, model.groups, model.elem_of
-    cache, out = {}, []
+    done = set()
     for u in sel:
         k = key_of.get(u)
-        if k is None:
+        if k is None or k in done:
             continue
-        hit = cache.get(k)
-        if hit is None:
-            members = groups[k]
-            if len(members) < 2:
-                hit = False
-            elif elem_of is None:
-                hit = True
-            else:
-                # The corners of ONE vertex (or the two sides of ONE edge) share a UV
-                # spot inside every island - that is not an overlap. It is one only
-                # when the spot holds different mesh vertices / edges.
-                first = elem_of[members[0]]
-                hit = any(elem_of[x] != first for x in members)
-            cache[k] = hit
-        if hit:
-            out.append(u)
-    return out
+        done.add(k)
+        members = groups[k]
+        if len(members) < 2:
+            continue
+        if elem_of is None:
+            return True
+        # The corners of ONE vertex (or the two sides of ONE edge) share a UV spot
+        # inside every island - that is not an overlap. It is one only when the
+        # spot holds different mesh vertices / edges.
+        first = elem_of[members[0]]
+        for x in members:
+            if elem_of[x] != first:
+                return True
+    return False
 
 
-def _has_overlap(model, sel):
-    return bool(_partner_units(model, sel))
-
-
-def _update_highlight(model, sel):
-    """Red highlight drawn only on the selected elements that are overlapped, so the
-    rest of a multi-selection keeps Blender's normal selection color."""
-    pts, lines, tris = [], [], []
-    units = _partner_units(model, sel)
-    if units and model.draw_of is not None:
-        for u in units:
-            for prim in model.draw_of(u):
-                kind = prim[0]
-                if kind == 'P':
-                    p = prim[1]
-                    pts.append((p[0], p[1], 0.0))
-                elif kind == 'L':
-                    a, b = prim[1], prim[2]
-                    lines += [(a[0], a[1], 0.0), (b[0], b[1], 0.0)]
-                else:
-                    rim = prim[1]
-                    n = len(rim)
-                    for k in range(n):
-                        a, b = rim[k], rim[(k + 1) % n]
-                        lines += [(a[0], a[1], 0.0), (b[0], b[1], 0.0)]
-                    for k in range(1, n - 1):                # fan fill
-                        for q in (rim[0], rim[k], rim[k + 1]):
-                            tris.append((q[0], q[1], 0.0))
-    hl = (pts, lines, tris)
-    S.red = bool(units)
-    if hl != S.hl:
-        S.hl = hl
-        S.hl_batches = None
-        try:
-            _tag_redraw(bpy.context)
-        except Exception:
-            pass
+def _set_red(on):
+    """Selection turns red only while the selection really contains overlaps."""
+    if on == S.red:
+        return
+    try:
+        ctx = bpy.context
+        if on:
+            _theme_apply_red(ctx)
+        else:
+            _theme_restore(ctx)
+        S.red = on
+        _tag_redraw(ctx)
+    except Exception:
+        pass
 
 
 def _snapshot(model, sel, topo):
     S.prev = set(sel)
     S.geo = model.geo           # positions of ALL units, to tell moves from selections
     S.topo = topo
-    _update_highlight(model, sel)
+    _set_red(_has_overlap(model, sel))
 
 
 def _process(context):
@@ -995,40 +933,15 @@ def _space_is_uv(sd):
 _draw_handle = None
 
 
-_HL_RED = (1.0, 0.12, 0.12, 1.0)
-_HL_FILL = (1.0, 0.12, 0.12, 0.22)
-
-
-def _line_shader():
-    """Polyline shader (thick lines on every GPU backend), or plain as a fallback."""
-    try:
-        return gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR'), True
-    except Exception:
-        return gpu.shader.from_builtin('UNIFORM_COLOR'), False
-
-
-def _draw_lines(shader, poly, batch, color, width, region):
-    shader.bind()
-    if poly:
-        shader.uniform_float("viewportSize", (region.width, region.height))
-        shader.uniform_float("lineWidth", width)
-    else:
-        gpu.state.line_width_set(width)
-    shader.uniform_float("color", color)
-    batch.draw(shader)
-    if not poly:
-        gpu.state.line_width_set(1.0)
-
-
 def _draw_overlay():
     if gpu is None:
         return
     try:
         ctx = bpy.context
         wm = ctx.window_manager
-        show_wire = wm.uv_overlap_show and (S.ov_green or S.ov_blue)
-        show_hl = wm.uv_overlap_active and any(S.hl)
-        if not (show_wire or show_hl):
+        if not wm.uv_overlap_show:
+            return
+        if not S.ov_green and not S.ov_blue:
             return
         if ctx.mode != 'EDIT_MESH' or not _space_is_uv(ctx.space_data):
             return
@@ -1040,59 +953,42 @@ def _draw_overlay():
         x1, y1 = v2d.view_to_region(10.0, 10.0, clip=False)
         sx, sy = (x1 - x0) / 10.0, (y1 - y0) / 10.0
 
-        lshader, poly = _line_shader()
+        width = float(getattr(wm, "uv_overlap_line_width", 1.0))
+        # Thick lines: the polyline shader (works on every GPU backend); plain
+        # UNIFORM_COLOR + line_width_set as a fallback.
+        try:
+            shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+            poly = True
+        except Exception:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            poly = False
+        if S.ov_batches is None:
+            S.ov_batches = (
+                batch_for_shader(shader, 'LINES', {"pos": S.ov_green}) if S.ov_green else None,
+                batch_for_shader(shader, 'LINES', {"pos": S.ov_blue}) if S.ov_blue else None,
+            )
+        b_green, b_blue = S.ov_batches
+
         gpu.state.blend_set('ALPHA')
         gpu.matrix.push()
         gpu.matrix.translate((x0, y0))
         gpu.matrix.scale((sx, sy))
-
-        # Stacked / overlapping wire (Shift+1/2/3/4, Shift+W)
-        if show_wire:
-            width = float(getattr(wm, "uv_overlap_line_width", 1.0))
-            if S.ov_batches is None:
-                S.ov_batches = (
-                    batch_for_shader(lshader, 'LINES', {"pos": S.ov_green}) if S.ov_green else None,
-                    batch_for_shader(lshader, 'LINES', {"pos": S.ov_blue}) if S.ov_blue else None,
-                )
-            b_green, b_blue = S.ov_batches
-            if b_blue is not None:
-                _draw_lines(lshader, poly, b_blue, tuple(wm.uv_overlap_color_overlap), width, region)
-            if b_green is not None:
-                _draw_lines(lshader, poly, b_green, tuple(wm.uv_overlap_color_stacked), width, region)
-
-        # Red highlight on the selected elements that are overlapped
-        if show_hl:
-            pts, lines, tris = S.hl
-            fshader = gpu.shader.from_builtin('UNIFORM_COLOR')
-            try:
-                pshader = gpu.shader.from_builtin('POINT_UNIFORM_COLOR')
-            except Exception:
-                pshader = fshader
-            if S.hl_batches is None:
-                S.hl_batches = (
-                    batch_for_shader(pshader, 'POINTS', {"pos": pts}) if pts else None,
-                    batch_for_shader(lshader, 'LINES', {"pos": lines}) if lines else None,
-                    batch_for_shader(fshader, 'TRIS', {"pos": tris}) if tris else None,
-                )
-            b_pts, b_lines, b_tris = S.hl_batches
-            if b_tris is not None:
-                fshader.bind()
-                fshader.uniform_float("color", _HL_FILL)
-                b_tris.draw(fshader)
-            if b_lines is not None:
-                _draw_lines(lshader, poly, b_lines, _HL_RED, 2.0, region)
-            if b_pts is not None:
-                prefs = ctx.preferences
-                vsize = float(getattr(prefs.themes[0].image_editor, "vertex_size", 3))
-                px = float(getattr(prefs.system, "pixel_size", 1.0))
-                gpu.state.point_size_set(max(4.0, (vsize + 1.5) * 1.6 * px))
-                pshader.bind()
-                pshader.uniform_float("color", _HL_RED)
-                b_pts.draw(pshader)
-                gpu.state.point_size_set(1.0)
-
+        shader.bind()
+        if poly:
+            shader.uniform_float("viewportSize", (region.width, region.height))
+            shader.uniform_float("lineWidth", width)
+        else:
+            gpu.state.line_width_set(width)
+        if b_blue is not None:
+            shader.uniform_float("color", tuple(wm.uv_overlap_color_overlap))
+            b_blue.draw(shader)
+        if b_green is not None:
+            shader.uniform_float("color", tuple(wm.uv_overlap_color_stacked))
+            b_green.draw(shader)
         gpu.matrix.pop()
         gpu.state.blend_set('NONE')
+        if not poly:
+            gpu.state.line_width_set(1.0)
     except Exception:
         pass
 

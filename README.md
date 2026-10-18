@@ -39,7 +39,7 @@ Rotates, mirrors and scales the UV selection using the closest vertex below the 
 
 
 ####UV OVERLAP SELECT
-Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press the key of the select mode you are already in to toggle overlap selection; while it is active, the selected elements that actually are overlapped are highlighted red (the rest of the selection keeps its normal color).
+Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press the key of the select mode you are already in to toggle overlap selection; while it is active, the UV selection turns red whenever it actually contains overlapped elements.
 
 - 1 / 2 / 3 / 4 again (on the active Vertex / Edge / Face / Island mode) = Toggles overlap selection
 - Selecting an element also selects everything sitting at the same UV position; deselecting it deselects the overlapped partners too
