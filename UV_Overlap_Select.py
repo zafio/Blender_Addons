@@ -20,7 +20,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 3),
+    "version": (1, 0, 4),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -45,7 +45,8 @@ _RED = (1.0, 0.10, 0.10)
 _THEME_PROPS = ("vertex_select", "edge_select", "face_select", "face_dot")
 _MESH_MODE = {'VERTEX': 'VERT', 'EDGE': 'EDGE', 'FACE': 'FACE'}
 _ACTIVE_VALUES = {'PRESS', 'RELEASE', 'CLICK', 'DOUBLE_CLICK', 'CLICK_DRAG'}
-_MOUSE_BUTTONS = {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'PEN', 'ERASER'}
+_MOUSE_BUTTONS = {'LEFTMOUSE', 'RIGHTMOUSE', 'PEN'}
+_SETTLE = 0.06   # seconds to wait after the last click event before expanding
 
 _saved_theme = {}
 _addon_keymaps = []
@@ -70,6 +71,8 @@ class _State:
         self.interval = 0.4
         self.geo = {}           # unit -> UV position signature at our last snapshot
         self.status = "Off"     # shown in the N panel
+        self.mouse_down = False # a select button is held (click not finished yet)
+        self.mouse_time = 0.0
 
 
 S = _State()
@@ -583,9 +586,18 @@ def _process(context):
     keys_add = {key_of[u] for u in added if u in key_of}
     keys_rem = {key_of[u] for u in removed if u in key_of} - keys_add
 
+    # A stack that lost only SOME of its members: Blender's own click select
+    # ("deselect all, then select the clicked one") does that to the partners we
+    # added, so put them back - unless the user really deselected (Shift / toggle
+    # or deselect click), in which case the whole stack goes.
+    removing = _last_op_deselects(wm)
     final = set(now)
     for k in keys_rem:
-        final.difference_update(groups[k])
+        members = groups[k]
+        if not removing and any(u in now for u in members):
+            final.update(members)
+        else:
+            final.difference_update(members)
     for k in keys_add:
         final.update(groups[k])
 
@@ -690,6 +702,18 @@ class UV_OT_overlap_toggle(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _last_op_deselects(wm):
+    """True if the last operator was a deselecting click (toggle / deselect)."""
+    try:
+        ops = wm.operators
+        if not len(ops):
+            return False
+        kw = ops[-1].as_keywords()
+        return bool(kw.get("toggle") or kw.get("deselect"))
+    except Exception:
+        return False
+
+
 def _ops_signature(wm):
     """Cheap fingerprint of 'the last operator that ran' to notice selection operators."""
     try:
@@ -755,8 +779,19 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     set_overlap_active(context, False)
                     return self._stop(context)
 
+            # Blender selects on press AND again on click (release); expanding in
+            # between gets undone by the second pass, so wait for the click to end.
+            if S.mouse_down:
+                if now - S.mouse_time < 10.0:
+                    return {'PASS_THROUGH'}
+                S.mouse_down = False     # missed release (outside the window)
+
             sig = _ops_signature(wm)
-            if S.dirty and now - S.dirty_time >= 0.04:
+            if S.dirty:
+                due = now - S.dirty_time >= _SETTLE
+                if not due:
+                    return {'PASS_THROUGH'}
+            elif sig != S.ops_sig:
                 due = True
             elif sig != S.ops_sig:
                 due = True
@@ -777,9 +812,16 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     return self._stop(context)
                 S.interval = max(0.4, (time.perf_counter() - t0) * 10.0)
 
-        elif event.value in _ACTIVE_VALUES:
-            S.dirty = True
-            S.dirty_time = time.monotonic()
+        else:
+            if event.type in _MOUSE_BUTTONS:
+                if event.value == 'PRESS':
+                    S.mouse_down = True
+                    S.mouse_time = time.monotonic()
+                elif event.value == 'RELEASE':
+                    S.mouse_down = False
+            if event.value in _ACTIVE_VALUES:
+                S.dirty = True
+                S.dirty_time = time.monotonic()
 
         return {'PASS_THROUGH'}
 
