@@ -26,7 +26,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 3, 1),
+    "version": (1, 3, 2),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -1365,7 +1365,7 @@ def register():
         default=(0.6, 1.0, 0.65, 1.0), update=_overlay_prop_update)
     wm_t.uv_overlap_color_overlap = FloatVectorProperty(
         name="Overlapping Color", subtype='COLOR', size=4, min=0.0, max=1.0,
-        default=(0.88, 0.69, 1.0, 1.0), update=_overlay_prop_update)     # mauve
+        default=(1.0, 0.66, 0.94, 1.0), update=_overlay_prop_update)     # reddish mauve
     wm_t.uv_overlap_line_width = FloatProperty(
         name="Line Width", description="Thickness of the stacked / overlapping wire",
         default=1.0, min=0.5, max=8.0, step=10, precision=1, update=_overlay_prop_update)
