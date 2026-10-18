@@ -26,7 +26,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 3, 3),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor: 1/2/3/4 again on the active mode, Shift+1/2/3/4 or Shift+W | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -72,6 +72,7 @@ class _State:
     def __init__(self):
         self.token = 0          # id of the current watcher
         self.heartbeat = 0.0    # last time the watcher ticked
+        self.gen = 0            # model build counter
         self.ov_green = []      # wire lines (UV coords): stacked faces
         self.ov_blue = []       # wire lines (UV coords): overlapping faces (mauve)
         self.ov_batches = None
@@ -86,8 +87,9 @@ class _State:
         self.dirty = False
         self.dirty_time = 0.0
         self.ops_sig = None
-        self.last_check = 0.0
-        self.interval = 0.4
+        self.cache = None       # (key, model) - UV grouping kept between clicks
+        self.geo_dirty = True   # UVs may have changed: rebuild the grouping
+        self.dg_dirty = False   # Blender reported a mesh update
         self.geo = {}           # unit -> UV position signature at our last snapshot
         self.status = "Off"     # shown in the N panel
         self.mouse_down = False # a select button is held (click not finished yet)
@@ -262,10 +264,57 @@ def _groups_from_dsu(dsu):
     return key_of, groups
 
 
+class _Reader:
+    """Re-reads ONLY the selection flags of a cached model (the expensive grouping by
+    UV position is kept between clicks while the UVs don't change)."""
+
+    def __init__(self, entries, kind):
+        self.entries = entries
+        self.kind = kind        # 'v' corner select, 'e' edge select, 'fe'/'fv' whole face
+        self.items = {}         # object index -> [(unit, loop or loops)]
+
+    def list(self, oi):
+        lst = self.items.get(oi)
+        if lst is None:
+            lst = self.items[oi] = []
+        return lst
+
+    def read(self):
+        out = set()
+        kind = self.kind
+        for oi, items in self.items.items():
+            acc = self.entries[oi][2]
+            if type(acc) is _AccLoopUV:
+                uvl = acc.uv
+                if kind == 'v':
+                    out.update([u for u, l in items if l[uvl].select])
+                elif kind == 'e':
+                    out.update([u for u, l in items if l[uvl].select_edge])
+                elif kind == 'fe':
+                    out.update([u for u, ls in items if all(l[uvl].select_edge for l in ls)])
+                else:
+                    out.update([u for u, ls in items if all(l[uvl].select for l in ls)])
+            else:
+                vs, es = acc.vsel, acc.esel
+                if kind == 'v':
+                    out.update([u for u, l in items if vs(l)])
+                elif kind == 'e':
+                    out.update([u for u, l in items if es(l)])
+                elif kind == 'fe':
+                    out.update([u for u, ls in items if all(es(l) for l in ls)])
+                else:
+                    out.update([u for u, ls in items if all(vs(l) for l in ls)])
+        return out
+
+
 class _Model:
-    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count", "elem_of")
+    __slots__ = ("key_of", "groups", "selected", "apply", "geo", "sig_count", "elem_of",
+                 "read", "gen", "probe")
 
     def __init__(self, key_of, groups, selected, apply, geo):
+        self.read = None        # () -> set of selected units (cheap re-read)
+        self.gen = 0            # build number (changes only when UVs are re-grouped)
+        self.probe = None       # one BMesh element, to notice a rebuilt mesh (undo...)
         self.sig_count = None   # island mode: footprint -> number of faces with it
         self.elem_of = None     # vertex/edge mode: unit -> mesh vertex / edge it belongs to
         self.key_of, self.groups, self.selected, self.apply = key_of, groups, selected, apply
@@ -365,9 +414,11 @@ def _collect(context):
 def _model_vertex(entries, inv):
     """UV sync OFF, vertex mode. Unit = face corner, group = same UV position."""
     key_of, groups, loop_of, sel, elem_of = {}, {}, {}, set(), {}
+    rd = _Reader(entries, 'v')
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
         vidx = {v: i for i, v in enumerate(bm.verts)}
+        its = rd.list(oi)
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
@@ -378,6 +429,7 @@ def _model_vertex(entries, inv):
                 groups.setdefault(key, []).append(u)
                 loop_of[u] = l
                 elem_of[u] = (oi, vidx[l.vert])
+                its.append((u, l))
                 if vsel(l):
                     sel.add(u)
 
@@ -396,6 +448,7 @@ def _model_vertex(entries, inv):
 
     model = _Model(key_of, groups, sel, apply, key_of)
     model.elem_of = elem_of
+    model.read = rd.read
     return model
 
 
@@ -448,10 +501,12 @@ def _model_edge(entries, inv, sticky):
     """UV sync OFF, edge mode. Unit = face corner edge, group = same pair of UV positions."""
     key_of, groups, loop_of, sel, elem_of = {}, {}, {}, set(), {}
     st = _Sticky(sticky)
+    rd = _Reader(entries, 'e')
     for oi, (me, bm, acc) in enumerate(entries):
         pos, esel = acc.pos, acc.esel
         vidx = {v: i for i, v in enumerate(bm.verts)} if st.fn else None
         eidx = {e: i for i, e in enumerate(bm.edges)}
+        its = rd.list(oi)
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
@@ -467,6 +522,7 @@ def _model_edge(entries, inv, sticky):
                 groups.setdefault(key, []).append(u)
                 loop_of[u] = l
                 elem_of[u] = (oi, eidx[l.edge])
+                its.append((u, l))
                 if esel(l):
                     sel.add(u)
 
@@ -488,6 +544,7 @@ def _model_edge(entries, inv, sticky):
 
     model = _Model(key_of, groups, sel, apply, key_of)
     model.elem_of = elem_of
+    model.read = rd.read
     return model
 
 
@@ -512,14 +569,17 @@ def _model_face(entries, inv, sticky):
     (In edge/face mode Blender treats a face as selected when all its EDGES are.)"""
     key_of, groups, face_of, sel = {}, {}, {}, set()
     st = _Sticky(sticky)
+    rd = _Reader(entries, 'fe')
     for oi, (me, bm, acc) in enumerate(entries):
         pos, esel = acc.pos, acc.esel
         vidx = {v: i for i, v in enumerate(bm.verts)} if st.fn else None
+        its = rd.list(oi)
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
             u = (oi, fi)
             ls = list(f.loops)
+            its.append((u, ls))
             ps = [pos(l, inv) for l in ls]
             st.add_face(oi, fi, f, ps, vidx)
             key = tuple(sorted(ps))
@@ -528,7 +588,9 @@ def _model_face(entries, inv, sticky):
             face_of[u] = f
             if all(esel(l) for l in ls):
                 sel.add(u)
-    return _Model(key_of, groups, sel, _apply_faces(entries, face_of, st), key_of)
+    model = _Model(key_of, groups, sel, _apply_faces(entries, face_of, st), key_of)
+    model.read = rd.read
+    return model
 
 
 def _model_island(entries, inv):
@@ -536,13 +598,16 @@ def _model_island(entries, inv):
     that shares an identical face footprint with it (stacked / mirrored islands)."""
     dsu = _DSU()
     seen_v, seen_sig, face_of, sel, geo = {}, {}, {}, set(), {}
+    rd = _Reader(entries, 'fv')
     for oi, (me, bm, acc) in enumerate(entries):
         pos, vsel = acc.pos, acc.vsel
         vidx = {v: i for i, v in enumerate(bm.verts)}
+        its = rd.list(oi)
         for fi, f in enumerate(bm.faces):
             if f.hide or not f.select:
                 continue
             fu = (oi, fi)
+            its.append((fu, list(f.loops)))
             dsu.add(fu)
             face_of[fu] = f
             ps = []
@@ -564,7 +629,8 @@ def _model_island(entries, inv):
     for g in geo.values():
         cnt[g] = cnt.get(g, 0) + 1
     model.sig_count = cnt       # an island group always has several faces; a real
-    return model                # overlap means some face footprint appears twice
+    model.read = rd.read        # overlap means some face footprint appears twice
+    return model
 
 
 def _model_sync(mode, entries, inv):
@@ -618,7 +684,9 @@ def _model_sync(mode, entries, inv):
             entries[oi][1].select_flush_mode()
         return touched
 
-    return _Model(key_of, groups, sel, apply, geo)
+    model = _Model(key_of, groups, sel, apply, geo)
+    model.read = lambda: {u for u, o in obj_of.items() if o.select}
+    return model
 
 
 def _build_model(mode, sync, entries, inv, sticky='SHARED_LOCATION'):
@@ -687,11 +755,49 @@ def _snapshot(model, sel, topo):
     _set_red(_has_overlap(model, sel))
 
 
+def _cache_key(mode, sync, entries, inv, sticky):
+    objs = []
+    for me, bm, _acc in entries:
+        objs.append((id(bm), len(bm.verts), len(bm.edges), len(bm.faces),
+                     0 if sync else getattr(me, "total_face_sel", 0)))
+    return (mode, sync, round(inv), None if sync else sticky, tuple(objs))
+
+
+def _get_model(mode, sync, entries, inv, sticky):
+    """The grouping by UV position is only rebuilt when the UVs may have changed
+    (any non-selection operator, a transform, undo/redo, a different mesh / visible
+    face set); otherwise only the selection flags are re-read."""
+    key = _cache_key(mode, sync, entries, inv, sticky)
+    cached = S.cache
+    if cached is not None and not S.geo_dirty and cached[0] == key:
+        model = cached[1]
+        probe = model.probe
+        try:
+            if probe is None or getattr(probe, "is_valid", True):
+                model.selected = model.read()
+                return model
+        except ReferenceError:
+            pass                          # mesh was rebuilt under us: re-group
+    model = _build_model(mode, sync, entries, inv, sticky)
+    S.gen += 1
+    model.gen = S.gen
+    for _me, bm, _acc in entries:
+        for f in bm.faces:
+            model.probe = f
+            break
+        if model.probe is not None:
+            break
+    S.cache = (key, model)
+    S.geo_dirty = False
+    return model
+
+
 def _process(context):
     # Never touch the mesh while a move / rotate / scale is running - that is what
     # tore the UVs apart. (The "moved" check below is a second safety net.)
     busy = _transform_running(context)
     if busy:
+        S.geo_dirty = True                # UVs are moving: re-group afterwards
         _set_status(context, "Paused while %s runs" % busy)
         return
 
@@ -707,7 +813,7 @@ def _process(context):
         (len(bm.verts), len(bm.edges), len(bm.faces)) for _me, bm, _acc in entries)
 
     sticky = getattr(ts, "uv_sticky_select_mode", 'SHARED_LOCATION')
-    model = _build_model(mode, sync, entries, inv, sticky)
+    model = _get_model(mode, sync, entries, inv, sticky)
     now = model.selected
     _update_overlay(context, entries, sync, inv, topo, model)
     if not wm.uv_overlap_active:          # only the Shift wire display is on
@@ -913,7 +1019,7 @@ def _update_overlay(context, entries, sync, inv, topo, model):
             S.ov_green, S.ov_blue, S.ov_batches, S.ov_sig = [], [], None, None
             _tag_redraw(context)
         return
-    sig = (topo, len(model.geo), hash(tuple(model.geo.items())))
+    sig = (topo, model.gen)
     if sig == S.ov_sig:
         return
     eps = max(wm.uv_overlap_tolerance, 1e-9)
@@ -1129,20 +1235,40 @@ def _last_op_deselects(wm):
         return False
 
 
+_SELECT_OP_PREFIXES = ("UV_OT_select", "UV_OT_shortest_path", "UV_OT_overlap")
+
+
 def _ops_signature(wm):
-    """Cheap fingerprint of 'the last operator that ran' to notice selection operators."""
+    """Cheap fingerprint of 'the last operator that ran': (count, pointer, idname).
+    Every new operator is a new object, so its pointer changes."""
     try:
         ops = wm.operators
-        if not len(ops):
-            return (0, None, ())
+        n = len(ops)
+        if not n:
+            return (0, 0, "")
         last = ops[-1]
-        try:
-            kw = tuple(sorted((k, str(v)) for k, v in last.as_keywords().items()))
-        except Exception:
-            kw = ()
-        return (len(ops), last.bl_idname, kw)
+        return (n, last.as_pointer(), last.bl_idname)
     except Exception:
         return None
+
+
+# Navigation / hover events never change the selection: they don't trigger a check.
+_IGNORED_EVENTS = {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'MIDDLEMOUSE', 'WHEELUPMOUSE',
+                   'WHEELDOWNMOUSE', 'WHEELINMOUSE', 'WHEELOUTMOUSE', 'TRACKPADPAN',
+                   'TRACKPADZOOM', 'MOUSEROTATE', 'MOUSESMARTZOOM', 'WINDOW_DEACTIVATE',
+                   'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_ALT',
+                   'RIGHT_ALT', 'OSKEY'}
+
+
+@persistent
+def _on_depsgraph_update(_scene, _depsgraph=None):
+    S.dg_dirty = True
+
+
+@persistent
+def _on_undo_redo(*_args):
+    S.geo_dirty = True                    # undo rebuilds the mesh: re-group
+    S.dg_dirty = True
 
 
 class UV_OT_overlap_watch(bpy.types.Operator):
@@ -1205,23 +1331,22 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     return {'PASS_THROUGH'}
                 S.mouse_down = False     # missed release (outside the window)
 
+            # Event driven: nothing is scanned while you're idle. A check runs only
+            # after an operator ran, Blender reported a mesh update, or a click / key
+            # press - and only once the click has settled.
+            if now - S.dirty_time < _SETTLE:
+                return {'PASS_THROUGH'}
             sig = _ops_signature(wm)
-            if S.dirty:
-                due = now - S.dirty_time >= _SETTLE
-                if not due:
-                    return {'PASS_THROUGH'}
-            elif sig != S.ops_sig:
+            due = S.dirty or S.dg_dirty
+            if sig != S.ops_sig:
                 due = True
-            elif sig != S.ops_sig:
-                due = True
-            else:
-                due = now - S.last_check >= S.interval
+                if sig and S.ops_sig is not None and not sig[2].startswith(_SELECT_OP_PREFIXES):
+                    S.geo_dirty = True    # unwrap, pack, snap, undo... may move UVs
 
             if due:
                 S.dirty = False
+                S.dg_dirty = False
                 S.ops_sig = sig
-                S.last_check = now
-                t0 = time.perf_counter()
                 try:
                     _process(context)
                 except Exception as ex:
@@ -1229,7 +1354,7 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     set_overlap_active(context, False)
                     self.report({'ERROR'}, "UV Overlap Select stopped: %s" % ex)
                     return self._stop(context)
-                S.interval = max(0.4, (time.perf_counter() - t0) * 10.0)
+                S.dg_dirty = False        # ignore the update our own change caused
 
         else:
             if event.type in _MOUSE_BUTTONS:
@@ -1238,7 +1363,8 @@ class UV_OT_overlap_watch(bpy.types.Operator):
                     S.mouse_time = time.monotonic()
                 elif event.value == 'RELEASE':
                     S.mouse_down = False
-            if event.value in _ACTIVE_VALUES:
+            if event.value in _ACTIVE_VALUES and event.type not in _IGNORED_EVENTS \
+                    and not event.type.startswith(('NDOF', 'TIMER')):
                 S.dirty = True
                 S.dirty_time = time.monotonic()
 
@@ -1390,6 +1516,12 @@ def register():
 
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
+    h = bpy.app.handlers
+    if _on_depsgraph_update not in h.depsgraph_update_post:
+        h.depsgraph_update_post.append(_on_depsgraph_update)
+    for lst in (h.undo_post, h.redo_post):
+        if _on_undo_redo not in lst:
+            lst.append(_on_undo_redo)
 
     try:
         _theme_restore(bpy.context)      # repair a theme left red by an earlier session
@@ -1407,6 +1539,12 @@ def unregister():
 
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+    h = bpy.app.handlers
+    if _on_depsgraph_update in h.depsgraph_update_post:
+        h.depsgraph_update_post.remove(_on_depsgraph_update)
+    for lst in (h.undo_post, h.redo_post):
+        if _on_undo_redo in lst:
+            lst.remove(_on_undo_redo)
 
     global _draw_handle
     if _draw_handle is not None:
