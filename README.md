@@ -36,3 +36,12 @@ Rotates, mirrors and scales the UV selection using the closest vertex below the 
 - < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps in whole texture pixels, or 0.1 steps without a texture)
 - Enter & LMB = Accept
 - Esc & RMB = Cancel
+
+
+####UV OVERLAP SELECT
+Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press the key of the select mode you are already in to toggle overlap selection; the UV selection turns red while it is active.
+
+- 1 / 2 / 3 / 4 again (on the active Vertex / Edge / Face / Island mode) = Toggles overlap selection
+- Selecting an element also selects everything sitting at the same UV position; deselecting it deselects the overlapped partners too
+- Works with UV Sync Selection on or off (Island mode only without sync)
+- N panel > Overlap tab: on/off button, tolerance, and "Keep On When Changing Mode"
