@@ -20,7 +20,7 @@ Sidebar: UV Editor > N panel > "Overlap" tab.
 bl_info = {
     "name": "UV Overlap Select",
     "author": "Zafio",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor: press 1/2/3/4 again on the active mode | N panel > Overlap",
     "description": "Press the active UV select mode key again to also select overlapped "
@@ -238,7 +238,9 @@ def _is_uv_editor(context):
     sd = context.space_data
     if context.mode != 'EDIT_MESH' or sd is None or sd.type != 'IMAGE_EDITOR':
         return False
-    return getattr(sd, "ui_mode", 'UV') == 'UV'
+    # NOTE: space.ui_mode never reports 'UV' (its enum only has View/Paint/Mask),
+    # so check space.mode / show_uvedit instead.
+    return getattr(sd, "mode", None) == 'UV' or bool(getattr(sd, "show_uvedit", False))
 
 
 def _current_mode(ts):
@@ -538,8 +540,8 @@ def set_overlap_active(context, state):
         S.armed = (_current_mode(ts), bool(ts.use_uv_select_sync))
         _theme_apply_red(context)
         try:
-            if time.monotonic() - S.heartbeat > 0.5:
-                bpy.ops.uv.overlap_watch('INVOKE_DEFAULT')
+            # Always start a fresh watcher (a new token makes any old one exit)
+            bpy.ops.uv.overlap_watch('INVOKE_DEFAULT')
             _process(context)
         except Exception:
             wm.uv_overlap_active = False
@@ -580,15 +582,16 @@ class UV_OT_overlap_mode_key(bpy.types.Operator):
         if ts.use_uv_select_sync and self.mode == 'ISLAND':
             return {'PASS_THROUGH'}          # island mode doesn't exist with sync on
         try:
-            if _current_mode(ts) == self.mode:
-                on = not wm.uv_overlap_active
-                set_overlap_active(context, on)
-                self.report({'INFO'}, "UV Overlap Select %s (%s)"
-                            % ("ON" if on else "OFF", self.mode.title()))
-            else:
-                _set_mode(context, self.mode)
-                if wm.uv_overlap_active:
-                    set_overlap_active(context, bool(wm.uv_overlap_keep))
+            if _current_mode(ts) != self.mode:
+                # Different mode: let Blender's own 1/2/3/4 binding switch the mode
+                # (so it converts the selection the normal way).
+                if wm.uv_overlap_active and not wm.uv_overlap_keep:
+                    set_overlap_active(context, False)
+                return {'PASS_THROUGH'}
+            on = not wm.uv_overlap_active
+            set_overlap_active(context, on)
+            self.report({'INFO'}, "UV Overlap Select %s (%s)"
+                        % ("ON" if on else "OFF", self.mode.title()))
         except Exception as ex:
             traceback.print_exc()
             self.report({'ERROR'}, "UV Overlap Select: %s" % ex)
