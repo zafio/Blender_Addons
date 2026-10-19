@@ -152,12 +152,12 @@ class RT_Rename(bpy.types.Operator):
             modal_feedback(self,context)
             return {'RUNNING_MODAL'}
         elif (event.type == "ESC" and event.value == "RELEASE") or (event.type == "RIGHTMOUSE" and event.value == "RELEASE"):
-            context.area.header_text_set()
+            context.area.header_text_set(None)
             return {'CANCELLED'}
         elif (event.type == "RET" and event.value == "RELEASE") or (event.type == "LEFTMOUSE" and event.value == "RELEASE"):
             active_object.name = self.Rename_Name
             active_object.data.name = active_object.name
-            context.area.header_text_set()
+            context.area.header_text_set(None)
             return {'FINISHED'}
         else:
             self.Rename_Name += (event.unicode or "")
