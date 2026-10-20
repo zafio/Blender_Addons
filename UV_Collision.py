@@ -1,11 +1,12 @@
 bl_info = {
     "name": "UV Collision Transform",
     "author": "Based on UV Sandbox by Alberto Gonzalez / Modified by Zafio",
-    "version": (0, 9, 3),
+    "version": (0, 10, 0),
     "blender": (4, 5, 0),
-    "location": "UV Editor > G (Move) / Header toggle / N-Panel > UV Collision",
-    "description": "Collision-aware UV Move (G) with per-triangle collision, sliding, overlap groups, "
-                   "pixel snapping and bounds constraint. Hold Alt while moving to toggle collision.",
+    "location": "UV Editor > G (Move), Tweak / Move tool drag / Header toggle / N-Panel > UV Collision",
+    "description": "Collision-aware UV Move (G, Tweak and Move tool drags) with per-triangle collision, "
+                   "sliding, overlapping/stacked groups, pixel snapping and bounds constraint. "
+                   "Hold Alt while moving to toggle collision.",
     "category": "UV",
 }
 
@@ -27,8 +28,55 @@ MAX_SUBSTEPS = 64     # anti-tunnelling cap per update
 SKIN = 1e-6          # UV units kept between islands after a contact (avoids re-penetration)
 SLIDE_ITERS = 4      # contact/slide iterations per update
 SLOW_UPDATE = 0.012   # seconds; slower updates get coalesced on a timer instead of per event
+STACK_TOL_PX = 0.5    # islands whose bounds match within this many texture pixels are "stacked"
+STACK_AREA_TOL = 0.02  # ...and whose areas match within 2 %
 
 addon_keymaps = []
+
+# Move-together modes. V cycles through them in this order.
+GROUP_NEXT = {'OVERLAP': 'STACKED', 'STACKED': 'OFF', 'OFF': 'OVERLAP'}
+GROUP_LABEL = {'OVERLAP': "Overlapping", 'STACKED': "Stacked", 'OFF': "Off"}
+
+
+def scene_group_mode(scene):
+    if scene.uv_solid_group_overlaps:
+        return 'OVERLAP'
+    if scene.uv_solid_group_stacked:
+        return 'STACKED'
+    return 'OFF'
+
+
+def effective_group_mode(scene, invert):
+    """Mode in use; holding Ctrl inverts it (Off -> Overlapping, anything else -> Off)."""
+    mode = scene_group_mode(scene)
+    if not invert:
+        return mode
+    return 'OVERLAP' if mode == 'OFF' else 'OFF'
+
+
+def cycle_group_mode(scene):
+    """V: Overlapping -> Stacked -> Off -> Overlapping."""
+    nxt = GROUP_NEXT[scene_group_mode(scene)]
+    scene.uv_solid_group_overlaps = nxt == 'OVERLAP'
+    scene.uv_solid_group_stacked = nxt == 'STACKED'
+    return nxt
+
+
+def _update_group_overlaps(self, context):
+    if self.uv_solid_group_overlaps and self.uv_solid_group_stacked:
+        self.uv_solid_group_stacked = False
+
+
+def _update_group_stacked(self, context):
+    if self.uv_solid_group_stacked and self.uv_solid_group_overlaps:
+        self.uv_solid_group_overlaps = False
+
+
+def _select_mouse(context):
+    """'LEFTMOUSE' or 'RIGHTMOUSE', from the active keymap's Select With preference."""
+    kc = context.window_manager.keyconfigs.active
+    prefs = getattr(kc, 'preferences', None) if kc else None
+    return 'RIGHTMOUSE' if getattr(prefs, 'select_mouse', 'LEFT') == 'RIGHT' else 'LEFTMOUSE'
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +185,35 @@ def _pt_seg_dist(P, G):
     t = np.clip(((P[:, None] - a) * d).sum(-1) / np.maximum(dd, 1e-30), 0.0, 1.0)
     diff = P[:, None] - (a + t[..., None] * d)
     return np.hypot(diff[..., 0], diff[..., 1])
+
+
+def _tris_area(tris):
+    """Unsigned total area of triangles (N,3,2) (flipped islands count positive)."""
+    if len(tris) == 0:
+        return 0.0
+    u = tris[:, 1] - tris[:, 0]
+    v = tris[:, 2] - tris[:, 0]
+    return float(np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]).sum()) * 0.5
+
+
+class _UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))
+
+    def find(self, x):
+        p = self.parent
+        while p[x] != x:
+            p[x] = p[p[x]]
+            x = p[x]
+        return x
+
+    def same(self, a, b):
+        return self.find(a) == self.find(b)
+
+    def join(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
 
 
 def addon_prefs(context):
@@ -279,8 +356,9 @@ class CollisionCore:
             isl['tris0'] = isl['offsets'][isl['tri_idx']]
 
         self.original_centers = [isl['center'].copy() for isl in self.islands]
-        self.group_of = None            # overlap groups are computed lazily
-        self.overlap_group_count = 0
+        self.group_cache = {}           # mode -> (group_of, group_count), computed lazily
+        rx, ry = get_resolution(context)
+        self.stack_tol = max(1e-6, STACK_TOL_PX / float(max(rx, ry)))
         self.members = []
 
     def island_loops(self, isl):
@@ -289,51 +367,81 @@ class CollisionCore:
             isl['loops'] = [l for f in isl['faces'] for l in faces[int(f)].loops]
         return isl['loops']
 
-    def detect_overlap_groups(self):
+    def _island_boxes(self):
+        return np.array([isl['rel_bounds'] + np.tile(isl['center'], 2) for isl in self.islands]
+                        ).reshape(-1, 4)
+
+    def detect_overlap_groups(self, union):
+        """Islands that overlap each other (even through a chain)."""
         n = len(self.islands)
-        parent = list(range(n))
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
         world = [isl['tris0'] + isl['center'] for isl in self.islands]
-        boxes = [isl['rel_bounds'] + np.tile(isl['center'], 2) for isl in self.islands]
+        boxes = self._island_boxes()
         for i in range(n):
             for j in range(i + 1, n):
-                if find(i) == find(j):
-                    continue
                 a, b = boxes[i], boxes[j]
                 if not (a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]):
                     continue
-                for _ in iter_tri_hits(world[i], world[j]):
-                    parent[find(j)] = find(i)
-                    break
+                if not union.same(i, j):
+                    for _ in iter_tri_hits(world[i], world[j]):
+                        union.join(i, j)
+                        break
 
+    def detect_stacked_groups(self, union):
+        """Islands lying on top of each other: same bounds (within STACK_TOL_PX) and same area."""
+        n = len(self.islands)
+        if n < 2:
+            return
+        boxes = self._island_boxes()
+        areas = np.array([_tris_area(isl['tris0']) for isl in self.islands])
+        tol = self.stack_tol
+        order = np.argsort(boxes[:, 0], kind='stable')
+        for a in range(n):
+            i = order[a]
+            for b in range(a + 1, n):
+                j = order[b]
+                if boxes[j, 0] - boxes[i, 0] > tol:
+                    break                       # sorted by min X: nothing further can match
+                if np.abs(boxes[j] - boxes[i]).max() > tol:
+                    continue
+                big = max(areas[i], areas[j])
+                if abs(areas[i] - areas[j]) > STACK_AREA_TOL * big + 1e-12:
+                    continue
+                union.join(int(i), int(j))
+
+    def groups_for(self, mode):
+        """(group_of, group_count) for 'OVERLAP' or 'STACKED'; None for 'OFF'."""
+        if mode == 'OFF':
+            return None
+        cached = self.group_cache.get(mode)
+        if cached is not None:
+            return cached
+        t = time.perf_counter()
+        n = len(self.islands)
+        union = _UnionFind(n)
+        if mode == 'STACKED':
+            self.detect_stacked_groups(union)
+        else:
+            self.detect_overlap_groups(union)
         groups = {}
         for i in range(n):
-            groups.setdefault(find(i), []).append(i)
-        self.group_of = [None] * n
+            groups.setdefault(union.find(i), []).append(i)
+        group_of = [None] * n
         for members in groups.values():
             for i in members:
-                self.group_of[i] = members
-        self.overlap_group_count = sum(1 for g in groups.values() if len(g) > 1)
+                group_of[i] = members
+        cached = self.group_cache[mode] = (group_of, sum(1 for g in groups.values() if len(g) > 1))
+        print(f"[UV Collision] {GROUP_LABEL[mode].lower()} groups: "
+              f"{(time.perf_counter() - t) * 1000:.1f} ms")
+        return cached
 
-    def ensure_groups(self):
-        if self.group_of is None:
-            t = time.perf_counter()
-            self.detect_overlap_groups()
-            print(f"[UV Collision] overlap groups: {(time.perf_counter() - t) * 1000:.1f} ms")
-
-    def expand_groups(self, idxs, group):
-        if not group:
+    def expand_groups(self, idxs, mode):
+        groups = self.groups_for(mode)
+        if groups is None:
             return sorted(set(idxs))
-        self.ensure_groups()
+        group_of = groups[0]
         out = set()
         for i in idxs:
-            out.update(self.group_of[i])
+            out.update(group_of[i])
         return sorted(out)
 
     # ----------------------------------------------------- write back ----
@@ -978,7 +1086,9 @@ class CollisionCore:
                 batch_for_shader(shader, 'LINE_LOOP', {"pos": frame}).draw(shader)
 
             collide_on = getattr(self, 'collision_active', True)
-            grouping = getattr(self, 'group_active', context.scene.uv_solid_group_overlaps)
+            mode = getattr(self, 'group_active', None) or scene_group_mode(context.scene)
+            cached = self.group_cache.get(mode) if mode != 'OFF' else None
+            group_of = cached[0] if cached else None
             active_set = set(self.members)
             buckets = {'static': [], 'group': [], 'active': []}
             for i, isl in enumerate(self.islands):
@@ -986,7 +1096,7 @@ class CollisionCore:
                     continue
                 if i in active_set:
                     key = 'active'
-                elif grouping and self.group_of is not None and len(self.group_of[i]) > 1:
+                elif group_of is not None and len(group_of[i]) > 1:
                     key = 'group'
                 elif collide_on:
                     key = 'static'
@@ -1054,6 +1164,15 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
     bl_label = "Move (UV Collision)"
     bl_options = {'REGISTER', 'UNDO', 'GRAB_CURSOR', 'BLOCKING'}
 
+    # Set on the drag keymap items (Tweak tool / Move tool / right-click-select drag):
+    # the move confirms when the dragging mouse button is released, like Blender's Move.
+    release_confirm: bpy.props.BoolProperty(
+        name="Confirm on Release", default=False, options={'SKIP_SAVE', 'HIDDEN'})
+    # Only run when the dragging button is the "Select With" mouse button (else the drag
+    # belongs to something else, e.g. the 2D cursor with right-click select).
+    require_select_mouse: bpy.props.BoolProperty(
+        name="Select Mouse Only", default=False, options={'SKIP_SAVE', 'HIDDEN'})
+
     @classmethod
     def poll(cls, context):
         return _poll_uv_edit(context)
@@ -1061,6 +1180,8 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
     def invoke(self, context, event):
         scene = context.scene
         if not scene.uv_collision_addon_enabled:
+            return {'PASS_THROUGH'}
+        if self.require_select_mouse and event.type != _select_mouse(context):
             return {'PASS_THROUGH'}
         prefs = addon_prefs(context)
         alt_anytime = prefs.alt_enables_collision if prefs else True
@@ -1083,12 +1204,19 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
 
         self.touched = touched
         self.ctrl = event.ctrl
-        self.group_active = scene.uv_solid_group_overlaps != self.ctrl
+        self.group_active = effective_group_mode(scene, self.ctrl)
         self.begin_body(self.expand_groups(touched, self.group_active))
         self.start_center = self.body_center()
 
+        # A drag starts where the button was pressed (not where the drag was detected),
+        # so the island keeps the same offset to the cursor, like Blender's Move.
+        self.drag_button = event.type if self.release_confirm else None
+        mx, my = event.mouse_region_x, event.mouse_region_y
+        if self.release_confirm and hasattr(event, 'mouse_prev_press_x'):
+            mx = event.mouse_prev_press_x - context.region.x
+            my = event.mouse_prev_press_y - context.region.y
         v2d = context.region.view2d
-        self.last_mouse = np.array(v2d.region_to_view(event.mouse_region_x, event.mouse_region_y))
+        self.last_mouse = np.array(v2d.region_to_view(mx, my))
         self.mouse_offset = np.zeros(2)
         self.axis = None            # None, 0 (X) or 1 (Y)
         self.num = ['', '']         # numeric input buffers
@@ -1117,8 +1245,8 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
         return context.scene.uv_solid_pixel_snap
 
     def regroup(self, context):
-        """Ctrl toggles overlap grouping; rebuild the moving body with the same offset."""
-        want = context.scene.uv_solid_group_overlaps != self.ctrl
+        """V / Ctrl change the move-together mode; rebuild the moving body with the same offset."""
+        want = effective_group_mode(context.scene, self.ctrl)
         if want == self.group_active:
             return
         self.group_active = want
@@ -1186,10 +1314,12 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
         col = "ON" if self.collision_active else "OFF"
         snap = "ON" if self.want_snap(context) else "OFF"
         bnd = "ON" if context.scene.uv_solid_constrain_bounds else "OFF"
-        grp = f"ON ({len(self.members)} islands)" if self.group_active else "OFF"
+        grp = GROUP_LABEL[self.group_active]
+        if self.group_active != 'OFF':
+            grp += f" ({len(self.members)} islands)"
         context.area.header_text_set(
             f"{dtxt}{axis}   |   Collision [{col}] (Alt)   Pixel Snap [{snap}] (S)   "
-            f"Group Overlaps [{grp}] (V / hold Ctrl)   Bounds [{bnd}] (B)")
+            f"Move Together [{grp}] (V cycles / hold Ctrl)   Bounds [{bnd}] (B)")
 
     # ---------------------------------------------------------- modal ----
 
@@ -1229,6 +1359,9 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
                 self.refresh(context)
             return {'RUNNING_MODAL'}
 
+        if self.drag_button is not None and et == self.drag_button and ev == 'RELEASE':
+            return self.finish(context, confirm=True)
+
         if ev != 'PRESS':
             return {'RUNNING_MODAL'}
 
@@ -1255,7 +1388,7 @@ class UV_OT_collision_translate(CollisionCore, bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if et == 'V':
-            context.scene.uv_solid_group_overlaps = not context.scene.uv_solid_group_overlaps
+            cycle_group_mode(context.scene)
             self.regroup(context)
             self.refresh(context)
             return {'RUNNING_MODAL'}
@@ -1332,12 +1465,14 @@ class UVSolidOperator(CollisionCore, bpy.types.Operator):
         rx, ry = get_resolution(context)
         b = "ON" if scene.uv_solid_constrain_bounds else "OFF"
         s = f"ON ({rx}x{ry})" if scene.uv_solid_pixel_snap else "OFF"
-        if scene.uv_solid_group_overlaps:
-            self.ensure_groups()
-        g = f"ON ({self.overlap_group_count} groups)" if scene.uv_solid_group_overlaps else "OFF"
+        mode = scene_group_mode(scene)
+        g = GROUP_LABEL[mode]
+        if mode != 'OFF':
+            g += f" ({self.groups_for(mode)[1]} groups)"
         context.workspace.status_text_set(
             f"Solid Drag: LMB drag (hold Alt: no collision) | B: Bounds [{b}] | S: Pixel Snap [{s}] | "
-            f"V: Group Overlaps [{g}] (or hold Ctrl on click) | Enter: Confirm | Esc/RMB: Cancel")
+            f"V: Move Together [{g}] (cycles; hold Ctrl on click to invert) | "
+            f"Enter: Confirm | Esc/RMB: Cancel")
 
     def invoke(self, context, event):
         self._handle = None
@@ -1347,7 +1482,7 @@ class UVSolidOperator(CollisionCore, bpy.types.Operator):
             self.report({'WARNING'}, "No UV islands found")
             return {'CANCELLED'}
         self.touched = set()
-        self.group_active = context.scene.uv_solid_group_overlaps
+        self.group_active = scene_group_mode(context.scene)
         self.pending = None
         self.last_mouse_target = None
         self.collision_active = True
@@ -1434,13 +1569,12 @@ class UVSolidOperator(CollisionCore, bpy.types.Operator):
             elif event.type == 'S':
                 scene.uv_solid_pixel_snap = not scene.uv_solid_pixel_snap
             elif event.type in {'G', 'V'}:
-                scene.uv_solid_group_overlaps = not scene.uv_solid_group_overlaps
+                self.group_active = cycle_group_mode(scene)
             self.update_status(context)
 
-        # V while dragging: toggle grouping live (rebuild the body, keep the drag going)
+        # V while dragging: cycle the move-together mode live (rebuild the body, keep the drag)
         if self.dragging and event.type == 'V' and event.value == 'PRESS':
-            scene.uv_solid_group_overlaps = not scene.uv_solid_group_overlaps
-            self.regroup_drag(context, scene.uv_solid_group_overlaps)
+            self.regroup_drag(context, cycle_group_mode(scene))
             self.update_status(context)
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
@@ -1451,7 +1585,7 @@ class UVSolidOperator(CollisionCore, bpy.types.Operator):
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
             i = self.pick_island(Vector(mouse))
             if i >= 0:
-                self.group_active = scene.uv_solid_group_overlaps != event.ctrl
+                self.group_active = effective_group_mode(scene, event.ctrl)
                 self.picked = i
                 self.click_mouse = mouse.copy()
                 self.click_centers = [isl['center'].copy() for isl in self.islands]
@@ -1517,16 +1651,17 @@ class UVSolidPanel(bpy.types.Panel):
         scene = context.scene
 
         layout.prop(scene, "uv_collision_addon_enabled",
-                    text="Enable UV Collision Move (G)", toggle=True,
+                    text="Enable UV Collision Move (G / Drag)", toggle=True,
                     icon='CHECKBOX_HLT' if scene.uv_collision_addon_enabled else 'CHECKBOX_DEHLT')
         body = layout.column()
         body.enabled = scene.uv_collision_addon_enabled
         if not scene.uv_collision_addon_enabled:
-            layout.label(text="Off: G uses Blender's native Move", icon='INFO')
+            layout.label(text="Off: G and drags use Blender's native Move", icon='INFO')
 
         top = body.column(align=True)
         top.prop(scene, "uv_collision_enabled", text="Collision on Move (G)")
         top.prop(scene, "uv_solid_group_overlaps", text="Move Overlapping Together (V)")
+        top.prop(scene, "uv_solid_group_stacked", text="Move Stacked Together (V)")
         col = body.column(align=True)
         col.prop(scene, "uv_solid_constrain_bounds", text="Constrain to Bounds (0 - 1)")
         col.prop(scene, "uv_solid_pixel_snap", text="Pixel Snapping (S)")
@@ -1550,11 +1685,11 @@ class UVSolidPanel(bpy.types.Panel):
         body.operator("uv.solid_drag", text="Click-Drag Tool", icon='SNAP_ON')
 
         box = body.box()
-        box.label(text="While moving (G):")
+        box.label(text="While moving (G, Tweak or Move tool drag):")
         box.label(text="• Alt: toggle collision")
         box.label(text="• S: toggle pixel snap")
-        box.label(text="• V: toggle move overlapping together")
-        box.label(text="• Ctrl (hold): invert overlapping together")
+        box.label(text="• V: cycle Overlapping > Stacked > Off")
+        box.label(text="• Ctrl (hold): Off <> Overlapping")
         box.label(text="• Shift: precision")
         box.label(text="• X / Y: lock axis, type numbers")
         box.label(text="• B: toggle bounds")
@@ -1607,8 +1742,18 @@ def register():
     )
     S.uv_solid_group_overlaps = bpy.props.BoolProperty(
         name="Move Overlapping Together",
-        description="Islands that overlap each other (even through a chain) are moved as one body (V toggles while moving, hold Ctrl to invert)",
+        description="Islands that overlap each other (even through a chain) are moved as one body "
+                    "(V cycles Overlapping / Stacked / Off while moving, hold Ctrl to invert)",
         default=False,
+        update=_update_group_overlaps,
+    )
+    S.uv_solid_group_stacked = bpy.props.BoolProperty(
+        name="Move Stacked Together",
+        description="Islands stacked exactly on top of each other (same bounds and area) are moved "
+                    "as one body; partly overlapping islands stay separate "
+                    "(V cycles Overlapping / Stacked / Off while moving)",
+        default=False,
+        update=_update_group_stacked,
     )
     S.uv_solid_padding_mode = bpy.props.EnumProperty(
         name="Padding",
@@ -1635,21 +1780,43 @@ def register():
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
+        op = UV_OT_collision_translate.bl_idname
         km = kc.keymaps.new(name="UV Editor", space_type='EMPTY')
-        kmi = km.keymap_items.new(UV_OT_collision_translate.bl_idname, 'G', 'PRESS')
+        kmi = km.keymap_items.new(op, 'G', 'PRESS')
         addon_keymaps.append((km, kmi))
+
+        # Drag-to-move. Each item runs before Blender's own one and passes through to it
+        # whenever the collision Move doesn't apply (add-on off, partial selection, ...).
+        drags = (
+            # right-click select: drag the selection
+            (km, 'RIGHTMOUSE', True),
+            # Tweak tool (left-click select): drag the selection
+            (kc.keymaps.new(name="Image Editor Tool: Uv, Tweak", space_type='IMAGE_EDITOR',
+                            region_type='WINDOW', tool=True), 'LEFTMOUSE', True),
+            # Move tool: drag anywhere (not on the gizmo)
+            (kc.keymaps.new(name="Image Editor Tool: Uv, Move", space_type='IMAGE_EDITOR',
+                            region_type='WINDOW', tool=True), 'LEFTMOUSE', False),
+        )
+        for dkm, button, select_only in drags:
+            kmi = dkm.keymap_items.new(op, button, 'CLICK_DRAG')
+            kmi.properties.release_confirm = True
+            kmi.properties.require_select_mouse = select_only
+            addon_keymaps.append((dkm, kmi))
 
 
 def unregister():
     for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except (RuntimeError, ReferenceError):
+            pass
     addon_keymaps.clear()
 
     bpy.types.IMAGE_HT_header.remove(draw_header_toggle)
 
     S = bpy.types.Scene
     for p in ("uv_collision_addon_enabled", "uv_collision_enabled", "uv_solid_constrain_bounds", "uv_solid_pixel_snap",
-              "uv_solid_group_overlaps", "uv_solid_tex_res",
+              "uv_solid_group_overlaps", "uv_solid_group_stacked", "uv_solid_tex_res",
               "uv_solid_padding_mode", "uv_solid_padding_px", "uv_solid_padding_pct"):
         delattr(S, p)
 
