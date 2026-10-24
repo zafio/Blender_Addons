@@ -1083,7 +1083,12 @@ def current_paint_texture(context):
 
 
 def sync_image_editors(context, image):
-    """Show `image` in every Image / UV Editor (pinned ones and render views are left alone)."""
+    """Show `image` in every Image / UV Editor (render / compositor views are left alone).
+
+    Pinned editors are updated too: Blender pins a UV Editor automatically whenever an image
+    is picked in it by hand (and when a script assigns one), so most UV Editors are pinned
+    without the user knowing. The pin state is kept as it was.
+    """
     for window in context.window_manager.windows:
         screen = window.screen
         if screen is None:
@@ -1092,12 +1097,13 @@ def sync_image_editors(context, image):
             if area.type != 'IMAGE_EDITOR':
                 continue
             space = area.spaces.active
-            if getattr(space, "use_image_pin", False):
-                continue
             if space.image is not None and space.image.type in NON_PAINT_IMAGE_TYPES:
                 continue
             if space.image != image:
+                pinned = getattr(space, "use_image_pin", False)
                 space.image = image
+                if hasattr(space, "use_image_pin") and space.use_image_pin != pinned:
+                    space.use_image_pin = pinned
             area.tag_redraw()
 
 
