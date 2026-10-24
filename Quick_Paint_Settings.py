@@ -1082,13 +1082,14 @@ def current_paint_texture(context):
     return (-1, None)
 
 
-def sync_image_editors(context, image):
-    """Show `image` in every Image / UV Editor (render / compositor views are left alone).
-
-    Pinned editors are updated too: Blender pins a UV Editor automatically whenever an image
-    is picked in it by hand (and when a script assigns one), so most UV Editors are pinned
-    without the user knowing. The pin state is kept as it was.
+def sync_image_editors(context, old_image, image):
+    """Switch Image / UV Editors that show `old_image` (the texture painted on until now)
+    to `image`. Editors showing any other image are left alone, so an editor kept on another
+    texture stays there. Pinning doesn't matter (Blender auto-pins UV Editors when an image is
+    picked in them by hand); each editor keeps its pin state.
     """
+    if old_image is None or old_image == image:
+        return
     for window in context.window_manager.windows:
         screen = window.screen
         if screen is None:
@@ -1097,13 +1098,12 @@ def sync_image_editors(context, image):
             if area.type != 'IMAGE_EDITOR':
                 continue
             space = area.spaces.active
-            if space.image is not None and space.image.type in NON_PAINT_IMAGE_TYPES:
+            if space.image != old_image:
                 continue
-            if space.image != image:
-                pinned = getattr(space, "use_image_pin", False)
-                space.image = image
-                if hasattr(space, "use_image_pin") and space.use_image_pin != pinned:
-                    space.use_image_pin = pinned
+            pinned = getattr(space, "use_image_pin", False)
+            space.image = image
+            if hasattr(space, "use_image_pin") and space.use_image_pin != pinned:
+                space.use_image_pin = pinned
             area.tag_redraw()
 
 
@@ -1111,6 +1111,7 @@ def set_paint_texture(context, mat_index, image):
     """Make `image` the paint target. Returns False if it can't be painted on here."""
     if image is None:
         return False
+    old_image = current_paint_texture(context)[1]
     if mat_index >= 0 and _uses_material_slots(context):
         obj = _paint_obj(context)
         if mat_index >= len(obj.material_slots):
@@ -1130,7 +1131,7 @@ def set_paint_texture(context, mat_index, image):
                     break
     elif context.mode == 'PAINT_TEXTURE':
         context.scene.tool_settings.image_paint.canvas = image
-    sync_image_editors(context, image)
+    sync_image_editors(context, old_image, image)
     if context.screen:
         for area in context.screen.areas:
             area.tag_redraw()
