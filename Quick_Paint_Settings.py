@@ -2,9 +2,10 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 11),
+    "version": (0, 0, 12),
     "blender": (4, 5, 0),
-    "location": "View3D (Image Paint & Vertex Paint) and Image Editor",
+    "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
+                "Texture Paint: Shift+Tab texture list, Shift+Q swap last two",
     "warning": "",
     "wiki_url": "",
     "tracker_url": "",
@@ -1027,6 +1028,255 @@ def stop_size_watch():
         bpy.app.handlers.load_pre.remove(_size_watch_load_pre)
 
 
+###############   PAINT TEXTURE SWITCHER (Shift+Tab list, Shift+Q swap)
+# Material mode (Texture Slots > Mode: Material): the list shows the paint slots
+# (Image Texture nodes) of every material on the object. Single Image mode: every image.
+# Picking one makes it the paint target, the active node in the Shader Editor, and the
+# image shown in every unpinned Image / UV Editor.
+NON_PAINT_IMAGE_TYPES = {'RENDER_RESULT', 'COMPOSITING'}
+TEX_HISTORY_SIZE = 2
+_tex_history = []   # textures picked from the list: (material name or "", image name), newest last
+
+
+def _paint_obj(context):
+    obj = context.active_object
+    return obj if obj is not None and obj.type == 'MESH' else None
+
+
+def _uses_material_slots(context):
+    return (context.mode == 'PAINT_TEXTURE' and _paint_obj(context) is not None and
+            context.scene.tool_settings.image_paint.mode == 'MATERIAL')
+
+
+def list_paint_textures(context):
+    """[(material_index, material, [images])]. material_index -1 = single image mode."""
+    if _uses_material_slots(context):
+        out = []
+        for i, slot in enumerate(_paint_obj(context).material_slots):
+            mat = slot.material
+            if mat is None:
+                continue
+            images = [img for img in mat.texture_paint_images if img is not None]
+            if images:
+                out.append((i, mat, images))
+        return out
+    images = [img for img in bpy.data.images if img.type not in NON_PAINT_IMAGE_TYPES]
+    return [(-1, None, images)] if images else []
+
+
+def current_paint_texture(context):
+    """(material_index, image) currently painted on."""
+    if _uses_material_slots(context):
+        obj = _paint_obj(context)
+        mat = obj.active_material
+        if mat is None:
+            return (obj.active_material_index, None)
+        images = mat.texture_paint_images
+        k = mat.paint_active_slot
+        return (obj.active_material_index, images[k] if 0 <= k < len(images) else None)
+    if context.mode == 'PAINT_TEXTURE':
+        return (-1, context.scene.tool_settings.image_paint.canvas)
+    space = context.space_data
+    if space is not None and space.type == 'IMAGE_EDITOR':
+        return (-1, space.image)
+    return (-1, None)
+
+
+def sync_image_editors(context, image):
+    """Show `image` in every Image / UV Editor (pinned ones and render views are left alone)."""
+    for window in context.window_manager.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != 'IMAGE_EDITOR':
+                continue
+            space = area.spaces.active
+            if getattr(space, "use_image_pin", False):
+                continue
+            if space.image is not None and space.image.type in NON_PAINT_IMAGE_TYPES:
+                continue
+            if space.image != image:
+                space.image = image
+            area.tag_redraw()
+
+
+def set_paint_texture(context, mat_index, image):
+    """Make `image` the paint target. Returns False if it can't be painted on here."""
+    if image is None:
+        return False
+    if mat_index >= 0 and _uses_material_slots(context):
+        obj = _paint_obj(context)
+        if mat_index >= len(obj.material_slots):
+            return False
+        mat = obj.material_slots[mat_index].material
+        if mat is None:
+            return False
+        images = list(mat.texture_paint_images)
+        if image not in images:
+            return False
+        obj.active_material_index = mat_index
+        mat.paint_active_slot = images.index(image)
+        if mat.node_tree:
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image == image:
+                    mat.node_tree.nodes.active = node
+                    break
+    elif context.mode == 'PAINT_TEXTURE':
+        context.scene.tool_settings.image_paint.canvas = image
+    sync_image_editors(context, image)
+    if context.screen:
+        for area in context.screen.areas:
+            area.tag_redraw()
+    return True
+
+
+def _history_key(context, mat_index, image):
+    mat_name = ""
+    if mat_index >= 0:
+        mat = _paint_obj(context).material_slots[mat_index].material
+        mat_name = mat.name if mat else ""
+    return (mat_name, image.name)
+
+
+def remember_paint_texture(context, mat_index, image):
+    key = _history_key(context, mat_index, image)
+    if key in _tex_history:
+        _tex_history.remove(key)
+    _tex_history.append(key)
+    del _tex_history[:-TEX_HISTORY_SIZE]
+
+
+def _resolve_history(context, key):
+    """(material_index, image) for a history entry, or None if it can't be used here."""
+    mat_name, img_name = key
+    image = bpy.data.images.get(img_name)
+    if image is None:
+        return None
+    material_mode = _uses_material_slots(context)
+    if not mat_name:
+        return None if material_mode else (-1, image)
+    if not material_mode:
+        return None
+    for i, slot in enumerate(_paint_obj(context).material_slots):
+        mat = slot.material
+        if mat is not None and mat.name == mat_name and image in list(mat.texture_paint_images):
+            return (i, image)
+    return None
+
+
+def selected_texture_nodes_images(context):
+    """Images of the selected Image Texture nodes in the active material, top to bottom."""
+    obj = _paint_obj(context)
+    mat = obj.active_material if obj else None
+    if mat is None or mat.node_tree is None:
+        return []
+    nodes = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.select and n.image]
+    nodes.sort(key=lambda n: (-n.location.y, n.location.x))
+    images = []
+    for n in nodes:
+        if n.image not in images:
+            images.append(n.image)
+    return images
+
+
+class SNA_OT_Set_Paint_Texture(bpy.types.Operator):
+    bl_idname = "sna.set_paint_texture"
+    bl_label = "Paint on Texture"
+    bl_description = "Paint on this texture (also shown in the Image / UV Editor and made the active node)"
+    bl_options = {'REGISTER'}
+
+    material_index: bpy.props.IntProperty(default=-1, options={'SKIP_SAVE'})
+    image_name: bpy.props.StringProperty(options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        image = bpy.data.images.get(self.image_name)
+        if not set_paint_texture(context, self.material_index, image):
+            self.report({'WARNING'}, f"Can't paint on '{self.image_name}' here")
+            return {'CANCELLED'}
+        remember_paint_texture(context, self.material_index, image)
+        return {'FINISHED'}
+
+
+class SNA_OT_Swap_Paint_Texture(bpy.types.Operator):
+    bl_idname = "sna.swap_paint_texture"
+    bl_label = "Swap Paint Texture"
+    bl_description = ("Switch between the last two textures picked in the Shift+Tab list. "
+                      "Without two picks, cycle the selected Image Texture nodes of the active material")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        cur = current_paint_texture(context)
+        hist = [r for r in (_resolve_history(context, k) for k in _tex_history) if r is not None]
+
+        if len(hist) == TEX_HISTORY_SIZE:
+            older, newer = hist
+            target = older if cur == newer else newer
+            if set_paint_texture(context, *target):
+                remember_paint_texture(context, *target)
+                self.report({'INFO'}, f"Painting on {target[1].name}")
+                return {'FINISHED'}
+
+        images = selected_texture_nodes_images(context)
+        if not images:
+            self.report({'INFO'}, "Pick two textures with Shift+Tab, or select Image Texture "
+                                  "nodes in the Shader Editor")
+            return {'CANCELLED'}
+        k = images.index(cur[1]) + 1 if cur[1] in images else 0
+        image = images[k % len(images)]
+        mat_index = _paint_obj(context).active_material_index if _uses_material_slots(context) else -1
+        if not set_paint_texture(context, mat_index, image):
+            self.report({'WARNING'}, f"Can't paint on '{image.name}' here")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Painting on {image.name}")
+        return {'FINISHED'}
+
+
+class SNA_PT_Paint_Texture_List(bpy.types.Panel):
+    bl_label = "Paint Textures"
+    bl_idname = "SNA_PT_Paint_Texture_List"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "WINDOW"
+    bl_ui_units_x = 12
+
+    def draw(self, context):
+        layout = self.layout
+        try:
+            groups = list_paint_textures(context)
+            cur = current_paint_texture(context)
+            if not groups:
+                layout.label(text="No textures to paint on", icon='INFO')
+                return
+            show_headers = len(groups) > 1
+            for mat_index, mat, images in groups:
+                col = layout.column(align=True)
+                if show_headers:
+                    col.label(text=mat.name, icon='MATERIAL')
+                for img in images:
+                    active = (mat_index, img) == cur
+                    op = col.operator("sna.set_paint_texture", text=img.name,
+                                      icon_value=layout.icon(img), depress=active)
+                    op.material_index = mat_index
+                    op.image_name = img.name
+            layout.label(text="Shift+Q: swap last two picks")
+        except Exception as exc:
+            print(str(exc) + " | Error in Paint Textures panel")
+
+
+def register_keys_paint_textures():
+    kc = bpy.context.window_manager.keyconfigs.addon
+    if kc:
+        # "Image Paint" is active in Texture Paint mode (3D View) and Image Editor paint mode,
+        # and is checked before the general 3D View / Image keymaps.
+        km = kc.keymaps.new(name="Image Paint", space_type="EMPTY")
+        kmi = km.keymap_items.new("wm.call_panel", type="TAB", value="PRESS", shift=True)
+        kmi.properties.name = "SNA_PT_Paint_Texture_List"
+        kmi.properties.keep_open = False
+        addon_keymaps['TEXLIST'] = (km, kmi)
+        kmi = km.keymap_items.new("sna.swap_paint_texture", type="Q", value="PRESS", shift=True)
+        addon_keymaps['TEXSWAP'] = (km, kmi)
+
+
 ###############   REGISTER ICONS
 def sn_register_icons():
     icons = []
@@ -1118,11 +1368,15 @@ def register():
     bpy.utils.register_class(SNA_OT_Toggle_Ui_Style)
     bpy.utils.register_class(SNA_OT_Toggle_Ui_Size)
     bpy.utils.register_class(SNA_OT_Paint_Size_Watcher)
+    bpy.utils.register_class(SNA_OT_Set_Paint_Texture)
+    bpy.utils.register_class(SNA_OT_Swap_Paint_Texture)
+    bpy.utils.register_class(SNA_PT_Paint_Texture_List)
     start_size_watch()
     register_key_757AB()
     register_key_C6025()
     register_key_314FA()
     register_key_B0360()
+    register_keys_paint_textures()
 
 
 ###############   UNREGISTER ADDON
@@ -1131,9 +1385,16 @@ def unregister():
     sn_unregister_properties()
     for key in addon_keymaps:
         km, kmi = addon_keymaps[key]
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except (RuntimeError, ReferenceError):
+            pass
     addon_keymaps.clear()
     stop_size_watch()
+    _tex_history.clear()
+    bpy.utils.unregister_class(SNA_PT_Paint_Texture_List)
+    bpy.utils.unregister_class(SNA_OT_Swap_Paint_Texture)
+    bpy.utils.unregister_class(SNA_OT_Set_Paint_Texture)
     bpy.utils.unregister_class(SNA_OT_Paint_Size_Watcher)
     bpy.utils.unregister_class(SNA_OT_Toggle_Ui_Size)
     bpy.utils.unregister_class(SNA_OT_Toggle_Ui_Style)
