@@ -2,7 +2,7 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 15),
+    "version": (0, 0, 16),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two. "
@@ -1394,9 +1394,48 @@ class SNA_MT_Blend_Mode_Pie(bpy.types.Menu):
             op.mode = mode
 
 
+BRUSH_PANEL_ID = "SNA_PT_Brush_Settings_86BC5"
+BRUSH_POPUP_WIDTH = 200     # px, same as Blender's default popover width (10 UI units)
+HOLD_CLOSE_TIME = 0.3       # hold S (or <) longer than this and the panel closes on release
+
+
+class SNA_OT_Brush_Settings_Popup(bpy.types.Operator):
+    """The S / < brush settings panel as a popup that closes when the mouse moves away from it
+    (Blender has no way for add-ons to close a stay-open popup, this kind can be closed)"""
+    bl_idname = "sna.brush_settings_popup"
+    bl_label = "Brush Settings"
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=BRUSH_POPUP_WIDTH)
+
+    def draw(self, context):
+        SNA_PT_Brush_Settings_86BC5.draw(self, context)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+def close_popup_by_cursor(window, x, y):
+    """Close a popup that closes on mouse-away: move the cursor to the far window corner
+    (Blender sees the mouse leave the popup and closes it), then put it back."""
+    far_x = 0 if x > window.width / 2 else window.width - 1
+    far_y = 0 if y > window.height / 2 else window.height - 1
+    window.cursor_warp(far_x, far_y)
+
+    def put_back():
+        try:
+            window.cursor_warp(x, y)
+        except (ReferenceError, RuntimeError):
+            pass
+        return None
+    bpy.app.timers.register(put_back, first_interval=0.05)
+
+
 class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
     """Open one of the add-on's popups (or the blend mode pie), only where painting happens
-    (else the key passes through to Blender)"""
+    (else the key passes through to Blender). For the brush panel: tap the key to keep it open,
+    hold it longer than HOLD_CLOSE_TIME and it closes on release"""
     bl_idname = "sna.call_paint_popup"
     bl_label = "Quick Paint Popup"
     bl_options = {'INTERNAL'}
@@ -1420,8 +1459,27 @@ class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
                 return {'PASS_THROUGH'}
             bpy.ops.wm.call_menu_pie('INVOKE_DEFAULT', name=BLEND_PIE_ID)
             return {'FINISHED'}
-        bpy.ops.wm.call_panel('INVOKE_DEFAULT', name=self.panel, keep_open=self.keep_open)
-        return {'FINISHED'}
+        if self.panel != BRUSH_PANEL_ID:
+            bpy.ops.wm.call_panel('INVOKE_DEFAULT', name=self.panel, keep_open=self.keep_open)
+            return {'FINISHED'}
+        # Brush panel: open it, then watch the key. Added after the popup, so this handler sees
+        # the key release before the popup does.
+        bpy.ops.sna.brush_settings_popup('INVOKE_DEFAULT')
+        self._key = event.type
+        self._t0 = time.monotonic()
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == self._key:
+            if event.value == 'RELEASE':
+                if time.monotonic() - self._t0 > HOLD_CLOSE_TIME and context.window:
+                    close_popup_by_cursor(context.window, event.mouse_x, event.mouse_y)
+                return {'FINISHED'}
+            return {'RUNNING_MODAL'}            # auto-repeat while held
+        if event.type == 'WINDOW_DEACTIVATE' or time.monotonic() - self._t0 > 120.0:
+            return {'FINISHED', 'PASS_THROUGH'}  # release missed (focus lost): stop watching
+        return {'PASS_THROUGH'}
 
 
 def _new_popup_item(km, typ, panel, keep_open=True, **mods):
@@ -1556,6 +1614,7 @@ def register():
     bpy.utils.register_class(SNA_OT_Set_Paint_Texture)
     bpy.utils.register_class(SNA_OT_Swap_Paint_Texture)
     bpy.utils.register_class(SNA_PT_Paint_Texture_List)
+    bpy.utils.register_class(SNA_OT_Brush_Settings_Popup)
     bpy.utils.register_class(SNA_OT_Call_Paint_Popup)
     bpy.utils.register_class(SNA_OT_Set_Blend_Mode)
     bpy.utils.register_class(SNA_OT_Swap_Blend_Mode)
@@ -1588,6 +1647,7 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Swap_Blend_Mode)
     bpy.utils.unregister_class(SNA_OT_Set_Blend_Mode)
     bpy.utils.unregister_class(SNA_OT_Call_Paint_Popup)
+    bpy.utils.unregister_class(SNA_OT_Brush_Settings_Popup)
     bpy.utils.unregister_class(SNA_PT_Paint_Texture_List)
     bpy.utils.unregister_class(SNA_OT_Swap_Paint_Texture)
     bpy.utils.unregister_class(SNA_OT_Set_Paint_Texture)
