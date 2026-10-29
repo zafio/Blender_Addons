@@ -2,7 +2,7 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 16),
+    "version": (0, 0, 17),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two. "
@@ -871,12 +871,6 @@ def register_key_757AB():
 def register_key_C6025():
     _register_brush_popup_key('C6025', "Image", "IMAGE_EDITOR", "S")
 
-def register_key_314FA():
-    _register_brush_popup_key('314FA', "3D View", "VIEW_3D", "GRLESS")
-
-def register_key_B0360():
-    _register_brush_popup_key('B0360', "Image", "IMAGE_EDITOR", "GRLESS")
-
 
 ###############   SEPARATE BRUSH SIZE: 3D VIEW / IMAGE EDITOR
 # Texture painting in the 3D View and in the Image Editor share one Radius.
@@ -1396,11 +1390,11 @@ class SNA_MT_Blend_Mode_Pie(bpy.types.Menu):
 
 BRUSH_PANEL_ID = "SNA_PT_Brush_Settings_86BC5"
 BRUSH_POPUP_WIDTH = 200     # px, same as Blender's default popover width (10 UI units)
-HOLD_CLOSE_TIME = 0.3       # hold S (or <) longer than this and the panel closes on release
+HOLD_CLOSE_TIME = 0.3       # hold S longer than this and the panel closes on release
 
 
 class SNA_OT_Brush_Settings_Popup(bpy.types.Operator):
-    """The S / < brush settings panel as a popup that closes when the mouse moves away from it
+    """The S brush settings panel as a popup that closes when the mouse moves away from it
     (Blender has no way for add-ons to close a stay-open popup, this kind can be closed)"""
     bl_idname = "sna.brush_settings_popup"
     bl_label = "Brush Settings"
@@ -1440,10 +1434,12 @@ class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
     bl_label = "Quick Paint Popup"
     bl_options = {'INTERNAL'}
 
-    panel: bpy.props.StringProperty()
-    keep_open: bpy.props.BoolProperty(default=True)
-    texture_only: bpy.props.BoolProperty(default=False)
-    pie_only: bpy.props.BoolProperty(default=False)
+    # SKIP_SAVE: Blender would otherwise reuse the last-used values for any property a hotkey
+    # doesn't set, so e.g. S inherited pie_only from right-click and opened the blend pie.
+    panel: bpy.props.StringProperty(options={'SKIP_SAVE'})
+    keep_open: bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    texture_only: bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    pie_only: bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
 
     @classmethod
     def poll(cls, context):
@@ -1502,8 +1498,7 @@ def register_keys_paint_textures():
                                 ("Image", "IMAGE_EDITOR", "IM")):
         km = kc.keymaps.new(name=km_name, space_type=space)
         if tag == "IP":
-            for key, typ in (("S", "S"), ("LESS", "GRLESS")):
-                addon_keymaps[f'{tag}_{key}'] = (km, _new_popup_item(km, typ, brush_panel))
+            addon_keymaps[f'{tag}_S'] = (km, _new_popup_item(km, "S", brush_panel))
         if tag != "VP":
             kmi = _new_popup_item(km, "TAB", "SNA_PT_Paint_Texture_List", keep_open=False, shift=True)
             kmi.properties.texture_only = True
@@ -1623,8 +1618,6 @@ def register():
     start_size_watch()
     register_key_757AB()
     register_key_C6025()
-    register_key_314FA()
-    register_key_B0360()
     register_keys_paint_textures()
 
 
