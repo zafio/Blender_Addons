@@ -2,7 +2,7 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 12),
+    "version": (0, 0, 13),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two",
@@ -166,6 +166,24 @@ def sn_cast_enum(string, enum_values):
 
 ###############   IMPERATIVE CODE
 addon_keymaps = {}
+
+
+###############   PAINT CONTEXT
+def image_editor_painting(context):
+    """True in an Image Editor set to Paint mode (works without any object in Texture Paint)."""
+    space = context.space_data
+    # space.mode, not space.ui_mode (ui_mode has no 'UV' item and warns in the UV Editor)
+    return space is not None and space.type == 'IMAGE_EDITOR' and getattr(space, "mode", None) == 'PAINT'
+
+
+def is_texture_paint(context):
+    """Texture painting: 3D View Texture Paint mode, or an Image Editor in Paint mode."""
+    return image_editor_painting(context) or context.mode == 'PAINT_TEXTURE'
+
+
+def in_paint_context(context):
+    """Where the add-on's popups and hotkeys apply."""
+    return is_texture_paint(context) or context.mode == 'PAINT_VERTEX'
 
 
 ###############   COLOR JITTER / RANDOMIZE COLOR LOGIC
@@ -454,7 +472,7 @@ PIXEL_CURVE_POINTS = ((0.0, 1.0), (0.499, 1.0), (0.5, 0.0), (1.0, 0.0))
 def get_active_paint_brush(context):
     """Return the brush of the current paint mode (vertex or texture/image paint)."""
     ts = context.scene.tool_settings
-    if context.mode == 'PAINT_VERTEX':
+    if not is_texture_paint(context) and context.mode == 'PAINT_VERTEX':
         return ts.vertex_paint.brush
     return ts.image_paint.brush
 
@@ -583,7 +601,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return (bpy.context.mode == r"PAINT_TEXTURE" or bpy.context.mode == r"PAINT_VERTEX")
+        return in_paint_context(context)
 
     def draw_header(self, context):
         pass
@@ -591,6 +609,8 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
     def draw(self, context):
         try:
             layout = self.layout
+            # Image Editor in Paint mode counts as texture painting too
+            tex_paint = is_texture_paint(context)
             ui_style = quickpaintsettingspanel["ui_icon_style"]
 
             col = layout.column(align=True)
@@ -601,7 +621,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
 
             # ── Color Selector ──
             ups = bpy.context.scene.tool_settings.unified_paint_settings
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 brush = bpy.context.scene.tool_settings.image_paint.brush
             else:
                 brush = bpy.context.scene.tool_settings.vertex_paint.brush
@@ -630,7 +650,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             row.alert = False
             row.scale_x = 1.0
             row.scale_y = 1.0
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 row.prop(bpy.context.scene.tool_settings.image_paint.brush,'blend',icon_value=0,text=r"",emboss=ui_style,expand=False,)
             else:
                 row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'blend',icon_value=0,text=r"",emboss=ui_style,expand=False,)
@@ -690,7 +710,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             row.scale_x = 1.0
             row.scale_y = 1.0
             row.prop(bpy.context.scene.tool_settings.unified_paint_settings,'size',icon_value=0,text=r"Radius",emboss=ui_style,slider=True,)
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_size',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
             else:
                 row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'use_pressure_size',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
@@ -702,7 +722,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             row.scale_x = 1.0
             row.scale_y = 1.0
             row.prop(bpy.context.scene.tool_settings.unified_paint_settings,'strength',icon_value=0,text=r"Strength",emboss=ui_style,slider=True,)
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_strength',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
             else:
                 row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'use_pressure_strength',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
@@ -714,7 +734,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             row.scale_x = 1.0
             row.scale_y = 1.0
             row.prop(bpy.context.scene.tool_settings.image_paint.brush,'spacing',icon_value=0,text=r"Spacing",emboss=ui_style,slider=True,)
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_spacing',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
             else:
                 row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'use_pressure_spacing',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
@@ -734,7 +754,7 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_jitter',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
             
             # Row 7: Bleed
-            if bpy.context.mode == r"PAINT_TEXTURE":
+            if tex_paint:
                 split = col.split(align=True,factor=0.9)
                 split.enabled = True
                 split.alert = False
@@ -854,14 +874,8 @@ def register_key_C6025():
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Image", space_type="IMAGE_EDITOR")
-        kmi = km.keymap_items.new("wm.call_panel",
-                                    type= "S",
-                                    value= "PRESS",
-                                    repeat= False,
-                                    ctrl=False,
-                                    alt=False,
-                                    shift=False)
-        kmi.properties.name = "SNA_PT_Brush_Settings_86BC5"
+        kmi = km.keymap_items.new("sna.call_paint_popup", type="S", value="PRESS")
+        kmi.properties.panel = "SNA_PT_Brush_Settings_86BC5"
         kmi.properties.keep_open = True
         addon_keymaps['C6025'] = (km, kmi)
 
@@ -884,14 +898,8 @@ def register_key_B0360():
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
         km = kc.keymaps.new(name="Image", space_type="IMAGE_EDITOR")
-        kmi = km.keymap_items.new("wm.call_panel",
-                                    type= "GRLESS",
-                                    value= "PRESS",
-                                    repeat= False,
-                                    ctrl=False,
-                                    alt=False,
-                                    shift=False)
-        kmi.properties.name = "SNA_PT_Brush_Settings_86BC5"
+        kmi = km.keymap_items.new("sna.call_paint_popup", type="GRLESS", value="PRESS")
+        kmi.properties.panel = "SNA_PT_Brush_Settings_86BC5"
         kmi.properties.keep_open = True
         addon_keymaps['B0360'] = (km, kmi)
 
@@ -1212,6 +1220,10 @@ class SNA_OT_Swap_Paint_Texture(bpy.types.Operator):
                       "Without two picks, cycle the selected Image Texture nodes of the active material")
     bl_options = {'REGISTER'}
 
+    @classmethod
+    def poll(cls, context):
+        return is_texture_paint(context)
+
     def execute(self, context):
         cur = current_paint_texture(context)
         hist = [r for r in (_resolve_history(context, k) for k in _tex_history) if r is not None]
@@ -1270,18 +1282,49 @@ class SNA_PT_Paint_Texture_List(bpy.types.Panel):
             print(str(exc) + " | Error in Paint Textures panel")
 
 
+class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
+    """Open one of the add-on's popups, only where painting happens (else the key passes through)"""
+    bl_idname = "sna.call_paint_popup"
+    bl_label = "Quick Paint Popup"
+    bl_options = {'INTERNAL'}
+
+    panel: bpy.props.StringProperty()
+    keep_open: bpy.props.BoolProperty(default=True)
+    texture_only: bpy.props.BoolProperty(default=False)
+
+    @classmethod
+    def poll(cls, context):
+        return in_paint_context(context)
+
+    def invoke(self, context, event):
+        if self.texture_only and not is_texture_paint(context):
+            return {'PASS_THROUGH'}
+        bpy.ops.wm.call_panel('INVOKE_DEFAULT', name=self.panel, keep_open=self.keep_open)
+        return {'FINISHED'}
+
+
 def register_keys_paint_textures():
     kc = bpy.context.window_manager.keyconfigs.addon
-    if kc:
-        # "Image Paint" is active in Texture Paint mode (3D View) and Image Editor paint mode,
-        # and is checked before the general 3D View / Image keymaps.
-        km = kc.keymaps.new(name="Image Paint", space_type="EMPTY")
-        kmi = km.keymap_items.new("wm.call_panel", type="TAB", value="PRESS", shift=True)
-        kmi.properties.name = "SNA_PT_Paint_Texture_List"
+    if not kc:
+        return
+    # "Image Paint" is active in 3D View Texture Paint mode and in Image Editor Paint mode,
+    # and is checked before the general 3D View / Image keymaps (so Blender's own paint keys
+    # on S / Shift+Tab can't hide ours). "Image" is a fallback for the Image Editor.
+    for km_name, space, tag in (("Image Paint", "EMPTY", "IP"), ("Image", "IMAGE_EDITOR", "IM")):
+        km = kc.keymaps.new(name=km_name, space_type=space)
+        if tag == "IP":
+            for key, typ in (("S", "S"), ("LESS", "GRLESS")):
+                kmi = km.keymap_items.new("sna.call_paint_popup", type=typ, value="PRESS")
+                kmi.properties.panel = "SNA_PT_Brush_Settings_86BC5"
+                kmi.properties.keep_open = True
+                addon_keymaps[f'{tag}_{key}'] = (km, kmi)
+        kmi = km.keymap_items.new("sna.call_paint_popup", type="TAB", value="PRESS", shift=True)
+        kmi.properties.panel = "SNA_PT_Paint_Texture_List"
         kmi.properties.keep_open = False
-        addon_keymaps['TEXLIST'] = (km, kmi)
+        kmi.properties.texture_only = True
+        addon_keymaps[f'{tag}_TEXLIST'] = (km, kmi)
         kmi = km.keymap_items.new("sna.swap_paint_texture", type="Q", value="PRESS", shift=True)
-        addon_keymaps['TEXSWAP'] = (km, kmi)
+        addon_keymaps[f'{tag}_TEXSWAP'] = (km, kmi)
 
 
 ###############   REGISTER ICONS
@@ -1378,6 +1421,7 @@ def register():
     bpy.utils.register_class(SNA_OT_Set_Paint_Texture)
     bpy.utils.register_class(SNA_OT_Swap_Paint_Texture)
     bpy.utils.register_class(SNA_PT_Paint_Texture_List)
+    bpy.utils.register_class(SNA_OT_Call_Paint_Popup)
     start_size_watch()
     register_key_757AB()
     register_key_C6025()
@@ -1399,6 +1443,7 @@ def unregister():
     addon_keymaps.clear()
     stop_size_watch()
     _tex_history.clear()
+    bpy.utils.unregister_class(SNA_OT_Call_Paint_Popup)
     bpy.utils.unregister_class(SNA_PT_Paint_Texture_List)
     bpy.utils.unregister_class(SNA_OT_Swap_Paint_Texture)
     bpy.utils.unregister_class(SNA_OT_Set_Paint_Texture)
