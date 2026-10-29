@@ -2,11 +2,11 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 14),
+    "version": (0, 0, 15),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two. "
-                "Blend pie: S S / < < / B, Shift+X swap blend, Alt+X black & white",
+                "Blend pie: RMB, Shift+X swap blend, Alt+X black & white",
     "warning": "",
     "wiki_url": "",
     "tracker_url": "",
@@ -863,7 +863,6 @@ def _register_brush_popup_key(tag, km_name, space, typ):
         kmi = km.keymap_items.new("sna.call_paint_popup", type=typ, value="PRESS")
         kmi.properties.panel = "SNA_PT_Brush_Settings_86BC5"
         kmi.properties.keep_open = True
-        kmi.properties.double_tap_pie = True    # press twice: blend mode pie
         addon_keymaps[tag] = (km, kmi)
 
 def register_key_757AB():
@@ -1257,9 +1256,8 @@ class SNA_PT_Paint_Texture_List(bpy.types.Panel):
             print(str(exc) + " | Error in Paint Textures panel")
 
 
-###############   BLEND MODE PIE (S S / < < / B), Shift+X swap, Alt+X reset colors
+###############   BLEND MODE PIE (RMB), Shift+X swap, Alt+X reset colors
 BLEND_PIE_ID = "SNA_MT_Blend_Mode_Pie"
-DOUBLE_TAP_TIME = 0.3   # seconds between the two presses of S (or <) that open the pie
 # Pie slots in Blender's order: W, E, S, N, NW, NE, SW, SE -> (label, enum identifiers to try)
 BLEND_PIE_SLOTS = (
     ("Multiply", ("MUL", "MULTIPLY")),
@@ -1347,7 +1345,7 @@ class SNA_OT_Swap_Blend_Mode(bpy.types.Operator):
         elif len(hist) == 1 and (hist[0] != cur or cur != 'MIX'):
             target = 'MIX' if cur == hist[0] else hist[0]
         else:
-            self.report({'INFO'}, "Pick a blend mode in the blend pie (S S or B) first")
+            self.report({'INFO'}, "Pick a blend mode in the blend pie (right mouse) first")
             return {'CANCELLED'}
         set_brush_blend(context, target)
         name = brush.bl_rna.properties['blend'].enum_items[target].name
@@ -1397,8 +1395,8 @@ class SNA_MT_Blend_Mode_Pie(bpy.types.Menu):
 
 
 class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
-    """Open one of the add-on's popups, only where painting happens (else the key passes through).
-    With double_tap_pie, pressing the key twice quickly opens the blend mode pie instead"""
+    """Open one of the add-on's popups (or the blend mode pie), only where painting happens
+    (else the key passes through to Blender)"""
     bl_idname = "sna.call_paint_popup"
     bl_label = "Quick Paint Popup"
     bl_options = {'INTERNAL'}
@@ -1406,64 +1404,30 @@ class SNA_OT_Call_Paint_Popup(bpy.types.Operator):
     panel: bpy.props.StringProperty()
     keep_open: bpy.props.BoolProperty(default=True)
     texture_only: bpy.props.BoolProperty(default=False)
-    double_tap_pie: bpy.props.BoolProperty(default=False)
     pie_only: bpy.props.BoolProperty(default=False)
 
     @classmethod
     def poll(cls, context):
         return in_paint_context(context)
 
-    def _open_panel(self):
-        bpy.ops.wm.call_panel('INVOKE_DEFAULT', name=self.panel, keep_open=self.keep_open)
-
-    def _end(self, context):
-        try:
-            context.window_manager.event_timer_remove(self._timer)
-        except Exception:
-            pass
-
     def invoke(self, context, event):
         if self.texture_only and not is_texture_paint(context):
             return {'PASS_THROUGH'}
         if self.pie_only:
+            # In an Image Editor only while it's in Paint mode (keep RMB menus in View / UV)
+            space = context.space_data
+            if space is not None and space.type == 'IMAGE_EDITOR' and not image_editor_painting(context):
+                return {'PASS_THROUGH'}
             bpy.ops.wm.call_menu_pie('INVOKE_DEFAULT', name=BLEND_PIE_ID)
             return {'FINISHED'}
-        if not self.double_tap_pie:
-            self._open_panel()
-            return {'FINISHED'}
-        # A popup would swallow the second key press, so wait briefly for it first
-        self._key = event.type
-        self._t0 = time.monotonic()
-        self._timer = context.window_manager.event_timer_add(0.02, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
-
-    def modal(self, context, event):
-        if event.type == 'TIMER':
-            if time.monotonic() - self._t0 >= DOUBLE_TAP_TIME:
-                self._end(context)
-                self._open_panel()
-                return {'FINISHED', 'PASS_THROUGH'}
-            return {'PASS_THROUGH'}
-        if event.type == self._key and event.value == 'PRESS':
-            if getattr(event, "is_repeat", False):
-                return {'RUNNING_MODAL'}          # key held down: ignore auto-repeat
-            self._end(context)
-            bpy.ops.wm.call_menu_pie('INVOKE_DEFAULT', name=BLEND_PIE_ID)
-            return {'FINISHED'}
-        if event.value == 'PRESS' and event.type not in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
-            # anything else (another key, a click): show the panel right away, keep the event
-            self._end(context)
-            self._open_panel()
-            return {'FINISHED', 'PASS_THROUGH'}
-        return {'PASS_THROUGH'}
+        bpy.ops.wm.call_panel('INVOKE_DEFAULT', name=self.panel, keep_open=self.keep_open)
+        return {'FINISHED'}
 
 
-def _new_popup_item(km, typ, panel, keep_open=True, double_tap_pie=False, **mods):
+def _new_popup_item(km, typ, panel, keep_open=True, **mods):
     kmi = km.keymap_items.new("sna.call_paint_popup", type=typ, value="PRESS", **mods)
     kmi.properties.panel = panel
     kmi.properties.keep_open = keep_open
-    kmi.properties.double_tap_pie = double_tap_pie
     return kmi
 
 
@@ -1481,15 +1445,15 @@ def register_keys_paint_textures():
         km = kc.keymaps.new(name=km_name, space_type=space)
         if tag == "IP":
             for key, typ in (("S", "S"), ("LESS", "GRLESS")):
-                addon_keymaps[f'{tag}_{key}'] = (km, _new_popup_item(km, typ, brush_panel, double_tap_pie=True))
+                addon_keymaps[f'{tag}_{key}'] = (km, _new_popup_item(km, typ, brush_panel))
         if tag != "VP":
             kmi = _new_popup_item(km, "TAB", "SNA_PT_Paint_Texture_List", keep_open=False, shift=True)
             kmi.properties.texture_only = True
             addon_keymaps[f'{tag}_TEXLIST'] = (km, kmi)
             kmi = km.keymap_items.new("sna.swap_paint_texture", type="Q", value="PRESS", shift=True)
             addon_keymaps[f'{tag}_TEXSWAP'] = (km, kmi)
-        # B: blend mode pie directly
-        kmi = _new_popup_item(km, "B", "")
+        # Right mouse: blend mode pie (replaces Blender's paint context menu while painting)
+        kmi = _new_popup_item(km, "RIGHTMOUSE", "")
         kmi.properties.pie_only = True
         addon_keymaps[f'{tag}_BLENDPIE'] = (km, kmi)
         kmi = km.keymap_items.new("sna.swap_blend_mode", type="X", value="PRESS", shift=True)
