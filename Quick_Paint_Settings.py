@@ -2,7 +2,7 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 17),
+    "version": (0, 0, 18),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two. "
@@ -592,6 +592,17 @@ class SNA_OT_Reset_Background(bpy.types.Operator):
         return self.execute(context)
 
 
+###############   UNIFIED TOGGLE
+def draw_unified_toggle(layout, ups, prop, emboss):
+    """Blender's "Use Unified" button (same icon as its own paint panels)."""
+    for icon in ('BRUSHES_ALL', 'WORLD'):   # BRUSHES_ALL in 4.x; fallback if ever renamed
+        try:
+            layout.prop(ups, prop, text="", icon=icon, emboss=emboss, toggle=True)
+            return
+        except TypeError:
+            continue
+
+
 ###############   PANEL
 class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
     bl_label = "Brush Settings"
@@ -704,30 +715,22 @@ class SNA_PT_Brush_Settings_86BC5(bpy.types.Panel):
             
             col.separator(factor=0.18)
             
-            # Row 3: Radius
-            row = col.row(align=True)
-            row.enabled = True
-            row.alert = False
-            row.scale_x = 1.0
-            row.scale_y = 1.0
-            row.prop(bpy.context.scene.tool_settings.unified_paint_settings,'size',icon_value=0,text=r"Radius",emboss=ui_style,slider=True,)
-            if tex_paint:
-                row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_size',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
-            else:
-                row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'use_pressure_size',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
-            
-            # Row 4: Strength
-            row = col.row(align=True)
-            row.enabled = True
-            row.alert = False
-            row.scale_x = 1.0
-            row.scale_y = 1.0
-            row.prop(bpy.context.scene.tool_settings.unified_paint_settings,'strength',icon_value=0,text=r"Strength",emboss=ui_style,slider=True,)
-            if tex_paint:
-                row.prop(bpy.context.scene.tool_settings.image_paint.brush,'use_pressure_strength',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
-            else:
-                row.prop(bpy.context.scene.tool_settings.vertex_paint.brush,'use_pressure_strength',icon='STYLUS_PRESSURE',text=r"",emboss=ui_style,toggle=True,)
-            
+            # Row 3: Radius  |  Row 4: Strength
+            # The slider edits the unified value when "Unified" is on, else the brush's own
+            # value (like Blender's own paint panels). The unified toggle sits after pressure.
+            ups = bpy.context.scene.tool_settings.unified_paint_settings
+            paint_brush = (bpy.context.scene.tool_settings.image_paint.brush if tex_paint
+                           else bpy.context.scene.tool_settings.vertex_paint.brush)
+            for prop, label, unified in (('size', "Radius", 'use_unified_size'),
+                                         ('strength', "Strength", 'use_unified_strength')):
+                row = col.row(align=True)
+                owner = ups if (getattr(ups, unified) or paint_brush is None) else paint_brush
+                row.prop(owner, prop, text=label, emboss=ui_style, slider=True)
+                if paint_brush is not None:
+                    row.prop(paint_brush, f'use_pressure_{prop}', icon='STYLUS_PRESSURE',
+                             text="", emboss=ui_style, toggle=True)
+                draw_unified_toggle(row, ups, unified, ui_style)
+
             # Row 5: Spacing
             row = col.row(align=True)
             row.enabled = True
