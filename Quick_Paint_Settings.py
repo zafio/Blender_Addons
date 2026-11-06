@@ -2,11 +2,11 @@ bl_info = {
     "name": "QuickPaintSettingsPanel",
     "description": "Popup Panel and Hotkeys for quicker access to common paint settings",
     "author": "Zafio",
-    "version": (0, 0, 18),
+    "version": (0, 0, 19),
     "blender": (4, 5, 0),
     "location": "View3D (Image Paint & Vertex Paint) and Image Editor. "
                 "Texture Paint: Shift+Tab texture list, Shift+Q swap last two. "
-                "Blend pie: RMB, Shift+X swap blend, Alt+X black & white",
+                "Blend pie: RMB, Shift+X swap blend, Alt+X black & white, Alt+R reload painted image",
     "warning": "",
     "wiki_url": "",
     "tracker_url": "",
@@ -1372,6 +1372,36 @@ class SNA_OT_Reset_Paint_Colors(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SNA_OT_Reload_Paint_Image(bpy.types.Operator):
+    bl_idname = "sna.reload_paint_image"
+    bl_label = "Reload Paint Image"
+    bl_description = ("Reload the image being painted on from disk (unsaved painting on it is lost, "
+                      "like Image > Reload in the Image Editor)")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        # 3D View Texture Paint only; in the Image Editor Blender's own Alt+R reloads
+        space = context.space_data
+        return context.mode == 'PAINT_TEXTURE' and space is not None and space.type == 'VIEW_3D'
+
+    def execute(self, context):
+        image = current_paint_texture(context)[1]
+        if image is None:
+            self.report({'WARNING'}, "No image being painted on")
+            return {'CANCELLED'}
+        if image.source == 'GENERATED' or not (image.filepath or image.packed_file):
+            # reloading a never-saved image would wipe it back to the generated pattern
+            self.report({'WARNING'}, f"'{image.name}' has no file on disk to reload from")
+            return {'CANCELLED'}
+        image.reload()
+        if context.screen:
+            for area in context.screen.areas:
+                area.tag_redraw()
+        self.report({'INFO'}, f"Reloaded {image.name}")
+        return {'FINISHED'}
+
+
 class SNA_MT_Blend_Mode_Pie(bpy.types.Menu):
     bl_idname = BLEND_PIE_ID
     bl_label = "Blend Mode"
@@ -1516,6 +1546,11 @@ def register_keys_paint_textures():
         addon_keymaps[f'{tag}_BLENDSWAP'] = (km, kmi)
         kmi = km.keymap_items.new("sna.reset_paint_colors", type="X", value="PRESS", alt=True)
         addon_keymaps[f'{tag}_RESETCOLORS'] = (km, kmi)
+        if tag == "IP":
+            # Alt+R: reload the painted image (3D View Texture Paint; the operator's poll lets
+            # Blender's own Alt+R through in the Image Editor)
+            kmi = km.keymap_items.new("sna.reload_paint_image", type="R", value="PRESS", alt=True)
+            addon_keymaps[f'{tag}_RELOAD'] = (km, kmi)
 
 
 ###############   REGISTER ICONS
@@ -1617,6 +1652,7 @@ def register():
     bpy.utils.register_class(SNA_OT_Set_Blend_Mode)
     bpy.utils.register_class(SNA_OT_Swap_Blend_Mode)
     bpy.utils.register_class(SNA_OT_Reset_Paint_Colors)
+    bpy.utils.register_class(SNA_OT_Reload_Paint_Image)
     bpy.utils.register_class(SNA_MT_Blend_Mode_Pie)
     start_size_watch()
     register_key_757AB()
@@ -1639,6 +1675,7 @@ def unregister():
     _tex_history.clear()
     _blend_history.clear()
     bpy.utils.unregister_class(SNA_MT_Blend_Mode_Pie)
+    bpy.utils.unregister_class(SNA_OT_Reload_Paint_Image)
     bpy.utils.unregister_class(SNA_OT_Reset_Paint_Colors)
     bpy.utils.unregister_class(SNA_OT_Swap_Blend_Mode)
     bpy.utils.unregister_class(SNA_OT_Set_Blend_Mode)
