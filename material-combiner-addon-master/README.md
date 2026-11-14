@@ -13,10 +13,11 @@ material-combiner-addon
 
 ## INSTALLATION
 1. Download an addon: [Material-combiner](https://github.com/Grim-es/material-combiner-addon/archive/master.zip)
-2. Go to File > User Preferences > Addons
-3. Click on Install Add-on from File
+2. Go to Edit > Preferences > Add-ons (Blender 4.5: Get Extensions / Add-ons tab)
+3. Click the dropdown arrow at the top right and choose Install from Disk
 4. Choose material-combiner-addon-master.zip archive
-5. Activate Material Combiner
+5. Activate Material Combiner (it is in the 3D View sidebar, MatCombiner tab)
+6. Pillow is needed: click Install Pillow in the panel. On Blender 4.2+ this needs "Allow Online Access" (Preferences > System > Network)
 
 ## KNOWN ISSUES
 

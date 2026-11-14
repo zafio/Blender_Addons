@@ -1,20 +1,18 @@
 import bpy
 from bpy.props import *
 
-from . import addon_updater_ops
-
 
 class CombineList(bpy.types.PropertyGroup):
-    ob = PointerProperty(
+    ob: PointerProperty(
         name='Current Object',
         type=bpy.types.Object,
     )
-    ob_id = IntProperty(default=0)
-    mat = PointerProperty(
+    ob_id: IntProperty(default=0)
+    mat: PointerProperty(
         name='Current Object Material',
         type=bpy.types.Material,
     )
-    layer = IntProperty(
+    layer: IntProperty(
         name='Material Layers',
         description='Materials with the same number will be merged together.'
                     '\nUse this to create multiple materials linked to the same atlas file',
@@ -23,46 +21,8 @@ class CombineList(bpy.types.PropertyGroup):
         step=1,
         default=1,
     )
-    used = BoolProperty(default=True)
-    type = IntProperty(default=0)
-
-
-class UpdatePreferences(bpy.types.AddonPreferences):
-    bl_idname = __package__
-    auto_check_update = BoolProperty(
-        name='Auto-check for Update',
-        description='If enabled, auto-check for updates using an interval',
-        default=True,
-    )
-    updater_intrval_months = bpy.props.IntProperty(
-        name='Months',
-        description='Number of months between checking for updates',
-        default=0,
-        min=0
-    )
-    updater_intrval_days = IntProperty(
-        name='Days',
-        description='Number of days between checking for updates',
-        default=1,
-        min=1
-    )
-    updater_intrval_hours = IntProperty(
-        name='Hours',
-        description='Number of hours between checking for updates',
-        default=0,
-        min=0,
-        max=0
-    )
-    updater_intrval_minutes = IntProperty(
-        name='Minutes',
-        description='Number of minutes between checking for updates',
-        default=0,
-        min=0,
-        max=0
-    )
-
-    def draw(self, context: bpy.types.Context):
-        addon_updater_ops.update_settings_ui(self, context)
+    used: BoolProperty(default=True)
+    type: IntProperty(default=0)
 
 
 def register() -> None:

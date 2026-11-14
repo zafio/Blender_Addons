@@ -17,11 +17,11 @@ class PropertyMenu(bpy.types.Operator):
     bl_description = 'Show settings for this material'
     bl_options = {'UNDO', 'INTERNAL'}
 
-    list_id = IntProperty(default=0)
+    list_id: IntProperty(default=0)
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> Set:
         scn = context.scene
-        dpi = bpy.context.preferences.system.dpi if globs.is_blender_2_80_or_newer else bpy.context.user_preferences.system.dpi
+        dpi = context.preferences.system.dpi
         wm = context.window_manager
         scn.smc_list_id = self.list_id
         return wm.invoke_props_dialog(self, width=dpi * 4)
@@ -34,19 +34,28 @@ class PropertyMenu(bpy.types.Operator):
 
     def draw(self, context: bpy.types.Context) -> None:
         scn = context.scene
+        if scn.smc_list_id >= len(scn.smc_ob_data):
+            return
         item = scn.smc_ob_data[scn.smc_list_id]
+        if not item.mat:
+            self.layout.label(text='Material not found, update the material list', icon='ERROR')
+            return
         if globs.is_blender_2_80_or_newer:
             node_tree = item.mat.node_tree if item.mat else None
             image = None
             shader = get_shader_type(item.mat) if item.mat else None
             node_name = shader_image_nodes.get(shader)
-            if node_name:
-                image = node_tree.nodes[node_name].image
+            node = node_tree.nodes.get(node_name) if node_name and node_tree else None
+            if node:
+                image = node.image
         else:
             image = get_image(get_texture(item.mat))
         col = self.layout.column()
         col.scale_y = 1.2
-        col.prop(item.mat, 'name', text='', icon_value=item.mat.preview.icon_id)
+        if item.mat.preview:
+            col.prop(item.mat, 'name', text='', icon_value=item.mat.preview.icon_id)
+        else:
+            col.prop(item.mat, 'name', text='', icon='MATERIAL')
         if image:
             self._show_image(col, image)
             self._show_diffuse_color(col, item, image)
@@ -61,7 +70,10 @@ class PropertyMenu(bpy.types.Operator):
             image.preview_ensure()
         row = col.row()
         image_name = '{0}...'.format(image.name[:16]) if len(image.name) > 16 else image.name
-        row.label(text=image_name, icon_value=image.preview.icon_id)
+        if image.preview:
+            row.label(text=image_name, icon_value=image.preview.icon_id)
+        else:
+            row.label(text=image_name, icon='IMAGE_DATA')
         row.alignment = 'RIGHT'
         row.label(text='Size: {0}x{1}px'.format(*image.size))
 
@@ -89,10 +101,7 @@ class PropertyMenu(bpy.types.Operator):
             if not item.mat.smc_diffuse:
                 return
 
-        split = (
-            col.row().split(factor=0.1) if globs.is_blender_2_80_or_newer and image else
-            col.row().split(percentage=0.1) if image else col
-        )
+        split = col.row().split(factor=0.1) if image else col
         split.separator()
 
         if shader in ['mmd', 'mmdCol']:

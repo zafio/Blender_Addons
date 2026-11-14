@@ -17,7 +17,6 @@ class RefreshObData(bpy.types.Operator):
     bl_label = 'Combine List'
     bl_description = 'Updates the material list'
 
-    @staticmethod
     def execute(self, context: bpy.types.Context) -> Set[str]:
         scn = context.scene
         ob_list = [ob for ob in context.visible_objects if
@@ -93,7 +92,7 @@ class CombineSwitch(bpy.types.Operator):
     bl_label = 'Add Item'
     bl_description = 'Selected materials will be combined into one texture atlas'
 
-    list_id = IntProperty(default=0)
+    list_id: IntProperty(default=0)
 
     def execute(self, context: bpy.types.Context) -> Set[str]:
         scn = context.scene

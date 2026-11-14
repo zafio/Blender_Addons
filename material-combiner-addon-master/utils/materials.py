@@ -6,7 +6,6 @@ from typing import ValuesView
 from typing import cast
 
 import bpy
-import numpy as np
 
 from .images import get_image
 from .images import get_packed_file
@@ -97,7 +96,7 @@ def sort_materials(mat_list: List[bpy.types.Material]) -> ValuesView[MatDictItem
 
 
 def rgb_to_255_scale(diffuse: Diffuse) -> Diffuse:
-    rgb = np.empty(shape=(0,), dtype=int)
+    rgb = []
     for c in diffuse:
         if c < 0.0:
             srgb = 0
@@ -105,7 +104,7 @@ def rgb_to_255_scale(diffuse: Diffuse) -> Diffuse:
             srgb = c * 12.92
         else:
             srgb = 1.055 * pow(c, 1.0 / 2.4) - 0.055
-        rgb = np.append(rgb, np.clip(round(srgb * 255), 0, 255))
+        rgb.append(int(min(max(round(srgb * 255), 0), 255)))
     return tuple(rgb)
 
 

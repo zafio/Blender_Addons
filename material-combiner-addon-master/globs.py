@@ -16,6 +16,7 @@ is_blender_2_79_or_older = bpy.app.version < (2, 80, 0)
 is_blender_2_80_or_newer = bpy.app.version >= (2, 80, 0)
 is_blender_2_92_or_newer = bpy.app.version >= (2, 92, 0)
 is_blender_3_or_newer = bpy.app.version >= (3, 0, 0)
+is_blender_4_2_or_newer = bpy.app.version >= (4, 2, 0)
 
 smc_pi = False
 

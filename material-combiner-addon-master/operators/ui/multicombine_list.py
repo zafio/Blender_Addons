@@ -38,7 +38,7 @@ class MultiCombineImageMove(bpy.types.Operator):
     bl_idname = 'smc.img_move'
     bl_label = "Move Item"
 
-    type = bpy.props.StringProperty(default='UP')
+    type: bpy.props.StringProperty(default='UP')
 
     def execute(self, context: bpy.types.Context) -> Set[str]:
         scn = context.scene
@@ -60,7 +60,7 @@ class MultiCombineImageReset(bpy.types.Operator):
     bl_description = 'Reset Selected Texture'
     bl_options = {'UNDO', 'INTERNAL'}
 
-    list_id = IntProperty(default=0)
+    list_id: IntProperty(default=0)
 
     def execute(self, context: bpy.types.Context) -> Set[str]:
         scn = context.scene
@@ -77,7 +77,7 @@ class MultiCombineColor(bpy.types.Operator):
     bl_description = 'Texture as Color'
     bl_options = {'UNDO', 'INTERNAL'}
 
-    list_id = IntProperty(default=0)
+    list_id: IntProperty(default=0)
 
     def execute(self, context: bpy.types.Context) -> Set[str]:
         scn = context.scene
@@ -95,11 +95,11 @@ class MultiCombineImagePath(bpy.types.Operator):
     bl_description = 'Select an Image'
     bl_options = {'UNDO', 'INTERNAL'}
 
-    list_id = IntProperty(default=0)
-    filepath = StringProperty(name='Select an Image', maxlen=1024, options={'HIDDEN'})
-    filename = StringProperty(name='Image Name', default='', options={'HIDDEN'})
-    directory = StringProperty(maxlen=1024, default='', subtype='FILE_PATH', options={'HIDDEN'})
-    filter_glob = StringProperty(
+    list_id: IntProperty(default=0)
+    filepath: StringProperty(name='Select an Image', maxlen=1024, options={'HIDDEN'})
+    filename: StringProperty(name='Image Name', default='', options={'HIDDEN'})
+    directory: StringProperty(maxlen=1024, default='', subtype='FILE_PATH', options={'HIDDEN'})
+    filter_glob: StringProperty(
         default='*.BMP;*.GIF;*.JPEG;*.JPG;*.PNG;*.TIFF;*.TIF;*.DDS;*.PSD;*.TGA',
         options={'HIDDEN'}
     )

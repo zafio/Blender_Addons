@@ -39,33 +39,33 @@ from ...utils.objects import get_polys
 from ...utils.objects import get_uv
 from ...utils.textures import get_texture
 
-try:
-    from PIL import Image
+Image = None
+ImageType = None
+ImageChops = None
+ImageFile = None
+resampling = None
 
-    ImageType = Image.Image
-except ImportError:
-    Image = None
-    ImageType = None
 
-try:
-    from PIL import ImageChops
-except ImportError:
-    ImageChops = None
-
-try:
-    from PIL import ImageFile
-except ImportError:
-    ImageFile = None
-
-if Image:
-    Image.MAX_IMAGE_PIXELS = None
+def load_pil() -> bool:
+    """(Re)import Pillow, so it can be used right after installing it without restarting Blender."""
+    global Image, ImageType, ImageChops, ImageFile, resampling
     try:
-        resampling = Image.LANCZOS
-    except AttributeError:
-        resampling = Image.ANTIALIAS
+        from PIL import Image as _Image
+        from PIL import ImageChops as _ImageChops
+        from PIL import ImageFile as _ImageFile
+    except ImportError:
+        return False
 
-if ImageFile:
+    Image, ImageChops, ImageFile = _Image, _ImageChops, _ImageFile
+    ImageType = Image.Image
+    Image.MAX_IMAGE_PIXELS = None
     ImageFile.LOAD_TRUNCATED_IMAGES = True
+    # Pillow 10 removed Image.ANTIALIAS; Image.Resampling exists since 9.1.
+    resampling = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', None) or Image.ANTIALIAS
+    return True
+
+
+load_pil()
 
 atlas_prefix = 'Atlas_'
 atlas_texture_prefix = 'texture_atlas_'
@@ -73,16 +73,17 @@ atlas_material_prefix = 'material_atlas_'
 
 
 def set_ob_mode(scn: Scene, data: SMCObData) -> None:
-    ob = next(item.ob for item in data if item.type == globs.CL_OBJECT)
+    ob = next((item.ob for item in data if item.type == globs.CL_OBJECT and item.ob), None)
     if ob:
         scn.objects.active = ob
-        bpy.ops.object.mode_set(mode='OBJECT')
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='OBJECT')
 
 
 def get_data(data: Sequence[bpy.types.PropertyGroup]) -> SMCObData:
     mats = defaultdict(dict)
     for item in data:
-        if item.type == globs.CL_MATERIAL and item.used:
+        if item.type == globs.CL_MATERIAL and item.used and item.ob and item.mat:
             mats[item.ob.name][item.mat] = item.layer
     return mats
 
@@ -198,7 +199,9 @@ def _get_image(mat: bpy.types.Material) -> Union[bpy.types.Image, None]:
     if globs.is_blender_2_79_or_older:
         return get_image(get_texture(mat))
 
-    shader = get_shader_type(mat) if mat else None
+    if not mat or not mat.node_tree:
+        return None
+    shader = get_shader_type(mat)
     node = mat.node_tree.nodes.get(shader_image_nodes.get(shader, ''))
     return node.image if node else None
 
@@ -386,7 +389,7 @@ def _get_layers(scn: Scene, mats_uv: MatsUV) -> Set[int]:
     return {
         item.layer
         for item in scn.smc_ob_data
-        if item.type == globs.CL_MATERIAL and item.used and item.mat in mats_uv[item.ob.name]
+        if item.type == globs.CL_MATERIAL and item.used and item.ob and item.mat in mats_uv[item.ob.name]
     }
 
 
@@ -405,7 +408,7 @@ def _get_unique_id(scn: Scene) -> str:
 def _add_its_from_existing_materials(scn: Scene, existed_ids: Set[int]) -> None:
     atlas_material_pattern = re.compile(r'{0}(\d+)_\d+'.format(atlas_material_prefix))
     for item in scn.smc_ob_data:
-        if item.type != globs.CL_MATERIAL:
+        if item.type != globs.CL_MATERIAL or not item.mat:
             continue
         
         match = atlas_material_pattern.fullmatch(item.mat.name)
@@ -449,19 +452,30 @@ def _create_material(texture: bpy.types.Texture, unique_id: str, idx: int) -> bp
 
 
 def _configure_material(mat: bpy.types.Material, texture: bpy.types.Texture) -> None:
-    mat.blend_method = 'CLIP'
+    if globs.is_blender_4_2_or_newer:
+        # EEVEE Next (4.2+) replaced Blend Mode with Render Method; Dithered handles alpha cut-outs.
+        mat.surface_render_method = 'DITHERED'
+    else:
+        mat.blend_method = 'CLIP'
     mat.use_backface_culling = True
     mat.use_nodes = True
 
-    node_texture = mat.node_tree.nodes.new(type='ShaderNodeTexImage')
+    nodes = mat.node_tree.nodes
+    principled = nodes.get('Principled BSDF') or next(
+        (node for node in nodes if node.type == 'BSDF_PRINCIPLED'), None)
+    if principled is None:
+        principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+        output = next((node for node in nodes if node.type == 'OUTPUT_MATERIAL'), None) or \
+            nodes.new(type='ShaderNodeOutputMaterial')
+        mat.node_tree.links.new(principled.outputs['BSDF'], output.inputs['Surface'])
+
+    node_texture = nodes.new(type='ShaderNodeTexImage')
     node_texture.image = texture.image
     node_texture.label = 'Material Combiner Texture'
-    node_texture.location = -300, 300
+    node_texture.location = principled.location.x - 400, principled.location.y
 
-    mat.node_tree.links.new(node_texture.outputs['Color'],
-                            mat.node_tree.nodes['Principled BSDF'].inputs['Base Color'])
-    mat.node_tree.links.new(node_texture.outputs['Alpha'],
-                            mat.node_tree.nodes['Principled BSDF'].inputs['Alpha'])
+    mat.node_tree.links.new(node_texture.outputs['Color'], principled.inputs['Base Color'])
+    mat.node_tree.links.new(node_texture.outputs['Alpha'], principled.inputs['Alpha'])
 
 
 def _configure_material_legacy(mat: bpy.types.Material, texture: bpy.types.Texture) -> None:

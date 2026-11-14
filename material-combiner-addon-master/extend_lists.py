@@ -21,6 +21,9 @@ class SMC_UL_Combine_List(bpy.types.UIList):
 
     @staticmethod
     def _draw_object(row: bpy.types.UILayout, item: Any, index: int) -> None:
+        if not item.ob:
+            row.label(text='(missing object) - update the list', icon='ERROR')
+            return
         row.prop(item.ob, 'name', text='', icon='META_CUBE' if globs.is_blender_2_80_or_newer else 'VIEW3D',
                  emboss=False)
         row = row.row()
@@ -32,7 +35,13 @@ class SMC_UL_Combine_List(bpy.types.UIList):
     @staticmethod
     def _draw_mat(row: bpy.types.UILayout, item: Any, index: int) -> None:
         row.separator()
-        row.label(text='', icon_value=item.mat.preview.icon_id if item.mat.preview else 'QUESTION')
+        if not item.mat:
+            row.label(text='(missing material) - update the list', icon='ERROR')
+            return
+        if item.mat.preview:
+            row.label(text='', icon_value=item.mat.preview.icon_id)
+        else:
+            row.label(text='', icon='QUESTION')
         row.prop(item.mat, 'name', text='')
         col = row.column(align=True)
         col.alignment = 'RIGHT'
@@ -53,12 +62,12 @@ class SMC_UL_Combine_List(bpy.types.UIList):
         matched_materials_ob = {
             item.ob
             for item in data
-            if item.type == globs.CL_MATERIAL and filter_name in item.mat.name.lower()
+            if item.type == globs.CL_MATERIAL and item.mat and filter_name in item.mat.name.lower()
         }
 
         flt_flags = [
             self.bitflag_filter_item
-            if (item.type == globs.CL_MATERIAL and filter_name in item.mat.name.lower()) or
+            if (item.type == globs.CL_MATERIAL and item.mat and filter_name in item.mat.name.lower()) or
                (item.type == globs.CL_OBJECT and item.ob in matched_materials_ob)
             else 0
             for item in data
@@ -69,6 +78,6 @@ class SMC_UL_Combine_List(bpy.types.UIList):
 
     @staticmethod
     def _filter_by_names(data: SMCObData) -> List[int]:
-        sorted_items = sorted(enumerate(data), key=lambda x: x[1].mat.name if x[1].type == globs.CL_MATERIAL else '')
+        sorted_items = sorted(enumerate(data), key=lambda x: x[1].mat.name if x[1].type == globs.CL_MATERIAL and x[1].mat else '')
         sorted_pairs = sorted(enumerate(sorted_items), key=lambda x: x[1])
         return [x[0] for x in sorted_pairs]

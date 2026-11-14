@@ -5,6 +5,7 @@ from typing import Tuple
 from typing import Union
 
 import bpy
+import bpy.utils.previews
 from mathutils import Vector
 
 from . import globs

@@ -12,16 +12,18 @@ class Combiner(bpy.types.Operator):
     bl_description = 'Combine materials'
     bl_options = {'UNDO', 'INTERNAL'}
 
-    directory = StringProperty(maxlen=1024, default='', subtype='FILE_PATH', options={'HIDDEN'})
-    filter_glob = StringProperty(default='', options={'HIDDEN'})
-    cats = BoolProperty(default=False)
+    directory: StringProperty(maxlen=1024, default='', subtype='FILE_PATH', options={'HIDDEN'})
+    filter_glob: StringProperty(default='', options={'HIDDEN'})
+    cats: BoolProperty(default=False)
     data = None
     mats_uv = None
     structure = None
 
     def execute(self, context: bpy.types.Context) -> Set[str]:
         if not self.data:
-            self.invoke(context, None)
+            result = self.invoke(context, None)
+            if 'RUNNING_MODAL' not in result:
+                return result
         scn = context.scene
         scn.smc_save_path = self.directory
         self.structure = BinPacker(get_size(scn, self.structure)).fit()
@@ -44,6 +46,9 @@ class Combiner(bpy.types.Operator):
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> Set[str]:
         scn = context.scene
+        if not globs.pil_exist:
+            self.report({'ERROR'}, 'Pillow is not installed')
+            return {'CANCELLED'}
         bpy.ops.smc.refresh_ob_data()
 
         if self.cats:
