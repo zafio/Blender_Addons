@@ -24,7 +24,7 @@ bl_info = {
     'name': "Shotariya's Material Combiner",
     'description': 'Public Release Material Combiner 2',
     'author': 'shotariya / Modified by Zafio',
-    'version': (2, 1, 3, 0),
+    'version': (2, 1, 3, 1),
     'blender': (4, 5, 0),
     'location': 'View3D > Sidebar > MatCombiner',
     'doc_url': 'https://github.com/Grim-es/material-combiner-addon',

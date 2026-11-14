@@ -11,7 +11,6 @@ from .icons import initialize_smc_icons
 from .icons import unload_smc_icons
 
 __bl_classes = [
-    ui.credits_menu.CreditsMenu,
     ui.main_menu.MaterialMenu,
     ui.property_menu.PropertyMenu,
 
