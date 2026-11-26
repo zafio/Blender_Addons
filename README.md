@@ -51,10 +51,14 @@ Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press 
 Lays UV islands out on the texture's pixel grid for low poly / pixel art characters (UV Editor or 3D View in Edit Mode > Sidebar > Pixel UV, also in the UV menus). Works on the selected faces (all faces if none are selected) of every object in Edit Mode, packed together.
 
 - Pixel Perfect UV = Straighten + Density + Snap + Pack in one click (or run Straighten / Snap / Pack on their own)
-- Straighten: quad-grid islands (limbs, torso strips...) become perfect rectangles, sized from the real 3D edge lengths. Only applied when the stretch stays under "Max Distortion %"; other islands keep their unwrap and are just rotated to sit straight. Islands mixing quads and triangles / n-gons (hands, caps...) get their quad part straightened and pinned, and Blender's unwrap fits the rest around it (idea from noio's [Pixel-Unwrapper](https://github.com/noio/Pixel-Unwrapper))
+- Snap: Bounds (default: only the island's outer edges go on pixel lines, the inside keeps its shape) or All Vertices
+- Straighten: quad-grid islands (limbs, torso strips...) become perfect rectangles, sized from the real 3D edge lengths. Only applied when the stretch stays under "Max Distortion %" (default 12%); other islands keep their unwrap and are just rotated to sit straight. Islands mixing quads and triangles / n-gons (hands, caps...) get their quad part straightened and pinned, and Blender's unwrap fits the rest around it (idea from noio's [Pixel-Unwrapper](https://github.com/noio/Pixel-Unwrapper))
 - Density: Fit Texture (biggest density that fits), Fixed px/unit (eyedropper reads it from the selection) or Current Average
+- Stack Mirrored L/R: islands that mirror each other across the object's X axis share the same pixels (the +X side is laid out, the -X one is stacked on it). Also as its own button. Islands folded onto themselves (left half over the right) are kept as they are
+- Character Density Preset: head x2, hands x1.3, legs x0.8 by height / distance from the centre (all editable in the redo panel)
+- Single Pixel Fill: maps the selected faces onto one free pixel; with Preserve Texture it keeps their average colour
 - Island Density: give the selected faces' islands their own fixed px/unit or a multiplier (e.g. x2 for the face). Stored on the mesh, so it's kept every time you re-run
-- Snap: every vertex lands on a pixel corner; rows and columns of straight islands never collapse below 1 px
+- Straight rows and columns always snap to whole pixels and never collapse below 1 px
 - Pack: whole-pixel packing with pixel padding, optional 90º rotation. Stacked / mirrored islands that share pixels stay together
 - Preserve Texture (Pack button): the painted pixels move with their islands, so you can repack after painting. Packs every face of the edited objects
 - Resize Texture: Canvas (more / less room, the painting stays where it is; choose the anchor, e.g. Top keeps the painting at the top and adds the space below) or Upscale (every pixel becomes N x N for finer painting)

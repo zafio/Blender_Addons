@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 4, 1),
+    "version": (0, 5, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -49,10 +49,13 @@ EPS = 1e-6
 
 class FaceRec:
     """One mesh face: vertex keys, current UVs in pixels, world positions, density settings."""
-    __slots__ = ("vkeys", "uv", "p3", "density", "scale", "ref", "keep_rot")
+    __slots__ = ("vkeys", "uv", "p3", "density", "scale", "ref", "keep_rot", "pl", "group")
 
-    def __init__(self, vkeys, uv, p3, density=0.0, scale=1.0, ref=None, keep_rot=False):
+    def __init__(self, vkeys, uv, p3, density=0.0, scale=1.0, ref=None, keep_rot=False,
+                 pl=None, group=None):
         self.keep_rot = keep_rot
+        self.pl = pl        # object-space positions (mirror detection); world p3 if None
+        self.group = group  # islands only mirror-pair inside the same group (object)
         self.vkeys = vkeys
         self.uv = uv
         self.p3 = p3
@@ -67,6 +70,8 @@ class Island:
         self.face_ids = []    # index into the FaceRec list
         self.uv = []          # original px position per uv-vertex
         self.p3 = []          # world position per uv-vertex
+        self.pl = []          # object-space position per uv-vertex
+        self.group = None
         self.density = 0.0    # fixed px/unit (0 = global)
         self.scale = 1.0      # multiplier on global density
         # filled by the pipeline
@@ -150,26 +155,30 @@ def find_islands(recs):
         isl = Island()
         local = {}
         dens = []
-        scales = []
+        sc_sum = sc_w = 0.0
         for fi in fl:
             r = recs[fi]
             face = []
-            for key, uv, p in zip(corner_keys[fi], r.uv, r.p3):
+            pls = r.pl or r.p3
+            for key, uv, p, q in zip(corner_keys[fi], r.uv, r.p3, pls):
                 idx = local.get(key)
                 if idx is None:
                     idx = local[key] = len(isl.uv)
                     isl.uv.append((uv[0], uv[1]))
                     isl.p3.append(p)
+                    isl.pl.append(q)
                 face.append(idx)
             isl.faces.append(face)
             isl.face_ids.append(fi)
             if r.density > 0:
                 dens.append(r.density)
-            if r.scale > 0 and abs(r.scale - 1.0) > 1e-6:
-                scales.append(r.scale)
+            a = area3d(r.p3) + 1e-12
+            sc_sum += (r.scale if r.scale > 0 else 1.0) * a
+            sc_w += a
+        isl.group = recs[fl[0]].group
         isl.keep_rot = any(recs[fi].keep_rot for fi in fl)
         isl.density = max(dens) if dens else 0.0
-        isl.scale = max(scales) if scales else 1.0
+        isl.scale = sc_sum / sc_w if sc_w else 1.0  # area-weighted multiplier
         islands.append(isl)
     return islands
 
@@ -180,13 +189,28 @@ def island_areas(isl, coords):
     return a3, a2
 
 
+def abs_area(isl, coords):
+    """Sum of unsigned face areas (folded / self-mirrored islands don't cancel out)."""
+    return sum(abs(signed_area2d([coords[i] for i in f])) for f in isl.faces)
+
+
+def face_signs(isl, coords):
+    """+1 / -1 per face (0 for degenerate faces) in coords."""
+    out = []
+    for f in isl.faces:
+        a = signed_area2d([coords[i] for i in f])
+        out.append(0 if abs(a) < 1e-9 else (1 if a > 0 else -1))
+    return out
+
+
 def distortion(isl, coords):
     """Area-weighted mean |log(stretch)| of the edges, after removing the island's uniform scale.
     0 = no distortion, 0.1 is about 10 % stretch."""
-    a3, a2 = island_areas(isl, coords)
-    if a3 < EPS or abs(a2) < EPS:
+    a3, _ = island_areas(isl, coords)
+    a2 = abs_area(isl, coords)
+    if a3 < EPS or a2 < EPS:
         return float("inf")
-    k = math.sqrt(a3 / abs(a2))  # uv -> world scale
+    k = math.sqrt(a3 / a2)  # uv -> world scale
     tot = 0.0
     wsum = 0.0
     for f in isl.faces:
@@ -201,10 +225,9 @@ def distortion(isl, coords):
                 return float("inf")
             tot += abs(math.log(l2 / l3)) * l3
             wsum += l3
-    # flipped faces count as heavy distortion
-    sign = 1.0 if a2 > 0 else -1.0
-    for f in isl.faces:
-        if signed_area2d([coords[i] for i in f]) * sign <= 0:
+    # faces flipped compared to the island's own unwrap count as heavy distortion
+    for s0, s1 in zip(face_signs(isl, isl.uv), face_signs(isl, coords)):
+        if s0 and s1 != s0:
             return float("inf")
     return tot / wsum if wsum > 0 else 0.0
 
@@ -375,9 +398,7 @@ def mixed_grid(isl, max_distortion):
     lay = lattice_layout(sub)
     if lay is None or distortion(sub, lay) > max_distortion:
         return None
-    _, a_orig = island_areas(sub, sub.uv)
-    _, a_new = island_areas(sub, lay)
-    k = math.sqrt(abs(a_orig) / max(abs(a_new), EPS))
+    k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
     co = _centroid(sub.uv)
     return {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
 
@@ -404,10 +425,11 @@ def convex_hull(pts):
 def align_layout(isl, rotate=True):
     """Original unwrap in world units (uniform scale only, no added distortion), optionally rotated
     so its minimum-area bounding box is axis aligned."""
-    a3, a2 = island_areas(isl, isl.uv)
-    if a3 < EPS or abs(a2) < EPS:
+    a3, _ = island_areas(isl, isl.uv)
+    a2 = abs_area(isl, isl.uv)
+    if a3 < EPS or a2 < EPS:
         return None
-    k = math.sqrt(a3 / abs(a2))
+    k = math.sqrt(a3 / a2)
     c = _centroid(isl.uv)
     pts = [((u - c[0]) * k, (v - c[1]) * k) for u, v in isl.uv]
     if not rotate:
@@ -483,15 +505,16 @@ def snap(coords, mask, isl=None):
 
 
 def _repair(isl, orig, out, passes=4, movable=None):
-    a = sum(signed_area2d([orig[i] for i in f]) for f in isl.faces)
-    sign = 1.0 if a >= 0 else -1.0
+    signs = face_signs(isl, orig)
     vfaces = defaultdict(list)
     for fi, f in enumerate(isl.faces):
         for v in f:
             vfaces[v].append(fi)
 
     def ok(fi, pts):
-        return signed_area2d([pts[i] for i in isl.faces[fi]]) * sign > 0
+        if not signs[fi]:
+            return True
+        return signed_area2d([pts[i] for i in isl.faces[fi]]) * signs[fi] > 0
 
     offsets = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
     out = list(out)
@@ -524,9 +547,8 @@ def _repair(isl, orig, out, passes=4, movable=None):
 
 
 def broken_faces(isl, coords):
-    _, a = island_areas(isl, isl.uv)
-    sign = 1.0 if a >= 0 else -1.0
-    return sum(1 for f in isl.faces if signed_area2d([coords[i] for i in f]) * sign <= 0)
+    """Faces that collapsed or flipped compared to the island's original unwrap."""
+    return sum(1 for s0, s1 in zip(face_signs(isl, isl.uv), face_signs(isl, coords)) if s0 and s1 != s0)
 
 
 # ---- packing (MaxRects, best short side fit, integer pixels) ----------------
@@ -601,30 +623,151 @@ def _rot90(loc, h):
 class Options:
     def __init__(self, **kw):
         self.straighten = True
-        self.max_distortion = 0.08
+        self.max_distortion = 0.12
         self.align = True
         self.density_mode = "FIT"     # FIT, FIXED, CURRENT
         self.density = 32.0           # px / unit for FIXED
         self.snap = True
+        self.snap_mode = "BOUNDS"     # BOUNDS (outer edges on pixel lines) or ALL (every vertex)
         self.pack = True
         self.padding = 1
         self.allow_rotate = False
+        self.stack_mirrored = True
         self.__dict__.update(kw)
+
+
+PIXEL_AREA = 0.25  # px^2: islands smaller than this are single-colour (one pixel) islands
+
+
+def is_pixel_island(isl):
+    xs = [p[0] for p in isl.uv]
+    ys = [p[1] for p in isl.uv]
+    a2 = abs_area(isl, isl.uv)
+    return a2 < PIXEL_AREA and max(xs) - min(xs) < 1.5 and max(ys) - min(ys) < 1.5
 
 
 def current_density(islands):
     a3 = a2 = 0.0
     for isl in islands:
-        x, y = island_areas(isl, isl.uv)
+        x, _ = island_areas(isl, isl.uv)
+        y = abs_area(isl, isl.uv)
+        if y < PIXEL_AREA:
+            continue
         a3 += x
-        a2 += abs(y)
+        a2 += y
     return math.sqrt(a2 / a3) if a3 > EPS else 0.0
 
+
+# ---- mirrored islands --------------------------------------------------------
+
+def _match_mirror(A, B, axis, tol):
+    """slave (B) uv-vertex -> master (A) uv-vertex, matching face by face. None if not a mirror."""
+    def mir(p):
+        q = list(p)
+        q[axis] = -q[axis]
+        return q
+
+    def fc(isl, f):
+        n = len(f)
+        return [sum(isl.pl[v][k] for v in f) / n for k in range(3)]
+
+    a_cent = [fc(A, f) for f in A.faces]
+    used_faces = set()
+    mp = {}
+    t2 = tol * tol
+    for f in B.faces:
+        c = mir(fc(B, f))
+        best, bd = None, t2
+        for fi, ac in enumerate(a_cent):
+            if fi in used_faces or len(A.faces[fi]) != len(f):
+                continue
+            d = (ac[0] - c[0]) ** 2 + (ac[1] - c[1]) ** 2 + (ac[2] - c[2]) ** 2
+            if d <= bd:
+                best, bd = fi, d
+        if best is None:
+            return None
+        used_faces.add(best)
+        af = A.faces[best]
+        for v in f:
+            q = mir(B.pl[v])
+            w = min(af, key=lambda u: sum((A.pl[u][k] - q[k]) ** 2 for k in range(3)))
+            if sum((A.pl[w][k] - q[k]) ** 2 for k in range(3)) > t2:
+                return None
+            if mp.setdefault(v, w) != w:
+                return None
+    if len(mp) != len(B.pl) or len(set(mp.values())) != len(mp):
+        return None
+    return mp
+
+
+def find_mirror_pairs(islands, axis=0, tol_rel=6e-3):
+    """Islands that are mirror images of each other across the object's X = 0 plane (small
+    asymmetries of about half a percent of the model size are tolerated).
+    Returns [(master, slave, slave_vertex -> master_vertex)], master on the +X side."""
+    pts = [p for isl in islands for p in isl.pl]
+    if not pts:
+        return []
+    size = max(max(p[k] for p in pts) - min(p[k] for p in pts) for k in range(3)) or 1.0
+
+    def cent(isl):
+        n = len(isl.pl)
+        return [sum(p[k] for p in isl.pl) / n for k in range(3)]
+
+    def min_edge(isl):
+        m = float("inf")
+        for f in isl.faces:
+            for i in range(len(f)):
+                d = _len3(isl.pl[f[i]], isl.pl[f[(i + 1) % len(f)]])
+                if d > 1e-9:
+                    m = min(m, d)
+        return m
+
+    cents = [cent(i) if i.pl else [0, 0, 0] for i in islands]
+    used = set()
+    pairs = []
+    order = sorted(range(len(islands)), key=lambda k: -cents[k][axis])
+    for a in order:
+        A = islands[a]
+        if a in used or not A.pl:
+            continue
+        tol = min(size * tol_rel, 0.3 * min_edge(A))
+        if cents[a][axis] <= tol:
+            continue
+        ma = list(cents[a])
+        ma[axis] = -ma[axis]
+        for b in order:
+            B = islands[b]
+            if b == a or b in used or B.group != A.group:
+                continue
+            if len(B.faces) != len(A.faces) or len(B.pl) != len(A.pl):
+                continue
+            if sum((cents[b][k] - ma[k]) ** 2 for k in range(3)) > (size * 0.02) ** 2:
+                continue
+            mp = _match_mirror(A, B, axis, tol)
+            if mp is None:
+                continue
+            pairs.append((a, b, mp))
+            used.update((a, b))
+            break
+    return pairs
+
+
+def stack_mirrored(islands, pairs):
+    """Slave islands take their master's UVs (current positions)."""
+    for a, b, mp in pairs:
+        src = islands[a].new if islands[a].new is not None else islands[a].uv
+        islands[b].new = [src[mp[j]] for j in range(len(islands[b].uv))]
+
+
+# ---- pipeline ----------------------------------------------------------------
 
 def build_layouts(islands, opt):
     for isl in islands:
         isl.units = None
         isl.kind = "skip"
+        if is_pixel_island(isl):
+            isl.kind = "pixel"
+            continue
         lay = lattice_layout(isl) if opt.straighten else None
         if lay is not None:
             d = distortion(isl, lay)
@@ -643,35 +786,63 @@ def _island_density(isl, base):
     return isl.density if isl.density > 0 else base * isl.scale
 
 
-def _place(isl, base, do_snap):
+def snap_bounds(pts):
+    """Only the island's bounding box goes onto pixel lines (min corner on a pixel corner, width
+    and height whole pixels); the inside keeps its shape (scaled by under half a pixel)."""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x0, y0 = min(xs), min(ys)
+    w, h = max(xs) - x0, max(ys) - y0
+    sx = max(1, round(w)) / w if w > 1e-6 else 1.0
+    sy = max(1, round(h)) / h if h > 1e-6 else 1.0
+    nx, ny = round(x0), round(y0)
+    return [(nx + (x - x0) * sx, ny + (y - y0) * sy) for x, y in pts]
+
+
+def snap_island(isl, pts, mode):
+    if mode == "ALL" or (isl.mask and any(isl.mask)):
+        # straight rows / columns always snap fully, everything else follows the mode
+        return snap(pts, isl.mask if isl.mask is not None else False, isl)
+    return snap_bounds(pts)
+
+
+def _place(isl, base, do_snap, mode="ALL"):
     d = _island_density(isl, base)
     pts = [(x * d, y * d) for x, y in isl.units]
-    return snap(pts, isl.mask, isl) if do_snap else pts
+    return snap_island(isl, pts, mode) if do_snap else pts
 
 
 def _try_pack(islands, base, W, H, opt):
     locs = []
     sizes = []
     for isl in islands:
-        loc, w, h = _local(_place(isl, base, opt.snap))
+        if isl.kind == "pixel":
+            locs.append([(0.5, 0.5)] * len(isl.uv))
+            sizes.append((1, 1))
+            continue
+        loc, w, h = _local(_place(isl, base, opt.snap, opt.snap_mode))
         locs.append(loc)
-        sizes.append((math.ceil(w - 1e-9), math.ceil(h - 1e-9)))
+        sizes.append((max(1, math.ceil(w - 1e-9)), max(1, math.ceil(h - 1e-9))))
     res = pack_rects(sizes, W, H, opt.padding, opt.allow_rotate)
     return res, locs, sizes
 
 
 def run(islands, W, H, opt):
     """Full pipeline. Fills isl.new (px). Returns (stats dict, error string or None)."""
-    build_layouts(islands, opt)
-    active = [i for i in islands if i.units is not None]
-    if not active:
+    pairs = find_mirror_pairs(islands) if opt.stack_mirrored else []
+    slaves = {b for _, b, _ in pairs}
+    work = [isl for k, isl in enumerate(islands) if k not in slaves]
+    build_layouts(work, opt)
+    active = [i for i in work if i.units is not None or i.kind == "pixel"]
+    sized = [i for i in active if i.kind != "pixel"]
+    if not sized and not active:
         return None, "No usable islands (zero-area faces?)"
 
-    free_isl = [i for i in active if i.density <= 0]
+    free_isl = [i for i in sized if i.density <= 0]
     if opt.density_mode == "FIXED":
         base = opt.density
     elif opt.density_mode == "CURRENT" or not opt.pack:
-        base = current_density(active)
+        base = current_density(sized) or 1.0
     else:
         base = None  # FIT
 
@@ -702,22 +873,28 @@ def run(islands, W, H, opt):
             isl.new = [(px + x, py + y) for px, py in loc]
     else:
         for isl in active:
+            if isl.kind == "pixel":
+                isl.new = list(isl.uv)
+                continue
             pts = _place(isl, base, False)
             cn = _centroid(pts)
             co = _centroid(isl.uv)
             off = (co[0] - cn[0], co[1] - cn[1])
             if opt.snap:
                 off = (round(off[0]), round(off[1]))
-                pts = snap(pts, isl.mask, isl)
+                pts = snap_island(isl, pts, opt.snap_mode)
             isl.new = [(x + off[0], y + off[1]) for x, y in pts]
 
+    stack_mirrored(islands, pairs)
     stats = {
         "density": base,
-        "straight": sum(1 for i in active if i.kind == "straight"),
-        "aligned": sum(1 for i in active if i.kind in ("aligned", "keep")),
-        "skipped": len(islands) - len(active),
-        "broken": sum(broken_faces(i, i.new) for i in active),
-        "max_distortion": max((i.distortion for i in active if i.kind == "straight"), default=0.0),
+        "straight": sum(1 for i in sized if i.kind == "straight"),
+        "aligned": sum(1 for i in sized if i.kind in ("aligned", "keep")),
+        "pixel": sum(1 for i in active if i.kind == "pixel"),
+        "mirrored": len(pairs),
+        "skipped": len(work) - len(active),
+        "broken": sum(broken_faces(i, i.new) for i in sized),
+        "max_distortion": max((i.distortion for i in sized if i.kind == "straight"), default=0.0),
     }
     return stats, None
 
@@ -728,11 +905,14 @@ def _bbox_area(pts):
     return max(max(xs) - min(xs), 1e-4) * max(max(ys) - min(ys), 1e-4)
 
 
-def run_snap_only(islands):
+def run_snap_only(islands, mode="ALL"):
     for isl in islands:
+        if is_pixel_island(isl):
+            isl.new = None
+            continue
         isl.mask = grid_mask(isl, isl.uv)
-        isl.new = snap(isl.uv, isl.mask, isl)
-    return {"broken": sum(broken_faces(i, i.new) for i in islands)}
+        isl.new = snap_island(isl, isl.uv, mode)
+    return {"broken": sum(broken_faces(i, i.new) for i in islands if i.new is not None)}
 
 
 def run_straighten_only(islands, opt):
@@ -742,15 +922,29 @@ def run_straighten_only(islands, opt):
         isl.new = None
         if isl.units is None or (isl.kind != "straight" and not opt.align):
             continue
-        _, a_orig = island_areas(isl, isl.uv)
-        _, a_new = island_areas(isl, isl.units)
-        k = math.sqrt(abs(a_orig) / max(abs(a_new), EPS))
+        k = math.sqrt(abs_area(isl, isl.uv) / max(abs_area(isl, isl.units), EPS))
         co = _centroid(isl.uv)
         isl.new = [(x * k + co[0], y * k + co[1]) for x, y in isl.units]
     return {
         "straight": sum(1 for i in islands if i.kind == "straight"),
         "aligned": sum(1 for i in islands if i.kind == "aligned"),
     }
+
+
+def run_stack_only(islands):
+    pairs = find_mirror_pairs(islands)
+    stack_mirrored(islands, pairs)
+    return len(pairs)
+
+
+def free_pixel(occupied, W, H, margin=1):
+    """First pixel (from the top-left) with no occupied pixel within margin."""
+    for j in range(H - 1 - margin, margin - 1, -1):
+        for i in range(margin, W - margin):
+            if all((i + di, j + dj) not in occupied
+                   for di in range(-margin, margin + 1) for dj in range(-margin, margin + 1)):
+                return i, j
+    return None
 
 
 def _point_in_poly(x, y, poly):
@@ -1039,7 +1233,9 @@ if bpy is not None:
                     f[dl] if dl else 0.0,
                     (f[sl] or 1.0) if sl else 1.0,
                     (uvl, loops, o),
-                    (o.name, f.index) in keep_rot))
+                    (o.name, f.index) in keep_rot,
+                    [tuple(l.vert.co) for l in loops],
+                    o.name))
         return objs, recs
 
     def write_back(objs, recs, islands, W, H):
@@ -1166,7 +1362,8 @@ if bpy is not None:
         return Options(
             straighten=s.straighten, max_distortion=s.max_distortion / 100.0, align=s.align,
             density_mode=s.density_mode, density=s.density, snap=True, pack=s.pack,
-            padding=s.padding, allow_rotate=s.allow_rotate)
+            padding=s.padding, allow_rotate=s.allow_rotate, snap_mode=s.snap_mode,
+            stack_mirrored=s.stack_mirrored)
 
     class PixelUVSettings(bpy.types.PropertyGroup):
         tex_source: EnumProperty(
@@ -1191,12 +1388,22 @@ if bpy is not None:
         straighten: BoolProperty(name="Straighten Quad Islands", default=True,
                                  description="Lay quad-grid islands out as rectangles")
         max_distortion: FloatProperty(
-            name="Max Distortion %", default=8.0, min=0.0, max=100.0, subtype='PERCENTAGE',
+            name="Max Distortion %", default=12.0, min=0.0, max=100.0, subtype='PERCENTAGE',
             description="Only straighten an island if the average edge stretch stays below this. "
                         "Otherwise the original unwrap is kept (no added distortion)")
         align: BoolProperty(name="Align Other Islands", default=True,
                             description="Rotate islands that aren't straightened so their bounds are axis aligned")
         pack: BoolProperty(name="Pack", default=True)
+        snap_mode: EnumProperty(
+            name="Snap", items=[
+                ('BOUNDS', "Bounds", "Only the island's outer edges go on pixel lines; the inside keeps "
+                                     "its shape (least distortion). Straightened rows / columns still snap"),
+                ('ALL', "All Vertices", "Every vertex goes onto a pixel corner")],
+            default='BOUNDS')
+        stack_mirrored: BoolProperty(
+            name="Stack Mirrored L/R", default=True,
+            description="Islands that mirror each other across the object's X axis share the same "
+                        "pixels (the +X side is laid out, the -X side is stacked on it, flipped)")
         preserve_texture: BoolProperty(
             name="Preserve Texture", default=True,
             description="Pack only: move the painted pixels with their islands so the model looks the "
@@ -1219,7 +1426,8 @@ if bpy is not None:
             ('ALL', "All", "Straighten, density, snap and pack"),
             ('STRAIGHTEN', "Straighten", "Straighten / align islands, keeping their size and place"),
             ('SNAP', "Snap to Pixels", "Snap the current UVs to the pixel grid"),
-            ('PACK', "Pack", "Pack the islands in whole pixels at their current size")],
+            ('PACK', "Pack", "Pack the islands in whole pixels at their current size"),
+            ('STACK', "Stack Mirrored", "Put each -X island on top of its +X mirror twin")],
             default='ALL', options={'SKIP_SAVE'})
 
         @classmethod
@@ -1247,8 +1455,12 @@ if bpy is not None:
                 return {'CANCELLED'}
             islands = find_islands(recs)
 
-            if self.step == 'SNAP':
-                st = run_snap_only(islands)
+            if self.step == 'STACK':
+                n = run_stack_only(islands)
+                st = {}
+                msg = "Stacked %d mirrored pairs" % n
+            elif self.step == 'SNAP':
+                st = run_snap_only(islands, s.snap_mode)
                 msg = "Snapped %d islands to %d x %d" % (len(islands), W, H)
             elif self.step == 'STRAIGHTEN':
                 st = run_straighten_only(islands, opt)
@@ -1276,6 +1488,10 @@ if bpy is not None:
                     return {'CANCELLED'}
                 msg = "%d straightened (max stretch %.1f%%), %d kept shape, %.2f px/unit" % (
                     st["straight"], st["max_distortion"] * 100, st["aligned"], st["density"])
+                if st["mirrored"]:
+                    msg += ", %d mirrored pairs stacked" % st["mirrored"]
+                if st["pixel"]:
+                    msg += ", %d single-pixel islands" % st["pixel"]
                 if s.density_mode == 'FIT' and s.pack:
                     s.density = round(st["density"], 3)
 
@@ -1655,6 +1871,136 @@ if bpy is not None:
             self.apply(context)
             return {'RUNNING_MODAL'}
 
+    class UV_OT_pixel_character_density(bpy.types.Operator):
+        bl_idname = "uv.pixel_character_density"
+        bl_label = "Character Density Preset"
+        bl_description = ("Give the head, hands and legs their own density multiplier, by height "
+                          "(world Z) and distance from the centre. Faces with a fixed px/unit keep it")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        head: FloatProperty(name="Head", default=2.0, min=0.05, soft_max=8)
+        hands: FloatProperty(name="Hands", default=1.3, min=0.05, soft_max=8)
+        body: FloatProperty(name="Body / Arms", default=1.0, min=0.05, soft_max=8)
+        legs: FloatProperty(name="Legs / Feet", default=0.8, min=0.05, soft_max=8)
+        head_from: FloatProperty(name="Head Starts At", default=0.78, min=0, max=1, subtype='FACTOR',
+                                 description="Height (fraction of the character) where the head starts")
+        legs_to: FloatProperty(name="Legs End At", default=0.45, min=0, max=1, subtype='FACTOR',
+                               description="Height (fraction of the character) where the legs end")
+        hands_from: FloatProperty(name="Hands From", default=0.6, min=0, max=1, subtype='FACTOR',
+                                  description="Sideways distance (fraction of half the width) where hands start")
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            objs = edit_objects(context)
+            data = []
+            zs, xs = [], []
+            for o in objs:
+                bm = bmesh.from_edit_mesh(o.data)
+                mw = o.matrix_world
+                cents = []
+                for f in bm.faces:
+                    c = mw @ f.calc_center_median()
+                    cents.append((f, c))
+                    zs.append(c.z)
+                    xs.append(abs(c.x))
+                data.append((o, bm, cents))
+            if not zs:
+                return {'CANCELLED'}
+            z0, z1 = min(zs), max(zs)
+            hx = max(xs) or 1.0
+            counts = {"head": 0, "hands": 0, "body": 0, "legs": 0}
+            for o, bm, cents in data:
+                dl = bm.faces.layers.float.get(DENSITY_ATTR) or bm.faces.layers.float.new(DENSITY_ATTR)
+                sl = bm.faces.layers.float.get(SCALE_ATTR) or bm.faces.layers.float.new(SCALE_ATTR)
+                for f, c in cents:
+                    if f[dl] > 0:
+                        continue
+                    t = (c.z - z0) / (z1 - z0) if z1 > z0 else 0.5
+                    if t >= self.head_from:
+                        part = "head"
+                    elif t < self.legs_to:
+                        part = "legs"
+                    elif abs(c.x) / hx >= self.hands_from:
+                        part = "hands"
+                    else:
+                        part = "body"
+                    f[sl] = getattr(self, part)
+                    counts[part] += 1
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            self.report({'INFO'}, "Faces: head %(head)d, hands %(hands)d, body %(body)d, legs %(legs)d" % counts)
+            return {'FINISHED'}
+
+    def is_face_selected(context, f, uvl):
+        sp = context.space_data
+        if sp and sp.type == 'IMAGE_EDITOR':
+            return uv_selected(context, f, uvl)
+        return f.select and not f.hide
+
+    class UV_OT_pixel_fill(bpy.types.Operator):
+        bl_idname = "uv.pixel_fill"
+        bl_label = "Single Pixel Fill"
+        bl_description = ("Map the selected faces onto one free pixel (a flat colour). With Preserve "
+                          "Texture, that pixel gets the average colour they had")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            s = context.scene.pixel_uv
+            img = find_image(context) if s.preserve_texture else None
+            if img is not None:
+                W, H = int(img.size[0]), int(img.size[1])
+            else:
+                W, H, _ = texture_size(context, s)
+            objs, recs = collect(context, W, H, all_faces=True)
+            bms = list(_KEEP_BMESH)
+            sel = set()
+            for k, r in enumerate(recs):
+                uvl, loops, _ = r.ref
+                if is_face_selected(context, loops[0].face, uvl):
+                    sel.add(k)
+            if not sel:
+                self.report({'WARNING'}, "Select faces first")
+                return {'CANCELLED'}
+            occupied = set()
+            for isl in find_islands(recs):
+                if not any(fid in sel for fid in isl.face_ids):
+                    occupied |= pixel_mask(isl, isl.uv, W, H)
+            target = free_pixel(occupied, W, H, margin=1)
+            if target is None:
+                self.report({'ERROR'}, "No free pixel left (with a 1 px margin)")
+                return {'CANCELLED'}
+            i, j = target
+            if img is not None:
+                src = read_pixels(img)
+                cells = set()
+                for k in sel:
+                    tmp = Island()
+                    tmp.uv = recs[k].uv
+                    tmp.faces = [list(range(len(tmp.uv)))]
+                    cells |= pixel_mask(tmp, tmp.uv, W, H)
+                if cells:
+                    col = sum(src[b, a] for a, b in cells) / len(cells)
+                    backup_image(img, src)
+                    dst = src.copy()
+                    dst[max(0, j - 1):j + 2, max(0, i - 1):i + 2] = col  # 3x3: no bleeding
+                    write_pixels(img, dst)
+            u, v = (i + 0.5) / W, (j + 0.5) / H
+            for k in sel:
+                uvl, loops, _ = recs[k].ref
+                for l in loops:
+                    l[uvl].uv = (u, v)
+            for o in objs:
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            del bms
+            self.report({'INFO'}, "%d faces -> pixel %d, %d" % (len(sel), i, j))
+            return {'FINISHED'}
+
     def active_face_density(context):
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
@@ -1705,6 +2051,7 @@ if bpy is not None:
         row.operator("uv.pixel_island_density", text="Set")
         row.operator("uv.pixel_island_density", text="Clear").clear = True
         row.operator("uv.pixel_select_custom_density", text="", icon='RESTRICT_SELECT_OFF')
+        box.operator("uv.pixel_character_density", icon='ARMATURE_DATA')
         cur = active_face_density(context)
         if cur:
             box.label(text="Active face: " + cur)
@@ -1716,6 +2063,7 @@ if bpy is not None:
         sub.enabled = s.straighten
         sub.prop(s, "max_distortion")
         box.prop(s, "align")
+        box.row().prop(s, "snap_mode", expand=True)
 
         box = layout.box()
         box.label(text="Packing", icon='PACKAGE')
@@ -1724,6 +2072,7 @@ if bpy is not None:
         sub.enabled = s.pack
         sub.prop(s, "padding")
         sub.prop(s, "allow_rotate")
+        box.prop(s, "stack_mirrored")
         box.prop(s, "preserve_texture")
         if s.preserve_texture:
             box.label(text="Used by Pack and Move Islands", icon='INFO')
@@ -1737,6 +2086,9 @@ if bpy is not None:
         row.operator("uv.pixel_perfect", text="Straighten").step = 'STRAIGHTEN'
         row.operator("uv.pixel_perfect", text="Snap").step = 'SNAP'
         row.operator("uv.pixel_perfect", text="Pack").step = 'PACK'
+        row = layout.row(align=True)
+        row.operator("uv.pixel_perfect", text="Stack Mirrored", icon='MOD_MIRROR').step = 'STACK'
+        row.operator("uv.pixel_fill", icon='SNAP_FACE_CENTER')
 
     class IMAGE_PT_pixel_perfect_uv(bpy.types.Panel):
         bl_space_type = 'IMAGE_EDITOR'
@@ -1777,6 +2129,8 @@ if bpy is not None:
         UV_OT_pixel_resize_texture,
         UV_OT_pixel_restore_texture,
         UV_OT_pixel_move,
+        UV_OT_pixel_character_density,
+        UV_OT_pixel_fill,
         IMAGE_PT_pixel_perfect_uv,
         VIEW3D_PT_pixel_perfect_uv,
     )
