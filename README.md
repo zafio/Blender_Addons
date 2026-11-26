@@ -57,6 +57,6 @@ Lays UV islands out on the texture's pixel grid for low poly / pixel art charact
 - Snap: every vertex lands on a pixel corner; rows and columns of straight islands never collapse below 1 px
 - Pack: whole-pixel packing with pixel padding, optional 90º rotation. Stacked / mirrored islands that share pixels stay together
 - Preserve Texture (Pack button): the painted pixels move with their islands, so you can repack after painting. Packs every face of the edited objects
-- Resize Texture: Canvas (more / less room, the painting stays where it is) or Upscale (every pixel becomes N x N for finer painting)
+- Resize Texture: Canvas (more / less room, the painting stays where it is; choose the anchor, e.g. Top keeps the painting at the top and adds the space below) or Upscale (every pixel becomes N x N for finer painting)
 - Restore Texture: Ctrl+Z only undoes the UVs, this puts the image back as it was before the last Preserve pack or resize. Remember to save the image
 - Texture size comes from the image in the UV Editor (or the material's image texture), or a custom size

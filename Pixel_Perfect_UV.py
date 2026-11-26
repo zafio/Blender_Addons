@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -889,6 +889,25 @@ def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0)):
     return dst
 
 
+def canvas_offset(W, H, nw, nh, anchor_x, anchor_y):
+    """Pixel offset of the old image inside the new canvas (row 0 = bottom)."""
+    ox = {"LEFT": 0, "CENTER": (nw - W) // 2, "RIGHT": nw - W}[anchor_x]
+    oy = {"BOTTOM": 0, "CENTER": (nh - H) // 2, "TOP": nh - H}[anchor_y]
+    return ox, oy
+
+
+def place_canvas(src, nw, nh, ox, oy):
+    """New nh x nw x 4 array with src placed at (ox, oy); negative offsets / smaller sizes crop."""
+    import numpy as np
+    H, W = src.shape[:2]
+    dst = np.zeros((nh, nw, src.shape[2]), dtype=src.dtype)
+    x0, y0 = max(0, ox), max(0, oy)
+    x1, y1 = min(nw, ox + W), min(nh, oy + H)
+    if x1 > x0 and y1 > y0:
+        dst[y0:y1, x0:x1] = src[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
+    return dst
+
+
 # ============================================================================
 # Blender side
 # ============================================================================
@@ -1291,15 +1310,15 @@ if bpy is not None:
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
             return {'FINISHED'}
 
-    def transform_all_uvs(objs, img, fx, fy):
-        """Scales the UVs of every face of the edited objects and of other meshes using img."""
+    def transform_all_uvs(objs, img, fx, fy, ox=0.0, oy=0.0):
+        """uv -> uv * f + o for every face of the edited objects and other meshes using img."""
         for o in objs:
             bm = bmesh.from_edit_mesh(o.data)
             uvl = bm.loops.layers.uv.verify()
             for f in bm.faces:
                 for l in f.loops:
                     uv = l[uvl].uv
-                    l[uvl].uv = (uv.x * fx, uv.y * fy)
+                    l[uvl].uv = (uv.x * fx + ox, uv.y * fy + oy)
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
         edited = {o.data for o in objs}
         done = set()
@@ -1309,7 +1328,7 @@ if bpy is not None:
                 continue
             done.add(me)
             for d in me.uv_layers.active.data:
-                d.uv = (d.uv.x * fx, d.uv.y * fy)
+                d.uv = (d.uv.x * fx + ox, d.uv.y * fy + oy)
 
     class UV_OT_pixel_resize_texture(bpy.types.Operator):
         bl_idname = "uv.pixel_resize_texture"
@@ -1319,12 +1338,20 @@ if bpy is not None:
         bl_options = {'REGISTER', 'UNDO'}
 
         mode: EnumProperty(name="Mode", items=[
-            ('CANVAS', "Canvas", "Change the image size, pixels and islands stay where they are "
-                                 "(anchored bottom-left)"),
+            ('CANVAS', "Canvas", "Change the image size, the painting and islands keep their pixels; "
+                                 "the anchor sets which side the space is added to / removed from"),
             ('UPSCALE', "Upscale", "Every pixel becomes N x N pixels, UVs unchanged")], default='CANVAS')
         width: IntProperty(name="Width", default=128, min=1, max=16384)
         height: IntProperty(name="Height", default=128, min=1, max=16384)
         factor: IntProperty(name="Factor", default=2, min=2, max=16)
+        anchor_y: EnumProperty(name="Vertical", items=[
+            ('TOP', "Top", "Keep the painting at the top: space is added below"),
+            ('CENTER', "Center", "Add space above and below equally"),
+            ('BOTTOM', "Bottom", "Keep the painting at the bottom: space is added above")], default='TOP')
+        anchor_x: EnumProperty(name="Horizontal", items=[
+            ('LEFT', "Left", "Keep the painting on the left: space is added on the right"),
+            ('CENTER', "Center", "Add space on both sides equally"),
+            ('RIGHT', "Right", "Keep the painting on the right: space is added on the left")], default='LEFT')
 
         @classmethod
         def poll(cls, context):
@@ -1345,6 +1372,9 @@ if bpy is not None:
                 row = col.row(align=True)
                 row.prop(self, "width")
                 row.prop(self, "height")
+                col.label(text="Keep the painting at:")
+                col.row(align=True).prop(self, "anchor_y", expand=True)
+                col.row(align=True).prop(self, "anchor_x", expand=True)
             else:
                 col.prop(self, "factor")
             col.label(text="Ctrl+Z won't undo the image: Restore Texture will", icon='INFO')
@@ -1367,11 +1397,9 @@ if bpy is not None:
                 msg = "%d x %d -> %d x %d (density x%d)" % (W, H, W * f, H * f, f)
             else:
                 nw, nh = self.width, self.height
-                dst = np.zeros((nh, nw, 4), dtype=np.float32)
-                cw, ch = min(W, nw), min(H, nh)
-                dst[:ch, :cw] = src[:ch, :cw]
-                write_pixels(img, dst)
-                transform_all_uvs(objs, img, W / nw, H / nh)
+                ox, oy = canvas_offset(W, H, nw, nh, self.anchor_x, self.anchor_y)
+                write_pixels(img, place_canvas(src, nw, nh, ox, oy))
+                transform_all_uvs(objs, img, W / nw, H / nh, ox / nw, oy / nh)
                 msg = "Canvas %d x %d -> %d x %d" % (W, H, nw, nh)
                 if nw < W or nh < H:
                     msg += " (cropped: check for islands outside the texture)"
