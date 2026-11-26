@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 3, 1),
+    "version": (0, 4, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -889,6 +889,65 @@ def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0)):
     return dst
 
 
+class BlockMove:
+    """Pixel block [mx, mx+w) x [my, my+h) turned k times by 90 degrees counter-clockwise around
+    its centre, then shifted by (dx, dy) whole pixels."""
+
+    def __init__(self, mx, my, w, h, k=0, dx=0, dy=0):
+        self.mx, self.my, self.w, self.h = mx, my, w, h
+        self.k, self.dx, self.dy = k % 4, dx, dy
+        w2, h2 = (h, w) if self.k % 2 else (w, h)
+        self.ox = mx + (w - w2) // 2 + dx  # new block origin
+        self.oy = my + (h - h2) // 2 + dy
+
+    def uv(self, x, y):
+        a, b, w, h = x - self.mx, y - self.my, self.w, self.h
+        for _ in range(self.k):
+            a, b, w, h = h - b, a, h, w
+        return a + self.ox, b + self.oy
+
+    def cell(self, i, j):
+        a, b, w, h = i - self.mx, j - self.my, self.w, self.h
+        for _ in range(self.k):
+            a, b, w, h = h - 1 - b, a, h, w
+        return a + self.ox, b + self.oy
+
+
+def lifted_cells(moving, masks, box):
+    """Pixels that travel with the moving islands: their own pixels plus a 1 px bleed ring that
+    no other island claims, inside the block."""
+    mx, my, w, h = box
+    cells = set()
+    for k in moving:
+        cells |= masks[k]
+    others = set()
+    for k, m in enumerate(masks):
+        if k not in moving:
+            others |= m
+    ring = set()
+    for i, j in cells:
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                c = (i + di, j + dj)
+                if c not in cells and c not in others and mx <= c[0] < mx + w and my <= c[1] < my + h:
+                    ring.add(c)
+    return cells | ring, others
+
+
+def block_move_pixels(src, W, H, mv, cells, clear=(0.0, 0.0, 0.0, 0.0)):
+    """Copy of src with `cells` lifted (cleared) and pasted through the BlockMove."""
+    dst = src.copy()
+    for i, j in cells:
+        if 0 <= i < W and 0 <= j < H:
+            dst[j, i] = clear
+    for i, j in cells:
+        if 0 <= i < W and 0 <= j < H:
+            ni, nj = mv.cell(i, j)
+            if 0 <= ni < W and 0 <= nj < H:
+                dst[nj, ni] = src[j, i]
+    return dst
+
+
 def canvas_offset(W, H, nw, nh, anchor_x, anchor_y):
     """Pixel offset of the old image inside the new canvas (row 0 = bottom)."""
     ox = {"LEFT": 0, "CENTER": (nw - W) // 2, "RIGHT": nw - W}[anchor_x]
@@ -1427,6 +1486,167 @@ if bpy is not None:
             self.report({'INFO'}, "Texture restored (%d x %d)" % tuple(b.size))
             return {'FINISHED'}
 
+    PASS_THROUGH = {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'WHEELINMOUSE', 'WHEELOUTMOUSE',
+                    'TRACKPADPAN', 'TRACKPADZOOM', 'NDOF_MOTION'}
+    NUDGE = {'LEFT_ARROW': (-1, 0), 'RIGHT_ARROW': (1, 0), 'UP_ARROW': (0, 1), 'DOWN_ARROW': (0, -1)}
+
+    def uv_selected(context, f, uvl):
+        if f.hide or not f.select:
+            return False
+        if context.tool_settings.use_uv_select_sync:
+            return True
+        return all(l[uvl].select for l in f.loops)
+
+    class UV_OT_pixel_move(bpy.types.Operator):
+        bl_idname = "uv.pixel_move"
+        bl_label = "Move Islands (Preserve Texture)"
+        bl_description = ("Move the selected UV islands in whole pixels, the painted pixels move with "
+                          "them. Mouse / arrows move, R / Shift+R turn 90°, X / Y lock an axis, "
+                          "Enter / LMB confirm, Esc / RMB cancel")
+        bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
+
+        @classmethod
+        def poll(cls, context):
+            sp = context.space_data
+            return context.mode == 'EDIT_MESH' and sp is not None and sp.type == 'IMAGE_EDITOR'
+
+        def mouse_uv(self, event):
+            return self.region.view2d.region_to_view(event.mouse_region_x, event.mouse_region_y)
+
+        def invoke(self, context, event):
+            s = context.scene.pixel_uv
+            self.img = find_image(context) if s.preserve_texture else None
+            if self.img is not None:
+                W, H = int(self.img.size[0]), int(self.img.size[1])
+            else:
+                W, H, _ = texture_size(context, s)
+            self.W, self.H = W, H
+            self.objs, recs = collect(context, W, H, all_faces=True)
+            islands = find_islands(recs)
+            selected = set()
+            for k, isl in enumerate(islands):
+                for fid in isl.face_ids:
+                    uvl, loops, _ = recs[fid].ref
+                    if uv_selected(context, loops[0].face, uvl):
+                        selected.add(k)
+                        break
+            if not selected:
+                self.report({'WARNING'}, "Select the islands to move")
+                return {'CANCELLED'}
+            masks = [pixel_mask(isl, isl.uv, W, H) for isl in islands]
+            moving = set()
+            for g in group_overlapping(islands, masks):  # stacked partners come along
+                if selected & set(g):
+                    moving |= set(g)
+            pts = [p for k in moving for p in islands[k].uv]
+            mx = math.floor(min(p[0] for p in pts) + 1e-6)
+            my = math.floor(min(p[1] for p in pts) + 1e-6)
+            w = max(1, math.ceil(max(p[0] for p in pts) - mx - 1e-6))
+            h = max(1, math.ceil(max(p[1] for p in pts) - my - 1e-6))
+            self.box = (mx, my, w, h)
+            self.corners = []
+            for k in moving:
+                for fid in islands[k].face_ids:
+                    uvl, loops, _ = recs[fid].ref
+                    for l in loops:
+                        uv = l[uvl].uv
+                        self.corners.append((uvl, l, uv.x * W, uv.y * H))
+            self.cells, self.others = lifted_cells(moving, masks, self.box) if self.img else (set(), set())
+            self.src = read_pixels(self.img) if self.img else None
+            self.region = context.region
+            self.area = context.area
+            self.start = self.mouse_uv(event)
+            self.mouse = self.start
+            self.k = 0
+            self.nudge = [0, 0]
+            self.axis = None
+            self.last = None
+            self.apply(context)
+            context.window_manager.modal_handler_add(self)
+            context.workspace.status_text_set(
+                "Mouse / Arrows: move   R / Shift+R: turn 90°   X / Y: lock axis   "
+                "Enter / LMB: confirm   Esc / RMB: cancel")
+            return {'RUNNING_MODAL'}
+
+        def current_move(self):
+            dx = round((self.mouse[0] - self.start[0]) * self.W) + self.nudge[0]
+            dy = round((self.mouse[1] - self.start[1]) * self.H) + self.nudge[1]
+            if self.axis == 'X':
+                dy = 0
+            elif self.axis == 'Y':
+                dx = 0
+            return BlockMove(*self.box, k=self.k, dx=dx, dy=dy)
+
+        def apply(self, context, force=False):
+            mv = self.current_move()
+            key = (mv.k, mv.dx, mv.dy)
+            if key == self.last and not force:
+                return
+            self.last = key
+            W, H = self.W, self.H
+            for uvl, l, x, y in self.corners:
+                nx, ny = mv.uv(x, y)
+                l[uvl].uv = (nx / W, ny / H)
+            for o in self.objs:
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            text = "Move %+d, %+d px" % (mv.dx, mv.dy)
+            if mv.k:
+                text += "   turned %d°" % (mv.k * 90)
+            if self.axis:
+                text += "   [%s axis]" % self.axis
+            if self.img is not None:
+                write_pixels(self.img, block_move_pixels(self.src, W, H, mv, self.cells))
+                dest = {mv.cell(i, j) for i, j in self.cells}
+                if dest & self.others:
+                    text += "   OVERLAPS another island"
+                if any(not (0 <= c[0] < W and 0 <= c[1] < H) for c in dest):
+                    text += "   OUTSIDE the texture (pixels lost)"
+            else:
+                text += "   (UVs only: Preserve Texture off or no image)"
+            self.area.header_text_set(text)
+
+        def finish(self, context):
+            self.area.header_text_set(None)
+            context.workspace.status_text_set(None)
+
+        def modal(self, context, event):
+            et = event.type
+            if et in PASS_THROUGH:
+                return {'PASS_THROUGH'}
+            if et == 'MOUSEMOVE':
+                self.mouse = self.mouse_uv(event)
+                self.apply(context)
+                return {'RUNNING_MODAL'}
+            if event.value != 'PRESS':
+                return {'RUNNING_MODAL'}
+            if et in NUDGE:
+                step = 8 if event.shift else 1
+                self.nudge[0] += NUDGE[et][0] * step
+                self.nudge[1] += NUDGE[et][1] * step
+            elif et == 'R':
+                self.k += -1 if event.shift else 1
+            elif et in ('X', 'Y'):
+                self.axis = None if self.axis == et else et
+            elif et in ('LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'):
+                if self.img is not None and self.last != (0, 0, 0):
+                    backup_image(self.img, self.src)
+                self.finish(context)
+                return {'FINISHED'}
+            elif et in ('RIGHTMOUSE', 'ESC'):
+                W, H = self.W, self.H
+                for uvl, l, x, y in self.corners:
+                    l[uvl].uv = (x / W, y / H)
+                for o in self.objs:
+                    bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+                if self.img is not None:
+                    write_pixels(self.img, self.src)
+                self.finish(context)
+                return {'CANCELLED'}
+            else:
+                return {'RUNNING_MODAL'}
+            self.apply(context)
+            return {'RUNNING_MODAL'}
+
     def active_face_density(context):
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
@@ -1498,7 +1718,9 @@ if bpy is not None:
         sub.prop(s, "allow_rotate")
         box.prop(s, "preserve_texture")
         if s.preserve_texture:
-            box.label(text="Preserve works with the Pack button", icon='INFO')
+            box.label(text="Used by Pack and Move Islands", icon='INFO')
+        if context.space_data and context.space_data.type == 'IMAGE_EDITOR':
+            box.operator("uv.pixel_move", text="Move Islands (Alt+G)", icon='VIEW_PAN')
 
         col = layout.column()
         col.scale_y = 1.4
@@ -1546,18 +1768,29 @@ if bpy is not None:
         UV_OT_pixel_select_custom,
         UV_OT_pixel_resize_texture,
         UV_OT_pixel_restore_texture,
+        UV_OT_pixel_move,
         IMAGE_PT_pixel_perfect_uv,
         VIEW3D_PT_pixel_perfect_uv,
     )
 
+    addon_keymaps = []
+
     def register():
         for c in classes:
             bpy.utils.register_class(c)
+        kc = bpy.context.window_manager.keyconfigs.addon
+        if kc:
+            km = kc.keymaps.new(name="UV Editor", space_type='EMPTY')
+            kmi = km.keymap_items.new(UV_OT_pixel_move.bl_idname, 'G', 'PRESS', alt=True)
+            addon_keymaps.append((km, kmi))
         bpy.types.Scene.pixel_uv = PointerProperty(type=PixelUVSettings)
         bpy.types.IMAGE_MT_uvs.append(menu_func)
         bpy.types.VIEW3D_MT_uv_map.append(menu_func)
 
     def unregister():
+        for km, kmi in addon_keymaps:
+            km.keymap_items.remove(kmi)
+        addon_keymaps.clear()
         bpy.types.VIEW3D_MT_uv_map.remove(menu_func)
         bpy.types.IMAGE_MT_uvs.remove(menu_func)
         del bpy.types.Scene.pixel_uv
