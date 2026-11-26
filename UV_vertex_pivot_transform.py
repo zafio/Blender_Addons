@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 7, 0),
+    "version": (1, 7, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
@@ -171,9 +171,20 @@ def _mirror_uvs(objs, pivot, axis):
 
 def _texture_api():
     """Pixel Perfect UV's texture session, when that add-on is enabled (optional)."""
+    # Only look at real module globals: some modules (bpy.ops submodules) answer any
+    # attribute name with an operator proxy, so getattr() can't be trusted here.
     for mod in list(sys.modules.values()):
-        api = getattr(mod, "PIXEL_UV_TEXTURE_API", None)
-        if api is not None and getattr(api, "version", 0) >= 1:
+        try:
+            api = vars(mod).get("PIXEL_UV_TEXTURE_API")
+        except TypeError:
+            continue
+        if api is None:
+            continue
+        try:
+            version = vars(api).get("version", 0)
+        except TypeError:
+            continue
+        if isinstance(version, int) and version >= 1 and callable(vars(api).get("start")):
             return api
     return None
 
