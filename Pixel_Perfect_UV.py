@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -18,6 +18,9 @@ Pipeline (each step can also be run on its own):
                  is just rotated so its bounding box is axis aligned.
 2. Density     - every island is scaled to the same texel density (px per unit), or to its own
                  density / multiplier stored on its faces (see "Island Density").
+   Islands mixing quads with triangles / n-gons get their main quad group straightened and
+                 pinned, and Blender's unwrap fits the rest around it (idea from noio's
+                 Pixel-Unwrapper, MIT: https://github.com/noio/Pixel-Unwrapper).
 3. Snap        - vertices land on pixel corners. Straight islands keep every row / column at
                  least 1 px wide so no face collapses.
 4. Pack        - islands are packed in whole pixels with pixel padding (MaxRects), optionally
@@ -46,9 +49,10 @@ EPS = 1e-6
 
 class FaceRec:
     """One mesh face: vertex keys, current UVs in pixels, world positions, density settings."""
-    __slots__ = ("vkeys", "uv", "p3", "density", "scale", "ref")
+    __slots__ = ("vkeys", "uv", "p3", "density", "scale", "ref", "keep_rot")
 
-    def __init__(self, vkeys, uv, p3, density=0.0, scale=1.0, ref=None):
+    def __init__(self, vkeys, uv, p3, density=0.0, scale=1.0, ref=None, keep_rot=False):
+        self.keep_rot = keep_rot
         self.vkeys = vkeys
         self.uv = uv
         self.p3 = p3
@@ -68,7 +72,8 @@ class Island:
         # filled by the pipeline
         self.units = None     # layout in world units (isotropic)
         self.kind = "keep"    # "straight", "aligned", "keep", "skip"
-        self.grid = False
+        self.mask = None       # per uv-vertex: on a straight row / column
+        self.keep_rot = False  # already straightened (mixed island): don't re-rotate
         self.distortion = 0.0
         self.new = None       # final px coords
 
@@ -162,6 +167,7 @@ def find_islands(recs):
                 dens.append(r.density)
             if r.scale > 0 and abs(r.scale - 1.0) > 1e-6:
                 scales.append(r.scale)
+        isl.keep_rot = any(recs[fi].keep_rot for fi in fl)
         isl.density = max(dens) if dens else 0.0
         isl.scale = max(scales) if scales else 1.0
         islands.append(isl)
@@ -313,6 +319,69 @@ def lattice_layout(isl):
     return best
 
 
+def quad_part(isl):
+    """Largest edge-connected group of quads in a mixed island, as its own Island.
+    Returns (sub_island, sub_index -> island_index) or (None, None)."""
+    quads = [fi for fi, f in enumerate(isl.faces) if len(f) == 4]
+    if not quads or len(quads) == len(isl.faces):
+        return None, None
+    edge_faces = defaultdict(list)
+    for fi in quads:
+        f = isl.faces[fi]
+        for k in range(4):
+            edge_faces[frozenset((f[k], f[(k + 1) % 4]))].append(fi)
+    seen = set()
+    best = []
+    for start in quads:
+        if start in seen:
+            continue
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            fi = stack.pop()
+            comp.append(fi)
+            f = isl.faces[fi]
+            for k in range(4):
+                for g in edge_faces[frozenset((f[k], f[(k + 1) % 4]))]:
+                    if g not in seen:
+                        seen.add(g)
+                        stack.append(g)
+        if len(comp) > len(best):
+            best = comp
+    sub = Island()
+    remap = {}
+    back = []
+    for fi in best:
+        face = []
+        for v in isl.faces[fi]:
+            if v not in remap:
+                remap[v] = len(back)
+                back.append(v)
+                sub.uv.append(isl.uv[v])
+                sub.p3.append(isl.p3[v])
+            face.append(remap[v])
+        sub.faces.append(face)
+        sub.face_ids.append(isl.face_ids[fi])
+    return sub, back
+
+
+def mixed_grid(isl, max_distortion):
+    """For a quad + non-quad island: straight layout of its main quad group, scaled to the
+    group's current size and placed where it is now (px). Returns {island_vertex: (x, y)} or None."""
+    sub, back = quad_part(isl)
+    if sub is None or len(sub.faces) < 2:
+        return None
+    lay = lattice_layout(sub)
+    if lay is None or distortion(sub, lay) > max_distortion:
+        return None
+    _, a_orig = island_areas(sub, sub.uv)
+    _, a_new = island_areas(sub, lay)
+    k = math.sqrt(abs(a_orig) / max(abs(a_new), EPS))
+    co = _centroid(sub.uv)
+    return {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
+
+
 def convex_hull(pts):
     pts = sorted(set(pts))
     if len(pts) < 3:
@@ -360,15 +429,21 @@ def align_layout(isl, rotate=True):
     return [(x * cs - y * sn, x * sn + y * cs) for x, y in pts]
 
 
-def is_grid(isl, coords, tol=1e-4):
-    if any(len(f) != 4 for f in isl.faces):
-        return False
+def grid_mask(isl, coords, tol=1e-4):
+    """True for uv-vertices that belong to at least one axis-aligned quad (rows / columns)."""
+    mask = [False] * len(coords)
     for f in isl.faces:
-        for k in range(4):
-            a, b = coords[f[k]], coords[f[(k + 1) % 4]]
-            if abs(a[0] - b[0]) > tol and abs(a[1] - b[1]) > tol:
-                return False
-    return True
+        if len(f) != 4:
+            continue
+        if all(abs(coords[f[k]][0] - coords[f[(k + 1) % 4]][0]) <= tol or
+               abs(coords[f[k]][1] - coords[f[(k + 1) % 4]][1]) <= tol for k in range(4)):
+            for v in f:
+                mask[v] = True
+    return mask
+
+
+def is_grid(isl, coords, tol=1e-4):
+    return all(len(f) == 4 for f in isl.faces) and all(grid_mask(isl, coords, tol))
 
 
 def _snap_axis(vals, min_gap):
@@ -389,20 +464,25 @@ def _snap_axis(vals, min_gap):
     return out
 
 
-def snap(coords, grid, isl=None):
-    """Grid islands: per-axis ordered rounding (rows/columns never collapse).
-    Free islands: plain rounding, then vertices of flipped / collapsed faces are nudged by 1 px."""
-    if grid:
-        xs = _snap_axis([p[0] for p in coords], 0.0)
-        ys = _snap_axis([p[1] for p in coords], 0.0)
-        return list(zip(xs, ys))
+def snap(coords, mask, isl=None):
+    """Grid vertices (mask True): ordered per-axis rounding, so rows / columns stay straight and
+    never collapse below 1 px. Other vertices: plain rounding, then vertices of flipped or
+    collapsed faces are nudged by 1 px."""
+    if mask is True or mask is False:
+        mask = [mask] * len(coords)
     out = [(round(x), round(y)) for x, y in coords]
-    if isl is not None:
-        out = _repair(isl, coords, out)
+    gi = [i for i, m in enumerate(mask) if m]
+    if gi:
+        xs = _snap_axis([coords[i][0] for i in gi], 0.0)
+        ys = _snap_axis([coords[i][1] for i in gi], 0.0)
+        for i, x, y in zip(gi, xs, ys):
+            out[i] = (x, y)
+    if isl is not None and not all(mask):
+        out = _repair(isl, coords, out, movable=[not m for m in mask])
     return out
 
 
-def _repair(isl, orig, out, passes=4):
+def _repair(isl, orig, out, passes=4, movable=None):
     a = sum(signed_area2d([orig[i] for i in f]) for f in isl.faces)
     sign = 1.0 if a >= 0 else -1.0
     vfaces = defaultdict(list)
@@ -424,6 +504,8 @@ def _repair(isl, orig, out, passes=4):
                 continue
             best = None
             for v in isl.faces[fi]:
+                if movable is not None and not movable[v]:
+                    continue
                 base = out[v]
                 for dx, dy in offsets:
                     out[v] = (base[0] + dx, base[1] + dy)
@@ -433,6 +515,8 @@ def _repair(isl, orig, out, passes=4):
                     if best is None or key < best[0]:
                         best = (key, v, out[v])
                 out[v] = base
+            if best is None:
+                continue
             cur_bad = sum(1 for g in vfaces[best[1]] if not ok(g, out))
             if best[0][0] < cur_bad:
                 out[best[1]] = best[2]
@@ -545,13 +629,13 @@ def build_layouts(islands, opt):
         if lay is not None:
             d = distortion(isl, lay)
             if d <= opt.max_distortion:
-                isl.units, isl.kind, isl.grid, isl.distortion = lay, "straight", True, d
+                isl.units, isl.kind, isl.mask, isl.distortion = lay, "straight", [True] * len(lay), d
                 continue
-        lay = align_layout(isl, rotate=opt.align)
+        lay = align_layout(isl, rotate=opt.align and not isl.keep_rot)
         if lay is not None:
             isl.units = lay
-            isl.kind = "aligned" if opt.align else "keep"
-            isl.grid = is_grid(isl, lay)
+            isl.kind = "straight" if isl.keep_rot else ("aligned" if opt.align else "keep")
+            isl.mask = grid_mask(isl, lay)
             isl.distortion = distortion(isl, lay)
 
 
@@ -562,7 +646,7 @@ def _island_density(isl, base):
 def _place(isl, base, do_snap):
     d = _island_density(isl, base)
     pts = [(x * d, y * d) for x, y in isl.units]
-    return snap(pts, isl.grid, isl) if do_snap else pts
+    return snap(pts, isl.mask, isl) if do_snap else pts
 
 
 def _try_pack(islands, base, W, H, opt):
@@ -624,7 +708,7 @@ def run(islands, W, H, opt):
             off = (co[0] - cn[0], co[1] - cn[1])
             if opt.snap:
                 off = (round(off[0]), round(off[1]))
-                pts = snap(pts, isl.grid, isl)
+                pts = snap(pts, isl.mask, isl)
             isl.new = [(x + off[0], y + off[1]) for x, y in pts]
 
     stats = {
@@ -646,8 +730,8 @@ def _bbox_area(pts):
 
 def run_snap_only(islands):
     for isl in islands:
-        isl.grid = is_grid(isl, isl.uv)
-        isl.new = snap(isl.uv, isl.grid, isl)
+        isl.mask = grid_mask(isl, isl.uv)
+        isl.new = snap(isl.uv, isl.mask, isl)
     return {"broken": sum(broken_faces(i, i.new) for i in islands)}
 
 
@@ -725,7 +809,7 @@ if bpy is not None:
     def edit_objects(context):
         return [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
 
-    def collect(context, W, H):
+    def collect(context, W, H, keep_rot=frozenset()):
         """FaceRecs of the selected faces (all visible faces when nothing is selected)."""
         objs = edit_objects(context)
         bms = []
@@ -751,7 +835,8 @@ if bpy is not None:
                     [l.vert for l in loops], uv, p3,
                     f[dl] if dl else 0.0,
                     (f[sl] or 1.0) if sl else 1.0,
-                    (uvl, loops)))
+                    (uvl, loops, o),
+                    (o.name, f.index) in keep_rot))
         return objs, recs
 
     def write_back(objs, recs, islands, W, H):
@@ -759,12 +844,74 @@ if bpy is not None:
             if isl.new is None:
                 continue
             for face, fid in zip(isl.faces, isl.face_ids):
-                uvl, loops = recs[fid].ref
+                uvl, loops, _ = recs[fid].ref
                 for l, idx in zip(loops, face):
                     x, y = isl.new[idx]
                     l[uvl].uv = (x / W, y / H)
         for o in objs:
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+
+    def straighten_mixed(context, W, H, opt):
+        """Islands mixing quads and triangles / n-gons: the main quad group is laid out as a
+        rectangle grid and pinned, then Blender's unwrap fits the other faces around it.
+        Islands whose result is too distorted are put back as they were.
+        Returns {(object name, face index)} of the faces handled this way."""
+        objs, recs = collect(context, W, H)
+        todo = []
+        for isl in find_islands(recs):
+            g = mixed_grid(isl, opt.max_distortion)
+            if g:
+                todo.append((isl, g))
+        done = set()
+        if not todo:
+            return done
+        bms = [(o, bmesh.from_edit_mesh(o.data)) for o in objs]
+        saved_sel = [([v.select for v in bm.verts], [e.select for e in bm.edges],
+                      [f.select for f in bm.faces]) for _, bm in bms]
+        for isl, g in todo:
+            corners = []
+            for face, fid in zip(isl.faces, isl.face_ids):
+                uvl, loops, o = recs[fid].ref
+                for l, idx in zip(loops, face):
+                    corners.append((uvl, l, idx, o))
+            saved = [(l[uvl].uv.copy(), l[uvl].pin_uv) for uvl, l, _, _ in corners]
+            for uvl, l, idx, _ in corners:
+                if idx in g:
+                    x, y = g[idx]
+                    l[uvl].uv = (x / W, y / H)
+                    l[uvl].pin_uv = True
+                else:
+                    l[uvl].pin_uv = False
+            for _, bm in bms:
+                for elems in (bm.verts, bm.edges, bm.faces):
+                    for e in elems:
+                        e.select = False
+            for _, l, _, _ in corners:
+                l.face.select_set(True)
+            for o, _ in bms:
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            try:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True, margin=0.0)
+                ok = True
+            except RuntimeError:
+                ok = False
+            if ok:
+                coords = [None] * len(isl.uv)
+                for uvl, l, idx, _ in corners:
+                    coords[idx] = (l[uvl].uv.x * W, l[uvl].uv.y * H)
+                ok = distortion(isl, coords) <= max(opt.max_distortion * 1.5, 0.05)
+            for (uv, pin), (uvl, l, _, o) in zip(saved, corners):
+                if not ok:
+                    l[uvl].uv = uv
+                l[uvl].pin_uv = pin
+            if ok:
+                done.update((o.name, l.face.index) for _, l, _, o in corners)
+        for (o, bm), (vs, es, fs) in zip(bms, saved_sel):
+            for elems, st in ((bm.verts, vs), (bm.edges, es), (bm.faces, fs)):
+                for e, v in zip(elems, st):
+                    e.select = v
+            bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+        return done
 
     def options_from(s):
         return Options(
@@ -828,12 +975,15 @@ if bpy is not None:
         def execute(self, context):
             s = context.scene.pixel_uv
             W, H, _ = texture_size(context, s)
-            objs, recs = collect(context, W, H)
+            opt = options_from(s)
+            mixed = set()
+            if self.step in ('ALL', 'STRAIGHTEN') and s.straighten:
+                mixed = straighten_mixed(context, W, H, opt)
+            objs, recs = collect(context, W, H, mixed)
             if not recs:
                 self.report({'WARNING'}, "No faces")
                 return {'CANCELLED'}
             islands = find_islands(recs)
-            opt = options_from(s)
 
             if self.step == 'SNAP':
                 st = run_snap_only(islands)
@@ -859,6 +1009,9 @@ if bpy is not None:
                     s.density = round(st["density"], 3)
 
             write_back(objs, recs, islands, W, H)
+            n_mixed = sum(1 for i in islands if i.keep_rot)
+            if n_mixed:
+                msg += " (%d with triangles / n-gons)" % n_mixed
             if st.get("broken"):
                 self.report({'WARNING'}, msg + " - %d faces collapsed or flipped by snapping "
                                                "(raise the density)" % st["broken"])
