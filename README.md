@@ -62,6 +62,7 @@ Lays UV islands out on the texture's pixel grid for low poly / pixel art charact
 - Single Pixel Fill: maps the selected faces onto one free pixel; with Preserve Texture it keeps their average colour
 - Island Density: give the selected faces' islands their own fixed px/unit or a multiplier (e.g. x2 for the face). Stored on the mesh, so it's kept every time you re-run
 - Straight rows and columns always snap to whole pixels and never collapse below 1 px
+- Preserve Texel Density (+ tolerance, default 5%): snapping may not change an island's size by more than the tolerance; tiny pieces and thin strips that would are only moved onto the pixel grid, keeping their exact density
 - Pack: whole-pixel packing with pixel padding, optional 90º rotation. Stacked / mirrored islands that share pixels stay together
 - Preserve Texture (Pack button): the painted pixels move with their islands, so you can repack after painting. Packs every face of the edited objects
 - Resize Texture: Canvas (more / less room, the painting stays where it is; choose the anchor, e.g. Top keeps the painting at the top and adds the space below) or Upscale (every pixel becomes N x N for finer painting)

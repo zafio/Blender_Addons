@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 7, 1),
+    "version": (0, 7, 2),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -635,7 +635,13 @@ class Options:
         self.padding = 1
         self.allow_rotate = False
         self.stack_mirrored = True
+        self.keep_density = False      # Preserve Texel Density
+        self.density_tolerance = 0.05  # largest size change snapping may cause when preserving
         self.__dict__.update(kw)
+
+
+def _keep(opt):
+    return opt.density_tolerance if getattr(opt, "keep_density", False) else None
 
 
 PIXEL_AREA = 0.25  # px^2: islands smaller than this are single-colour (one pixel) islands
@@ -801,7 +807,36 @@ def snap_bounds(pts):
     return [(nx + (x - x0) * sx, ny + (y - y0) * sy) for x, y in pts]
 
 
-def snap_island(isl, pts, mode):
+def snap_translate(pts):
+    """Moves the island so its bounding box corner sits on a pixel corner; size untouched."""
+    x0 = min(p[0] for p in pts)
+    y0 = min(p[1] for p in pts)
+    dx, dy = round(x0) - x0, round(y0) - y0
+    return [(x + dx, y + dy) for x, y in pts]
+
+
+def snap_change(pts, snapped):
+    """How much snapping changed the island: worst of width / height / area change (fraction)."""
+    def ext(ps, k):
+        return max(p[k] for p in ps) - min(p[k] for p in ps)
+    worst = 0.0
+    for k in (0, 1):
+        a, b = ext(pts, k), ext(snapped, k)
+        if a > 1e-6:
+            worst = max(worst, abs(b / a - 1.0))
+    return worst
+
+
+def snap_island(isl, pts, mode, keep_density=None):
+    """keep_density: None, or the largest size change (fraction) snapping may cause; islands that
+    would change more are only moved onto the grid, keeping their exact texel density."""
+    out = _snap_island(isl, pts, mode)
+    if keep_density is not None and snap_change(pts, out) > keep_density:
+        return snap_translate(pts)
+    return out
+
+
+def _snap_island(isl, pts, mode):
     """Straightened islands: strict grid snap (rows / columns never collapse). Anything else:
     Bounds (outer edges only) or, in ALL mode, plain rounding + repair. A free-form island
     that just happens to contain a few axis-aligned quads must not get the strict grid snap:
@@ -813,10 +848,10 @@ def snap_island(isl, pts, mode):
     return snap_bounds(pts)
 
 
-def _place(isl, base, do_snap, mode="ALL"):
+def _place(isl, base, do_snap, mode="ALL", keep_density=None):
     d = _island_density(isl, base)
     pts = [(x * d, y * d) for x, y in isl.units]
-    return snap_island(isl, pts, mode) if do_snap else pts
+    return snap_island(isl, pts, mode, keep_density) if do_snap else pts
 
 
 def _try_pack(islands, base, W, H, opt):
@@ -827,7 +862,7 @@ def _try_pack(islands, base, W, H, opt):
             locs.append([(0.5, 0.5)] * len(isl.uv))
             sizes.append((1, 1))
             continue
-        loc, w, h = _local(_place(isl, base, opt.snap, opt.snap_mode))
+        loc, w, h = _local(_place(isl, base, opt.snap, opt.snap_mode, _keep(opt)))
         locs.append(loc)
         sizes.append((max(1, math.ceil(w - 1e-9)), max(1, math.ceil(h - 1e-9))))
     res = pack_rects(sizes, W, H, opt.padding, opt.allow_rotate)
@@ -889,7 +924,7 @@ def run(islands, W, H, opt):
             off = (co[0] - cn[0], co[1] - cn[1])
             if opt.snap:
                 off = (round(off[0]), round(off[1]))
-                pts = snap_island(isl, pts, opt.snap_mode)
+                pts = snap_island(isl, pts, opt.snap_mode, _keep(opt))
             isl.new = [(x + off[0], y + off[1]) for x, y in pts]
 
     stack_mirrored(islands, pairs)
@@ -912,14 +947,14 @@ def _bbox_area(pts):
     return max(max(xs) - min(xs), 1e-4) * max(max(ys) - min(ys), 1e-4)
 
 
-def run_snap_only(islands, mode="ALL"):
+def run_snap_only(islands, mode="ALL", keep_density=None):
     for isl in islands:
         if is_pixel_island(isl):
             isl.new = None
             continue
         isl.mask = grid_mask(isl, isl.uv)
         isl.kind = "straight" if is_grid(isl, isl.uv) else "keep"
-        isl.new = snap_island(isl, isl.uv, mode)
+        isl.new = snap_island(isl, isl.uv, mode, keep_density)
     return {"broken": sum(broken_faces(i, i.new) for i in islands if i.new is not None)}
 
 
@@ -2469,7 +2504,8 @@ if bpy is not None:
             straighten=s.straighten, max_distortion=s.max_distortion / 100.0, align=s.align,
             density_mode=s.density_mode, density=s.density, snap=True, pack=s.pack,
             padding=s.padding, allow_rotate=s.allow_rotate, snap_mode=s.snap_mode,
-            stack_mirrored=s.stack_mirrored)
+            stack_mirrored=s.stack_mirrored, keep_density=s.keep_density,
+            density_tolerance=s.density_tolerance / 100.0)
 
     class PixelUVSettings(bpy.types.PropertyGroup):
         tex_source: EnumProperty(
@@ -2506,6 +2542,15 @@ if bpy is not None:
                                      "its shape (least distortion). Straightened rows / columns still snap"),
                 ('ALL', "All Vertices", "Every vertex goes onto a pixel corner")],
             default='BOUNDS')
+        keep_density: BoolProperty(
+            name="Preserve Texel Density", default=False,
+            description="Snapping may not change an island's size by more than the tolerance: islands "
+                        "that would (tiny pieces, thin strips) are only moved onto the pixel grid, "
+                        "keeping their exact density")
+        density_tolerance: FloatProperty(
+            name="Tolerance", default=5.0, min=0.0, max=100.0, subtype='PERCENTAGE',
+            description="Largest change in width / height that snapping may cause with Preserve "
+                        "Texel Density on")
         stack_mirrored: BoolProperty(
             name="Stack Mirrored L/R", default=True,
             description="Islands that mirror each other across the object's X axis share the same "
@@ -2579,7 +2624,8 @@ if bpy is not None:
                 st = {}
                 msg = "Stacked %d mirrored pairs" % n
             elif self.step == 'SNAP':
-                st = run_snap_only(islands, s.snap_mode)
+                st = run_snap_only(islands, s.snap_mode,
+                                   s.density_tolerance / 100.0 if s.keep_density else None)
                 msg = "Snapped %d islands to %d x %d" % (len(islands), W, H)
             elif self.step == 'STRAIGHTEN':
                 st = run_straighten_only(islands, opt)
@@ -3339,6 +3385,11 @@ if bpy is not None:
         sub.prop(s, "max_distortion")
         box.prop(s, "align")
         box.row().prop(s, "snap_mode", expand=True)
+        row = box.row(align=True)
+        row.prop(s, "keep_density")
+        sub = row.row(align=True)
+        sub.enabled = s.keep_density
+        sub.prop(s, "density_tolerance", text="")
 
         box = layout.box()
         box.label(text="Packing", icon='PACKAGE')
