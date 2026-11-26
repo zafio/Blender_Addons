@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 6, 0),
+    "version": (0, 6, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1466,7 +1466,23 @@ if bpy is not None:
         if img is not None:
             write_pixels(img, arr)
 
+    # persistent: Blender removes non-persistent handlers whenever a .blend is loaded (which
+    # happens right after add-ons are enabled at startup), and texture undo would silently stop.
+    @bpy.app.handlers.persistent
     def _on_undo(*_args):
+        try:
+            _undo_texture()
+        except Exception as exc:  # never break Blender's own undo
+            print("Pixel Perfect UV: texture undo failed:", exc)
+
+    @bpy.app.handlers.persistent
+    def _on_redo(*_args):
+        try:
+            _redo_texture()
+        except Exception as exc:
+            print("Pixel Perfect UV: texture redo failed:", exc)
+
+    def _undo_texture():
         applied = [k for k, e in enumerate(HISTORY) if e.applied]
         for k in reversed(applied):
             if read_revs(HISTORY[k].objs) == HISTORY[k].rev_before:
@@ -1477,7 +1493,7 @@ if bpy is not None:
                     HISTORY[j].applied = False
                 return
 
-    def _on_redo(*_args):
+    def _redo_texture():
         pending = [k for k, e in enumerate(HISTORY) if not e.applied]
         for k in reversed(pending):
             if read_revs(HISTORY[k].objs) == HISTORY[k].rev_after:
@@ -1488,6 +1504,7 @@ if bpy is not None:
                     HISTORY[j].applied = True
                 return
 
+    @bpy.app.handlers.persistent
     def _on_load(*_args):
         HISTORY.clear()
 
