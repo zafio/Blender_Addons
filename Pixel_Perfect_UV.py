@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1005,15 +1005,21 @@ if bpy is not None:
     def edit_objects(context):
         return [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
 
+    # BMesh wrappers must stay alive while we hold BMLoop / BMFace references: when the Python
+    # BMesh object is freed, Blender invalidates every element taken from it.
+    _KEEP_BMESH = []
+
     def collect(context, W, H, keep_rot=frozenset(), all_faces=False):
         """FaceRecs of the selected faces (all visible faces when nothing is selected, every
         face including hidden ones with all_faces)."""
         objs = edit_objects(context)
         bms = []
+        _KEEP_BMESH.clear()
         any_sel = False
         for o in objs:
             bm = bmesh.from_edit_mesh(o.data)
             bms.append((o, bm))
+            _KEEP_BMESH.append(bm)
             if not all_faces and not any_sel and any(f.select and not f.hide for f in bm.faces):
                 any_sel = True
         recs = []
@@ -1522,6 +1528,7 @@ if bpy is not None:
                 W, H, _ = texture_size(context, s)
             self.W, self.H = W, H
             self.objs, recs = collect(context, W, H, all_faces=True)
+            self.bms = list(_KEEP_BMESH)  # keep the loops valid for the whole modal
             islands = find_islands(recs)
             selected = set()
             for k, isl in enumerate(islands):
@@ -1606,6 +1613,7 @@ if bpy is not None:
             self.area.header_text_set(text)
 
         def finish(self, context):
+            self.bms = None
             self.area.header_text_set(None)
             context.workspace.status_text_set(None)
 
