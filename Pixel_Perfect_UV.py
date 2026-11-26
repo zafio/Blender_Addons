@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -753,22 +753,140 @@ def run_straighten_only(islands, opt):
     }
 
 
-def run_pack_only(islands, W, H, opt):
-    locs, sizes = [], []
-    for isl in islands:
-        mx = math.floor(min(p[0] for p in isl.uv) + 1e-6)
-        my = math.floor(min(p[1] for p in isl.uv) + 1e-6)
-        loc = [(x - mx, y - my) for x, y in isl.uv]
-        locs.append(loc)
-        sizes.append((math.ceil(max(p[0] for p in loc) - 1e-6), math.ceil(max(p[1] for p in loc) - 1e-6)))
+def _point_in_poly(x, y, poly):
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def pixel_mask(isl, coords, W, H):
+    """Pixels (i, j) whose centre lies inside one of the island's faces (coords in px)."""
+    cells = set()
+    for f in isl.faces:
+        poly = [coords[v] for v in f]
+        x0 = max(0, math.floor(min(p[0] for p in poly)))
+        x1 = min(W - 1, math.ceil(max(p[0] for p in poly)))
+        y0 = max(0, math.floor(min(p[1] for p in poly)))
+        y1 = min(H - 1, math.ceil(max(p[1] for p in poly)))
+        for j in range(y0, y1 + 1):
+            for i in range(x0, x1 + 1):
+                if _point_in_poly(i + 0.5, j + 0.5, poly):
+                    cells.add((i, j))
+    if not cells:  # sliver: take the pixels its vertices touch
+        for x, y in coords:
+            i, j = min(max(int(math.floor(x)), 0), W - 1), min(max(int(math.floor(y)), 0), H - 1)
+            cells.add((i, j))
+    return cells
+
+
+def group_overlapping(islands, masks):
+    """Islands sharing pixels (stacked / mirrored halves) stay together as one packing unit."""
+    owner = {}
+    parent = list(range(len(islands)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for k, m in enumerate(masks):
+        for c in m:
+            o = owner.get(c)
+            if o is None:
+                owner[c] = k
+            else:
+                ra, rb = find(o), find(k)
+                if ra != rb:
+                    parent[ra] = rb
+    groups = defaultdict(list)
+    for k in range(len(islands)):
+        groups[find(k)].append(k)
+    return list(groups.values())
+
+
+class PackMove:
+    """Integer move of a group of islands: pixel block [mx, mx+w) x [my, my+h) goes to (x, y),
+    rotated 90 degrees counter-clockwise first when rot is True."""
+    __slots__ = ("members", "mx", "my", "w", "h", "x", "y", "rot")
+
+    def __init__(self, members, mx, my, w, h, x, y, rot):
+        self.members, self.mx, self.my, self.w, self.h = members, mx, my, w, h
+        self.x, self.y, self.rot = x, y, rot
+
+    def cell(self, i, j):
+        a, b = i - self.mx, j - self.my
+        if self.rot:
+            a, b = self.h - 1 - b, a
+        return a + self.x, b + self.y
+
+
+def run_pack_only(islands, W, H, opt, keep_overlaps=True):
+    """Packs the islands at their current size (whole-pixel moves / 90 degree turns only).
+    Returns (error, moves, masks)."""
+    masks = [pixel_mask(isl, isl.uv, W, H) for isl in islands]
+    groups = group_overlapping(islands, masks) if keep_overlaps else [[k] for k in range(len(islands))]
+    boxes, sizes = [], []
+    for g in groups:
+        pts = [p for k in g for p in islands[k].uv]
+        mx = math.floor(min(p[0] for p in pts) + 1e-6)
+        my = math.floor(min(p[1] for p in pts) + 1e-6)
+        w = max(1, math.ceil(max(p[0] for p in pts) - mx - 1e-6))
+        h = max(1, math.ceil(max(p[1] for p in pts) - my - 1e-6))
+        boxes.append((mx, my))
+        sizes.append((w, h))
     res = pack_rects(sizes, W, H, opt.padding, opt.allow_rotate)
     if res is None:
-        return "Islands don't fit in %d x %d at their current size" % (W, H)
-    for isl, loc, (w, h), (x, y, rot) in zip(islands, locs, sizes, res):
-        if rot:
-            loc = _rot90(loc, h)
-        isl.new = [(px + x, py + y) for px, py in loc]
-    return None
+        return "Islands don't fit in %d x %d at their current size" % (W, H), None, masks
+    moves = []
+    for g, (mx, my), (w, h), (x, y, rot) in zip(groups, boxes, sizes, res):
+        for k in g:
+            loc = [(px - mx, py - my) for px, py in islands[k].uv]
+            if rot:
+                loc = _rot90(loc, h)
+            islands[k].new = [(px + x, py + y) for px, py in loc]
+        moves.append(PackMove(g, mx, my, w, h, x, y, rot))
+    return None, moves, masks
+
+
+def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0)):
+    """src: H x W x 4 array (numpy, row 0 = bottom). Returns a new array where each island's
+    pixels (plus a 1 px bleed ring that no other island claims) follow its PackMove.
+    Pixels not under any island are cleared."""
+    import numpy as np
+    dst = np.empty_like(src)
+    dst[:, :] = clear
+    claimed = {}
+    for k, m in enumerate(masks):
+        for c in m:
+            claimed.setdefault(c, set()).add(k)
+    for mv in moves:
+        members = set(mv.members)
+        cells = set()
+        for k in mv.members:
+            cells |= masks[k]
+        ring = set()
+        for i, j in cells:
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    c = (i + di, j + dj)
+                    if c in cells or not (mv.mx <= c[0] < mv.mx + mv.w and mv.my <= c[1] < mv.my + mv.h):
+                        continue
+                    if claimed.get(c, members) <= members:
+                        ring.add(c)
+        for i, j in cells | ring:
+            if not (0 <= i < W and 0 <= j < H):
+                continue
+            ni, nj = mv.cell(i, j)
+            if 0 <= ni < W and 0 <= nj < H:
+                dst[nj, ni] = src[j, i]
+    return dst
 
 
 # ============================================================================
@@ -809,15 +927,16 @@ if bpy is not None:
     def edit_objects(context):
         return [o for o in context.objects_in_mode_unique_data if o.type == 'MESH']
 
-    def collect(context, W, H, keep_rot=frozenset()):
-        """FaceRecs of the selected faces (all visible faces when nothing is selected)."""
+    def collect(context, W, H, keep_rot=frozenset(), all_faces=False):
+        """FaceRecs of the selected faces (all visible faces when nothing is selected, every
+        face including hidden ones with all_faces)."""
         objs = edit_objects(context)
         bms = []
         any_sel = False
         for o in objs:
             bm = bmesh.from_edit_mesh(o.data)
             bms.append((o, bm))
-            if not any_sel and any(f.select and not f.hide for f in bm.faces):
+            if not all_faces and not any_sel and any(f.select and not f.hide for f in bm.faces):
                 any_sel = True
         recs = []
         for o, bm in bms:
@@ -826,7 +945,7 @@ if bpy is not None:
             sl = bm.faces.layers.float.get(SCALE_ATTR)
             mw = o.matrix_world
             for f in bm.faces:
-                if f.hide or (any_sel and not f.select):
+                if not all_faces and (f.hide or (any_sel and not f.select)):
                     continue
                 loops = list(f.loops)
                 p3 = [tuple(mw @ l.vert.co) for l in loops]
@@ -913,6 +1032,52 @@ if bpy is not None:
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
         return done
 
+    BACKUP_SUFFIX = ".pixuv_backup"
+
+    def read_pixels(img):
+        import numpy as np
+        w, h = img.size
+        buf = np.empty(w * h * 4, dtype=np.float32)
+        img.pixels.foreach_get(buf)
+        return buf.reshape(h, w, 4)
+
+    def write_pixels(img, arr):
+        h, w = arr.shape[:2]
+        if tuple(img.size) != (w, h):
+            img.scale(w, h)
+        img.pixels.foreach_set(arr.astype("float32").ravel())
+        img.update()
+
+    def backup_image(img, arr):
+        """Keeps a copy of the pixels before they are moved (Ctrl+Z only undoes the UVs)."""
+        name = img.name + BACKUP_SUFFIX
+        old = bpy.data.images.get(name)
+        if old:
+            bpy.data.images.remove(old)
+        h, w = arr.shape[:2]
+        b = bpy.data.images.new(name, w, h, alpha=True, float_buffer=img.is_float)
+        b.pixels.foreach_set(arr.astype("float32").ravel())
+        b.use_fake_user = True
+        try:
+            b.pack()
+        except RuntimeError:
+            pass
+        return b
+
+    def image_users(img, exclude_meshes):
+        """Other mesh objects (not being edited) whose materials use img."""
+        names = []
+        for o in bpy.data.objects:
+            if o.type != 'MESH' or o.data in exclude_meshes:
+                continue
+            for slot in o.material_slots:
+                m = slot.material
+                if m and m.use_nodes and m.node_tree and any(
+                        n.type == 'TEX_IMAGE' and n.image == img for n in m.node_tree.nodes):
+                    names.append(o.name)
+                    break
+        return names
+
     def options_from(s):
         return Options(
             straighten=s.straighten, max_distortion=s.max_distortion / 100.0, align=s.align,
@@ -948,6 +1113,11 @@ if bpy is not None:
         align: BoolProperty(name="Align Other Islands", default=True,
                             description="Rotate islands that aren't straightened so their bounds are axis aligned")
         pack: BoolProperty(name="Pack", default=True)
+        preserve_texture: BoolProperty(
+            name="Preserve Texture", default=True,
+            description="Pack only: move the painted pixels with their islands so the model looks the "
+                        "same. Packs every face of the edited objects. Ctrl+Z only undoes the UVs: use "
+                        "Restore Texture after it to get the old pixels back")
         island_mode: EnumProperty(
             name="Island Density", items=[
                 ('FIXED', "Fixed px/unit", "The selected islands always use this density"),
@@ -976,10 +1146,18 @@ if bpy is not None:
             s = context.scene.pixel_uv
             W, H, _ = texture_size(context, s)
             opt = options_from(s)
+            img = None
+            if self.step == 'PACK' and s.preserve_texture:
+                img = find_image(context)
+                if img is None:
+                    self.report({'ERROR'}, "Preserve Texture needs an image (show it in the UV Editor "
+                                           "or use it in the material)")
+                    return {'CANCELLED'}
+                W, H = int(img.size[0]), int(img.size[1])
             mixed = set()
             if self.step in ('ALL', 'STRAIGHTEN') and s.straighten:
                 mixed = straighten_mixed(context, W, H, opt)
-            objs, recs = collect(context, W, H, mixed)
+            objs, recs = collect(context, W, H, mixed, all_faces=img is not None)
             if not recs:
                 self.report({'WARNING'}, "No faces")
                 return {'CANCELLED'}
@@ -992,12 +1170,21 @@ if bpy is not None:
                 st = run_straighten_only(islands, opt)
                 msg = "%d straightened, %d aligned" % (st["straight"], st["aligned"])
             elif self.step == 'PACK':
-                err = run_pack_only(islands, W, H, opt)
+                err, moves, masks = run_pack_only(islands, W, H, opt)
                 if err:
                     self.report({'ERROR'}, err)
                     return {'CANCELLED'}
                 st = {}
                 msg = "Packed %d islands" % len(islands)
+                if img is not None:
+                    src = read_pixels(img)
+                    backup_image(img, src)
+                    write_pixels(img, move_pixels(src, W, H, moves, masks))
+                    msg += ", texture preserved (save the image!)"
+                    others = image_users(img, {o.data for o in objs})
+                    if others:
+                        msg += " - also used by %s, which wasn't in Edit Mode and now looks wrong" % (
+                            ", ".join(others[:3]))
             else:
                 st, err = run(islands, W, H, opt)
                 if err:
@@ -1104,6 +1291,114 @@ if bpy is not None:
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
             return {'FINISHED'}
 
+    def transform_all_uvs(objs, img, fx, fy):
+        """Scales the UVs of every face of the edited objects and of other meshes using img."""
+        for o in objs:
+            bm = bmesh.from_edit_mesh(o.data)
+            uvl = bm.loops.layers.uv.verify()
+            for f in bm.faces:
+                for l in f.loops:
+                    uv = l[uvl].uv
+                    l[uvl].uv = (uv.x * fx, uv.y * fy)
+            bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+        edited = {o.data for o in objs}
+        done = set()
+        for name in image_users(img, edited):
+            me = bpy.data.objects[name].data
+            if me in done or not me.uv_layers.active:
+                continue
+            done.add(me)
+            for d in me.uv_layers.active.data:
+                d.uv = (d.uv.x * fx, d.uv.y * fy)
+
+    class UV_OT_pixel_resize_texture(bpy.types.Operator):
+        bl_idname = "uv.pixel_resize_texture"
+        bl_label = "Resize Texture"
+        bl_description = ("Resize the image without breaking the painting: Canvas adds / removes room "
+                          "(islands keep their pixels), Upscale makes every pixel N x N (finer painting)")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        mode: EnumProperty(name="Mode", items=[
+            ('CANVAS', "Canvas", "Change the image size, pixels and islands stay where they are "
+                                 "(anchored bottom-left)"),
+            ('UPSCALE', "Upscale", "Every pixel becomes N x N pixels, UVs unchanged")], default='CANVAS')
+        width: IntProperty(name="Width", default=128, min=1, max=16384)
+        height: IntProperty(name="Height", default=128, min=1, max=16384)
+        factor: IntProperty(name="Factor", default=2, min=2, max=16)
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def invoke(self, context, event):
+            img = find_image(context)
+            if img is None:
+                self.report({'ERROR'}, "No image found")
+                return {'CANCELLED'}
+            self.width, self.height = int(img.size[0]) * 2, int(img.size[1]) * 2
+            return context.window_manager.invoke_props_dialog(self)
+
+        def draw(self, context):
+            col = self.layout.column()
+            col.prop(self, "mode", expand=True)
+            if self.mode == 'CANVAS':
+                row = col.row(align=True)
+                row.prop(self, "width")
+                row.prop(self, "height")
+            else:
+                col.prop(self, "factor")
+            col.label(text="Ctrl+Z won't undo the image: Restore Texture will", icon='INFO')
+
+        def execute(self, context):
+            import numpy as np
+            img = find_image(context)
+            if img is None:
+                self.report({'ERROR'}, "No image found")
+                return {'CANCELLED'}
+            W, H = int(img.size[0]), int(img.size[1])
+            src = read_pixels(img)
+            backup_image(img, src)
+            objs = edit_objects(context)
+            s = context.scene.pixel_uv
+            if self.mode == 'UPSCALE':
+                f = self.factor
+                write_pixels(img, np.repeat(np.repeat(src, f, axis=0), f, axis=1))
+                s.density *= f
+                msg = "%d x %d -> %d x %d (density x%d)" % (W, H, W * f, H * f, f)
+            else:
+                nw, nh = self.width, self.height
+                dst = np.zeros((nh, nw, 4), dtype=np.float32)
+                cw, ch = min(W, nw), min(H, nh)
+                dst[:ch, :cw] = src[:ch, :cw]
+                write_pixels(img, dst)
+                transform_all_uvs(objs, img, W / nw, H / nh)
+                msg = "Canvas %d x %d -> %d x %d" % (W, H, nw, nh)
+                if nw < W or nh < H:
+                    msg += " (cropped: check for islands outside the texture)"
+            if s.tex_source == 'CUSTOM':
+                s.tex_width, s.tex_height = int(img.size[0]), int(img.size[1])
+            self.report({'INFO'}, msg + ". Save the image!")
+            return {'FINISHED'}
+
+    class UV_OT_pixel_restore_texture(bpy.types.Operator):
+        bl_idname = "uv.pixel_restore_texture"
+        bl_label = "Restore Texture"
+        bl_description = ("Put back the pixels from before the last Preserve Texture pack or resize. "
+                          "Use it together with Ctrl+Z (which only undoes the UVs)")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        @classmethod
+        def poll(cls, context):
+            img = find_image(context)
+            return img is not None and bpy.data.images.get(img.name + BACKUP_SUFFIX) is not None
+
+        def execute(self, context):
+            img = find_image(context)
+            b = bpy.data.images.get(img.name + BACKUP_SUFFIX)
+            write_pixels(img, read_pixels(b))
+            self.report({'INFO'}, "Texture restored (%d x %d)" % tuple(b.size))
+            return {'FINISHED'}
+
     def active_face_density(context):
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
@@ -1132,6 +1427,9 @@ if bpy is not None:
             row.prop(s, "tex_width")
             row.prop(s, "tex_height")
         box.label(text="%s: %d x %d" % (img or "Custom", W, H))
+        row = box.row(align=True)
+        row.operator("uv.pixel_resize_texture", icon='FULLSCREEN_ENTER')
+        row.operator("uv.pixel_restore_texture", text="", icon='LOOP_BACK')
 
         box = layout.box()
         box.label(text="Density", icon='MOD_UVPROJECT')
@@ -1170,6 +1468,9 @@ if bpy is not None:
         sub.enabled = s.pack
         sub.prop(s, "padding")
         sub.prop(s, "allow_rotate")
+        box.prop(s, "preserve_texture")
+        if s.preserve_texture:
+            box.label(text="Preserve works with the Pack button", icon='INFO')
 
         col = layout.column()
         col.scale_y = 1.4
@@ -1215,6 +1516,8 @@ if bpy is not None:
         UV_OT_pixel_density_from_selection,
         UV_OT_pixel_island_density,
         UV_OT_pixel_select_custom,
+        UV_OT_pixel_resize_texture,
+        UV_OT_pixel_restore_texture,
         IMAGE_PT_pixel_perfect_uv,
         VIEW3D_PT_pixel_perfect_uv,
     )
