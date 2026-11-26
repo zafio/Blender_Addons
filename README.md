@@ -51,12 +51,14 @@ Selects overlapped (stacked / mirrored) UV elements together (UV Editor). Press 
 ####PIXEL PERFECT UV
 Lays UV islands out on the texture's pixel grid for low poly / pixel art characters (UV Editor or 3D View in Edit Mode > Sidebar > Pixel UV, also in the UV menus). Works on the selected faces (all faces if none are selected) of every object in Edit Mode, packed together.
 
+- Auto Unwrap Character = Auto Seams + unwrap + Character Density Preset + Pixel Perfect UV, in one click
+- Auto Seams: marks seams like a hand unwrap. Learned from hand-unwrapped characters (a small model predicts which edges an artist would cut), then every island is made a flat piece (tubes opened, closed parts cut on the most hidden side) and everything is mirrored left / right. Per object Seam Type: Auto, Organic (body), Hard Surface (props: cut the creases) or Tube (rope, cable). "Keep My Seams" builds around seams you marked. Rules mode uses crease angles instead of the model
 - Pixel Perfect UV = Straighten + Density + Snap + Pack in one click (or run Straighten / Snap / Pack on their own)
 - Snap: Bounds (default: only the island's outer edges go on pixel lines, the inside keeps its shape) or All Vertices
 - Straighten: quad-grid islands (limbs, torso strips...) become perfect rectangles, sized from the real 3D edge lengths. Only applied when the stretch stays under "Max Distortion %" (default 12%); other islands keep their unwrap and are just rotated to sit straight. Islands mixing quads and triangles / n-gons (hands, caps...) get their quad part straightened and pinned, and Blender's unwrap fits the rest around it (idea from noio's [Pixel-Unwrapper](https://github.com/noio/Pixel-Unwrapper))
 - Density: Fit Texture (biggest density that fits), Fixed px/unit (eyedropper reads it from the selection) or Current Average
 - Stack Mirrored L/R: islands that mirror each other across the object's X axis share the same pixels (the +X side is laid out, the -X one is stacked on it). Also as its own button. Islands folded onto themselves (left half over the right) are kept as they are
-- Character Density Preset: head x2, hands x1.3, legs x0.8 by height / distance from the centre (all editable in the redo panel)
+- Character Density Preset: head x2, hands x1.3, legs x0.8 by height / distance from the centre, hard-surface props x1.5 (all editable in the redo panel)
 - Single Pixel Fill: maps the selected faces onto one free pixel; with Preserve Texture it keeps their average colour
 - Island Density: give the selected faces' islands their own fixed px/unit or a multiplier (e.g. x2 for the face). Stored on the mesh, so it's kept every time you re-run
 - Straight rows and columns always snap to whole pixels and never collapse below 1 px

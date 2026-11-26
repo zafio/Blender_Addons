@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 6, 2),
+    "version": (0, 7, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -27,6 +27,7 @@ Pipeline (each step can also be run on its own):
                  rotated by 90 degrees. "Fit" mode finds the highest density that fits.
 """
 
+import heapq
 import math
 from collections import defaultdict, deque
 
@@ -1227,6 +1228,837 @@ def place_canvas(src, nw, nh, ox, oy):
 
 
 # ============================================================================
+# Auto seams
+# ============================================================================
+#
+# Seams come from a small boosted-tree model trained on hand-unwrapped characters (it predicts
+# per edge how likely the artist was to cut it), followed by geometry rules that make every
+# island a flat-able disk: tubes are opened and closed pieces cut along the cheapest, most
+# seam-like path, and every cut is mirrored across X so left / right islands can be stacked.
+# Without the model (or with "Rules" chosen) crease angles per object type are used instead.
+
+TWO_PI = 2.0 * math.pi
+
+
+
+def _add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _mul(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _length(a):
+    return math.sqrt(_dot(a, a))
+
+
+def _normalize(a):
+    l = _length(a)
+    return (a[0] / l, a[1] / l, a[2] / l) if l > 1e-12 else (0.0, 0.0, 0.0)
+
+
+SEAM_TYPES = {
+    # angle: feature edge angle; chain: min edges in a sharp chain to count as a border
+    # curv: max total |Gaussian curvature| (radians) a chart may keep before being split
+    "HARD": dict(angle=55.0, chain=1, curv=10.4, min_split_faces=6),
+    "ORGANIC": dict(angle=60.0, chain=4, curv=14.4, min_split_faces=12),
+    "TUBE": dict(angle=181.0, chain=1, curv=18.0, min_split_faces=12),   # no crease cuts
+}
+
+
+class SeamMesh:
+    def __init__(self, verts, faces, groups=None, up=(0.0, 0.0, 1.0), front=(0.0, -1.0, 0.0),
+                 mirror_axis=0, existing_seams=()):
+        self.V = [tuple(v) for v in verts]
+        self.F = [list(f) for f in faces]
+        self.G = list(groups) if groups is not None else [None] * len(self.F)
+        self.up = _normalize(up)
+        self.front = _normalize(front)
+        self.axis = mirror_axis
+        self.edge_index = {}
+        self.E = []            # (a, b)
+        self.EF = []           # faces per edge
+        self.FE = []           # edges per face
+        for fi, f in enumerate(self.F):
+            fe = []
+            for k in range(len(f)):
+                a, b = f[k], f[(k + 1) % len(f)]
+                key = (a, b) if a < b else (b, a)
+                ei = self.edge_index.get(key)
+                if ei is None:
+                    ei = self.edge_index[key] = len(self.E)
+                    self.E.append(key)
+                    self.EF.append([])
+                self.EF[ei].append(fi)
+                fe.append(ei)
+            self.FE.append(fe)
+        self.VE = defaultdict(list)
+        for ei, (a, b) in enumerate(self.E):
+            self.VE[a].append(ei)
+            self.VE[b].append(ei)
+        self.fn, self.fa, self.fc = [], [], []
+        for f in self.F:
+            p = [self.V[v] for v in f]
+            n = (0.0, 0.0, 0.0)
+            for i in range(1, len(p) - 1):
+                n = _add(n, _cross(_sub(p[i], p[0]), _sub(p[i + 1], p[0])))
+            self.fa.append(0.5 * _length(n))
+            self.fn.append(_normalize(n))
+            self.fc.append(_mul(tuple(map(sum, zip(*p))), 1.0 / len(p)))
+        self.length = [_length(_sub(self.V[a], self.V[b])) for a, b in self.E]
+        self.angle = []
+        for ei, fl in enumerate(self.EF):
+            if len(fl) == 2:
+                d = max(-1.0, min(1.0, _dot(self.fn[fl[0]], self.fn[fl[1]])))
+                self.angle.append(math.degrees(math.acos(d)))
+            else:
+                self.angle.append(0.0)
+        self.border = {ei for ei, fl in enumerate(self.EF) if len(fl) != 2}
+        self.existing = {self.edge_index[(min(a, b), max(a, b))] for a, b in existing_seams
+                         if (min(a, b), max(a, b)) in self.edge_index}
+        self._mirror_maps()
+        self._costs()
+
+    # -- symmetry -------------------------------------------------------------
+    def _mirror_maps(self):
+        xs = [v[self.axis] for v in self.V]
+        size = max(max(c) - min(c) for c in zip(*self.V)) if self.V else 1.0
+        self.tol = size * 2e-3
+        cell = self.tol * 2
+        grid = defaultdict(list)
+        for i, v in enumerate(self.V):
+            grid[tuple(int(math.floor(c / cell)) for c in v)].append(i)
+        self.vmir = {}
+        for i, v in enumerate(self.V):
+            m = list(v)
+            m[self.axis] = -m[self.axis]
+            key = tuple(int(math.floor(c / cell)) for c in m)
+            best, bd = None, self.tol ** 2
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        for j in grid.get((key[0] + dx, key[1] + dy, key[2] + dz), ()):
+                            d = sum((self.V[j][k] - m[k]) ** 2 for k in range(3))
+                            if d <= bd:
+                                best, bd = j, d
+            if best is not None:
+                self.vmir[i] = best
+        self.emir = {}
+        for ei, (a, b) in enumerate(self.E):
+            ma, mb = self.vmir.get(a), self.vmir.get(b)
+            if ma is None or mb is None:
+                continue
+            mk = (ma, mb) if ma < mb else (mb, ma)
+            mj = self.edge_index.get(mk)
+            if mj is not None:
+                self.emir[ei] = mj
+        self.on_center = {i for i, v in enumerate(self.V) if abs(v[self.axis]) <= self.tol}
+
+    # -- cut path costs ---------------------------------------------------------
+    def hidden(self, ei):
+        """0 (fully visible: front / top) .. 1 (hidden: underneath, inner side)."""
+        n = (0.0, 0.0, 0.0)
+        for f in self.EF[ei]:
+            n = _add(n, self.fn[f])
+        n = _normalize(n)
+        a, b = self.E[ei]
+        cx = (self.V[a][self.axis] + self.V[b][self.axis]) / 2
+        inward = 0.0
+        if abs(cx) > self.tol * 5:
+            inward = max(0.0, -n[self.axis] * (1 if cx > 0 else -1))
+        down = max(0.0, -_dot(n, self.up))
+        back = max(0.0, -_dot(n, self.front))
+        frontness = max(0.0, _dot(n, self.front))
+        return max(0.0, min(1.0, 0.55 * down + 0.3 * back + 0.35 * inward + 0.15 - 0.3 * frontness))
+
+    def _costs(self):
+        self.cost = []
+        for ei in range(len(self.E)):
+            c = self.length[ei] * (0.25 + 2.5 * (1.0 - self.hidden(ei)))
+            if self.angle[ei] >= 30:
+                c *= 0.45
+            a, b = self.E[ei]
+            if a in self.on_center and b in self.on_center:
+                c *= 0.5
+            if ei in self.existing:
+                c *= 0.2
+            self.cost.append(c)
+
+    # -- charts -----------------------------------------------------------------
+    def charts(self, cuts):
+        parent = list(range(len(self.F)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for ei, fl in enumerate(self.EF):
+            if len(fl) == 2 and ei not in cuts:
+                ra, rb = find(fl[0]), find(fl[1])
+                if ra != rb:
+                    parent[ra] = rb
+        groups = defaultdict(list)
+        for fi in range(len(self.F)):
+            groups[find(fi)].append(fi)
+        return list(groups.values())
+
+    def topology(self, chart, cuts):
+        """(boundary loops as lists of edge ids, genus, interior edge set, boundary vertex set)."""
+        fs = set(chart)
+        edges = set()
+        for f in chart:
+            edges.update(self.FE[f])
+        bnd = {e for e in edges if e in cuts or e in self.border or
+               any(g not in fs for g in self.EF[e]) or len(self.EF[e]) != 2}
+        interior = edges - bnd
+        verts = set()
+        for f in chart:
+            verts.update(self.F[f])
+        chi = len(verts) - len(edges) + len(chart)
+        # boundary components: edges connected through shared vertices
+        vb = defaultdict(list)
+        for e in bnd:
+            a, b = self.E[e]
+            vb[a].append(e)
+            vb[b].append(e)
+        seen = set()
+        loops = []
+        for e0 in bnd:
+            if e0 in seen:
+                continue
+            comp, stack = [], [e0]
+            seen.add(e0)
+            while stack:
+                e = stack.pop()
+                comp.append(e)
+                for v in self.E[e]:
+                    for e2 in vb[v]:
+                        if e2 not in seen:
+                            seen.add(e2)
+                            stack.append(e2)
+            loops.append(comp)
+        b = len(loops)
+        genus = (2 - b - chi) // 2
+        bverts = set(vb)
+        return loops, genus, interior, bverts
+
+    def curvature(self, chart, cuts):
+        """Total |angle deficit| at the chart's interior vertices (radians)."""
+        _, _, interior, bverts = self.topology(chart, cuts)
+        ang = defaultdict(float)
+        for f in chart:
+            vs = self.F[f]
+            n = len(vs)
+            for k in range(n):
+                p = self.V[vs[k]]
+                a = _sub(self.V[vs[k - 1]], p)
+                b = _sub(self.V[vs[(k + 1) % n]], p)
+                la, lb = _length(a), _length(b)
+                if la < 1e-12 or lb < 1e-12:
+                    continue
+                ang[vs[k]] += math.acos(max(-1.0, min(1.0, _dot(a, b) / (la * lb))))
+        return sum(abs(TWO_PI - s) for v, s in ang.items() if v not in bverts)
+
+    # -- paths ----------------------------------------------------------------
+    def path(self, sources, targets, allowed_edges):
+        """Cheapest edge path from any source vertex to any target vertex using allowed edges."""
+        dist = {}
+        prev = {}
+        heap = []
+        for s in sources:
+            dist[s] = 0.0
+            heap.append((0.0, s))
+        heapq.heapify(heap)
+        targets = set(targets)
+        while heap:
+            d, v = heapq.heappop(heap)
+            if d > dist.get(v, float("inf")):
+                continue
+            if v in targets and v not in sources:
+                out = []
+                while v in prev:
+                    e, v = prev[v]
+                    out.append(e)
+                return out
+            for e in self.VE[v]:
+                if e not in allowed_edges:
+                    continue
+                a, b = self.E[e]
+                w = b if a == v else a
+                nd = d + self.cost[e]
+                if nd < dist.get(w, float("inf")):
+                    dist[w] = nd
+                    prev[w] = (e, v)
+                    heapq.heappush(heap, (nd, w))
+        return None
+
+    def add_mirrored(self, cuts, edges):
+        for e in edges:
+            cuts.add(e)
+            m = self.emir.get(e)
+            if m is not None:
+                cuts.add(m)
+
+    # -- steps ----------------------------------------------------------------
+    def feature_cuts(self, faces_by_type):
+        cuts = set(self.existing)
+        for typ, faces in faces_by_type.items():
+            prm = SEAM_TYPES[typ]
+            fs = set(faces)
+            sharp = {e for f in faces for e in self.FE[f]
+                     if self.angle[e] >= prm["angle"] and all(g in fs for g in self.EF[e])}
+            # keep chains of at least `chain` edges
+            vb = defaultdict(list)
+            for e in sharp:
+                for v in self.E[e]:
+                    vb[v].append(e)
+            seen = set()
+            for e0 in sharp:
+                if e0 in seen:
+                    continue
+                comp, stack = [], [e0]
+                seen.add(e0)
+                while stack:
+                    e = stack.pop()
+                    comp.append(e)
+                    for v in self.E[e]:
+                        for e2 in vb[v]:
+                            if e2 not in seen:
+                                seen.add(e2)
+                                stack.append(e2)
+                if len(comp) >= prm["chain"]:
+                    self.add_mirrored(cuts, comp)
+        return cuts
+
+    def split_plane(self, chart, cuts):
+        """Cut the chart across its main axis at the narrowest, cheapest cross-section."""
+        pts = [self.fc[f] for f in chart]
+        c = _mul(tuple(map(sum, zip(*pts))), 1.0 / len(pts))
+        # main axis by power iteration on the covariance
+        cov = [[0.0] * 3 for _ in range(3)]
+        for p in pts:
+            d = _sub(p, c)
+            for i in range(3):
+                for j in range(3):
+                    cov[i][j] += d[i] * d[j]
+        ax = (1.0, 0.7, 0.3)
+        for _ in range(30):
+            ax = _normalize(tuple(sum(cov[i][j] * ax[j] for j in range(3)) for i in range(3)))
+        proj = {f: _dot(_sub(self.fc[f], c), ax) for f in chart}
+        lo, hi = min(proj.values()), max(proj.values())
+        if hi - lo < 1e-9:
+            return None
+        fs = set(chart)
+        best = None
+        for step in range(1, 20):
+            t = lo + (hi - lo) * step / 20.0
+            side = {f: proj[f] > t for f in chart}
+            n_pos = sum(side.values())
+            if n_pos < 2 or len(chart) - n_pos < 2:
+                continue
+            cut = [e for f in chart for e in self.FE[f]
+                   if len(self.EF[e]) == 2 and e not in cuts and all(g in fs for g in self.EF[e])
+                   and side[self.EF[e][0]] != side[self.EF[e][1]]]
+            cut = list(set(cut))
+            if not cut:
+                continue
+            balance = min(n_pos, len(chart) - n_pos) / len(chart)
+            score = sum(self.cost[e] for e in cut) / (0.2 + balance)
+            if best is None or score < best[0]:
+                best = (score, cut)
+        return best[1] if best else None
+
+    def diskify(self, chart, cuts):
+        """Adds cuts until the chart is a disk. Returns True if something was cut."""
+        loops, genus, interior, bverts = self.topology(chart, cuts)
+        if len(loops) == 1 and genus == 0:
+            return False
+        if genus > 0 or len(loops) == 0:
+            if len(loops) == 0 and genus == 0:
+                # closed sphere: cut from the most hidden vertex to a far hidden vertex
+                verts = {v for f in chart for v in self.F[f]}
+                vh = {}
+                for v in verts:
+                    es = [e for e in self.VE[v] if e in interior]
+                    vh[v] = sum(self.hidden(e) for e in es) / len(es) if es else 0
+                a = max(verts, key=lambda v: vh[v])
+                far = sorted(verts, key=lambda v: -_length(_sub(self.V[v], self.V[a])))
+                cand = far[:max(3, len(far) // 4)]
+                b = max(cand, key=lambda v: vh[v])
+                p = self.path({a}, {b}, interior)
+                if p:
+                    self.add_mirrored(cuts, p)
+                    return True
+            p = self.split_plane(chart, cuts)
+            if p:
+                self.add_mirrored(cuts, p)
+                return True
+            return False
+        # several boundary loops: connect loop 0 to the nearest other loop
+        lv = []
+        for loop in loops:
+            vs = set()
+            for e in loop:
+                vs.update(self.E[e])
+            lv.append(vs)
+        best = None
+        for i in range(1, len(lv)):
+            p = self.path(lv[0], lv[i] - lv[0], interior)
+            if p is not None:
+                c = sum(self.cost[e] for e in p)
+                if best is None or c < best[0]:
+                    best = (c, p)
+        if best is None:
+            p = self.split_plane(chart, cuts)
+            if p:
+                self.add_mirrored(cuts, p)
+                return True
+            return False
+        self.add_mirrored(cuts, best[1])
+        return True
+
+    def use_probabilities(self, prob, threshold=0.4, min_chain=2):
+        """Learned per-edge seam probabilities drive the cuts and the path costs."""
+        self.prob = prob
+        self.threshold = threshold
+        self.min_chain = min_chain
+        for ei in range(len(self.E)):
+            c = self.length[ei] * (0.04 + 3.0 * (1.0 - prob[ei]) ** 2)
+            if ei in self.existing:
+                c *= 0.2
+            self.cost[ei] = c
+
+    def prob_cuts(self):
+        cand = {e for e in range(len(self.E)) if self.prob[e] >= self.threshold and len(self.EF[e]) == 2}
+        cand |= self.existing
+        vb = defaultdict(list)
+        for e in cand:
+            for v in self.E[e]:
+                vb[v].append(e)
+        cuts, seen = set(self.existing), set()
+        for e0 in cand:
+            if e0 in seen:
+                continue
+            comp, stack = [], [e0]
+            seen.add(e0)
+            while stack:
+                e = stack.pop()
+                comp.append(e)
+                for v in self.E[e]:
+                    for e2 in vb[v]:
+                        if e2 not in seen:
+                            seen.add(e2)
+                            stack.append(e2)
+            if len(comp) >= self.min_chain:
+                self.add_mirrored(cuts, comp)
+        return cuts
+
+    def run(self, types, max_iter=400):
+        """types: group -> 'HARD' / 'ORGANIC' / 'TUBE'. Returns the set of cut edge ids."""
+        faces_by_type = defaultdict(list)
+        for f, g in enumerate(self.G):
+            faces_by_type[types.get(g, "ORGANIC")].append(f)
+        ftype = {f: types.get(g, "ORGANIC") for f, g in enumerate(self.G)}
+        cuts = self.prob_cuts() if getattr(self, "prob", None) is not None else self.feature_cuts(faces_by_type)
+        for _ in range(max_iter):
+            changed = False
+            for chart in self.charts(cuts):
+                prm = SEAM_TYPES[ftype[chart[0]]]
+                if len(chart) >= prm["min_split_faces"] and self.curvature(chart, cuts) > prm["curv"]:
+                    p = self.split_plane(chart, cuts)
+                    if p:
+                        self.add_mirrored(cuts, p)
+                        changed = True
+                        break
+            if not changed:
+                break
+        for _ in range(max_iter):
+            changed = False
+            for chart in self.charts(cuts):
+                if self.diskify(chart, cuts):
+                    changed = True
+                    break
+            if not changed:
+                break
+        return cuts
+
+
+def classify_group(mesh, faces):
+    """Guess the seam type of an object from its shape: many sharp edges -> HARD, long and thin
+    -> TUBE, otherwise ORGANIC."""
+    es = {e for f in faces for e in mesh.FE[f] if len(mesh.EF[e]) == 2}
+    if not es:
+        return "ORGANIC"
+    sharp = sum(1 for e in es if mesh.angle[e] >= 45) / len(es)
+    quads = sum(1 for f in faces if len(mesh.F[f]) == 4) / len(faces)
+    if quads >= 0.95 and len(faces) >= 24:
+        return "TUBE"      # a clean quad tube (rope, cable, strap loop)
+    if sharp >= 0.35:
+        return "HARD"
+    return "ORGANIC"
+
+
+# ---- learned edge model ----------------------------------------------------------
+
+FEATURE_NAMES = [
+    "angle", "sharp30", "sharp45", "sharp60", "sharp90", "concave",
+    "down", "up", "back", "front", "inward", "outward",
+    "height", "side", "center", "len_rel", "quads_adj", "tris_adj", "valence",
+    "chain45", "chain60", "nb_sharp", "loop_straight",
+    "t_hard", "t_organic", "t_tube",
+]
+
+
+def edge_features(mesh, types):
+    """One feature row per edge (pure Python). types: group -> seam type."""
+    V, E = mesh.V, mesh.E
+    allv = V
+    lo = [min(p[k] for p in allv) for k in range(3)]
+    hi = [max(p[k] for p in allv) for k in range(3)]
+    up = mesh.up
+    hmin = min(_dot(p, up) for p in allv)
+    hmax = max(_dot(p, up) for p in allv)
+    xmax = max(abs(p[mesh.axis]) for p in allv) or 1.0
+    lens = sorted(mesh.length)
+    lmed = lens[len(lens) // 2] or 1.0
+    # sharp chain lengths
+    chains = {}
+    for th in (45, 60):
+        sharp = {e for e in range(len(E)) if mesh.angle[e] >= th and len(mesh.EF[e]) == 2}
+        vb = defaultdict(list)
+        for e in sharp:
+            for v in E[e]:
+                vb[v].append(e)
+        size = {}
+        seen = set()
+        for e0 in sharp:
+            if e0 in seen:
+                continue
+            comp, stack = [], [e0]
+            seen.add(e0)
+            while stack:
+                e = stack.pop()
+                comp.append(e)
+                for v in E[e]:
+                    for e2 in vb[v]:
+                        if e2 not in seen:
+                            seen.add(e2)
+                            stack.append(e2)
+            for e in comp:
+                size[e] = len(comp)
+        chains[th] = size
+    rows = []
+    for ei, (a, b) in enumerate(E):
+        fl = mesh.EF[ei]
+        ang = mesh.angle[ei]
+        n = (0.0, 0.0, 0.0)
+        for f in fl:
+            n = _add(n, mesh.fn[f])
+        n = _normalize(n)
+        concave = 0.0
+        if len(fl) == 2:
+            d = _sub(mesh.fc[fl[1]], mesh.fc[fl[0]])
+            concave = 1.0 if _dot(mesh.fn[fl[0]], d) > 1e-9 else 0.0
+        mid = _mul(_add(V[a], V[b]), 0.5)
+        cx = mid[mesh.axis]
+        side_sign = 1 if cx > 0 else -1
+        inward = max(0.0, -n[mesh.axis] * side_sign) if abs(cx) > mesh.tol * 5 else 0.0
+        outward = max(0.0, n[mesh.axis] * side_sign) if abs(cx) > mesh.tol * 5 else 0.0
+        g = mesh.G[fl[0]] if fl else None
+        t = types.get(g, "ORGANIC")
+        # does the edge continue straight into a neighbour edge (part of an edge loop)?
+        dvec = _normalize(_sub(V[b], V[a]))
+        straight = 0.0
+        for v, sgn in ((a, -1), (b, 1)):
+            for e2 in mesh.VE[v]:
+                if e2 == ei:
+                    continue
+                p, q = E[e2]
+                w = q if p == v else p
+                d2 = _normalize(_sub(V[w], V[v]))
+                straight = max(straight, _dot(d2, dvec) * sgn)
+        nb = [e2 for v in (a, b) for e2 in mesh.VE[v] if e2 != ei]
+        rows.append([
+            ang / 180.0, float(ang >= 30), float(ang >= 45), float(ang >= 60), float(ang >= 90), concave,
+            max(0.0, -_dot(n, up)), max(0.0, _dot(n, up)),
+            max(0.0, -_dot(n, mesh.front)), max(0.0, _dot(n, mesh.front)), inward, outward,
+            (_dot(mid, up) - hmin) / ((hmax - hmin) or 1.0), abs(cx) / xmax,
+            float(a in mesh.on_center and b in mesh.on_center),
+            mesh.length[ei] / lmed,
+            float(sum(1 for f in fl if len(mesh.F[f]) == 4)), float(sum(1 for f in fl if len(mesh.F[f]) == 3)),
+            (len(mesh.VE[a]) + len(mesh.VE[b])) / 2.0,
+            min(chains[45].get(ei, 0), 40) / 40.0, min(chains[60].get(ei, 0), 40) / 40.0,
+            sum(1 for e2 in nb if mesh.angle[e2] >= 45) / max(1, len(nb)),
+            straight,
+            float(t == "HARD"), float(t == "ORGANIC"), float(t == "TUBE"),
+        ])
+    return rows
+
+
+# Trained on 3 characters (Commoner, Monk, Guard with helmet / sword / sheath / strap / rope);
+# leave-one-character-out edge F1 about 0.64 against the artist's own seams.
+SEAM_MODEL_BLOB = (
+    "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"
+    "nmrSpDCD2TFbIpsOV2CDTFW0d1xECmWroFihvMuyt4LRLt0g7lApZlVk5dXuKkIZy2qiEudd+gkVsXZs4cPYFQqOlHnpBoeT"
+    "YwSqu0CWKF2C2q9M5uS230YKuVXcT+XsPqS78mm12sPm4wu7rCyHvTjbBisb+LvKlWjvBVBqo0YT+OgdznvzaoBmy0kfRoei"
+    "u9/TiFGbos+MK04BlJxkSWwgYEslG4KZjOLACJ+y1hUNwcxXKmteNPCjl1LjjwO/TCfVMrFj4GJcOkH5ZaK9cRQbKJvSVNZU"
+    "YkNn2rWT1VCZDw14ldPo8Pimhx/wlFZBl1kqgcYzWFBXIm8AmYJ8g0crWope6IDqD/Jh8TrNIrzzySPGL/9BjO+OMX44FNfx"
+    "ZDRERC+1c/kQ4x+0xVVph9/ErDFt3TUiVYLdIb674i+UQpIJZC6hTMKpjLxbqiuztQVeAfUUW8PLlCKidVg6MBkBYLs0Dm+9"
+    "pmWzH41Kh9xIB0+Jjpx4NynaHXhshReJslX1tLt9C1Y1WjvT8P2Uy6URQHX7VZTyldb5BDArHGbuCkSJMx8RBBsxzitoHMtT"
+    "bs3pULcpG2ZB8uEOKKufU0xYas1lpgC1DJbDlEzFt61VUplOLrehi8GaX3BLthgn0oLUdrX5muM2qdmh2VFJymVgsQXyusxl"
+    "rVUMSeqafaiqBvfhAhy5wT/iTqAozvT/xUqSMag3WFYScIxD1TZlT3OirMNFeOaD1CcdtEDkIPUadUzTcU6SG2wZP7EI09pY"
+    "K80FNFsNjHmjitK7TwwBXrXjAzuaynuUyqGspYJXswrUy+55CBmOW9Es+KjwRWzGdofRLdRDj2wwb6zFAW8CcCs8n5MBUc0f"
+    "KjfXJpw33RITERqQ5VDkHKmmKgcYTsyooc2tyGIGzkZF61mPuA6UOFBH3BDcyIOH2ZEU04LNO62BhR1IizB6OR/4q+HEX00p"
+    "HfirKPrzvmOlu9NJBojCV0xw56+iXCFC2fi1HPiAwKAWGU/fpYY9plAi1dSBPx1CJYbzuqcUSjiIlXPFAoh5a+fmoV7h383q"
+    "wzGp96ekngpx4KV95Dm9Tg5kV1yHZzaud5LyQV7caf9o5rJ1yGsOM9xFpaSoSgDipRKOHFTsLB1t2NR38H7UqqkpVxAr984M"
+    "1dhyRreqXqMZ8IVNh+ya0pHnMa8eSerDVLAp7CEQdReOFMeh74QFConxd7KCHkf9ZTiXdJYRU5/Es2BEV5S+BkMTV6sASgrZ"
+    "WBpE3p7H5IgbWqNS9cDVdKjEP719+OfPn77/+e3zHx9++suHT1/+9vfPH94+/PHbp2//CO76U0zXn/L6u6Z/+uXrl18+/Zv+"
+    "i1+//vsX/Mef/8D/99dPv/wL/uOfv3398h3/+fuXf//07Vf84euf3+effvv8+99+08/++P1X/de/fP7y/fM3/OHvn7/8/O3z"
+    "3/Gn//3np1//+PnTr/8Lf/7+7ffrj//2Cf+TX/q/+e3T71/6k/U/9Sf78tef+8PpN339+o+f//j+7dP8pe8//zZ++/vPX7/9"
+    "7dOX33/pf/7+518/f8AqfP8NS/Db17//+uEn3XP9TXzp519//vrlw08fwg/4jW+ffsFD/vHDf/nvX//1X79++fzt7Yf/+fXL"
+    "v7z98D/+xDf/8N9++Me3r//4479++L//D9HI/G8="
+)
+_SEAM_MODEL = None
+
+
+def seam_model():
+    global _SEAM_MODEL
+    if _SEAM_MODEL is None:
+        import base64
+        import json
+        import zlib
+        _SEAM_MODEL = json.loads(zlib.decompress(base64.b64decode(SEAM_MODEL_BLOB)))
+    return _SEAM_MODEL
+
+
+def predict_seams(rows, model=None):
+    """Seam probability per feature row (pure Python boosted trees)."""
+    model = model or seam_model()
+    base, lr, trees = model["base"], model["lr"], model["trees"]
+    out = []
+    for r in rows:
+        s = base
+        for nodes in trees:
+            i = 0
+            node = nodes[0]
+            while node[2] != -1:
+                i = node[2] if r[node[0]] <= node[1] else node[3]
+                node = nodes[i]
+            s += lr * node[4]
+        out.append(1.0 / (1.0 + math.exp(-s)))
+    return out
+
+
+def auto_seams(verts, faces, groups, types=None, up=(0.0, 0.0, 1.0), front=(0.0, -1.0, 0.0),
+               method="LEARNED", existing=(), threshold=None):
+    """Returns (cut edges as vertex pairs, chart count, types used). types: group -> type or 'AUTO'."""
+    mesh = SeamMesh(verts, faces, groups, up=up, front=front, existing_seams=existing)
+    by_group = defaultdict(list)
+    for fi, g in enumerate(mesh.G):
+        by_group[g].append(fi)
+    used = {}
+    for g, fs in by_group.items():
+        t = (types or {}).get(g, "AUTO")
+        used[g] = classify_group(mesh, fs) if t in (None, "AUTO") else t
+    if method == "LEARNED":
+        model = seam_model()
+        prob = predict_seams(edge_features(mesh, used), model)
+        mesh.use_probabilities(prob, threshold if threshold is not None else model["threshold"], 1)
+    cuts = mesh.run(used)
+    pairs = [mesh.E[e] for e in cuts if e not in mesh.border]
+    return pairs, len(mesh.charts(cuts)), used
+
+
+# ============================================================================
 # Blender side
 # ============================================================================
 
@@ -1666,6 +2498,17 @@ if bpy is not None:
                         "(Pack, Move Islands, Single Pixel Fill and UV Vertex Pivot Transform's 90° "
                         "rotations / mirrors). Pack then packs every face of the edited objects. "
                         "Ctrl+Z undoes the texture too")
+        seam_method: EnumProperty(
+            name="Seams", items=[
+                ('LEARNED', "Learned", "Seams predicted by a model trained on hand-unwrapped characters"),
+                ('RULES', "Rules", "Crease angles per object type (hard-surface / organic / tube)")],
+            default='LEARNED')
+        keep_seams: BoolProperty(
+            name="Keep My Seams", default=False,
+            description="Keep the seams already marked (and build around them) instead of replacing them")
+        unwrap_preset: BoolProperty(
+            name="Character Density Preset", default=True,
+            description="Auto Unwrap applies the Character Density Preset (head x2, hands, legs, props)")
         island_mode: EnumProperty(
             name="Island Density", items=[
                 ('FIXED', "Fixed px/unit", "The selected islands always use this density"),
@@ -2156,6 +2999,8 @@ if bpy is not None:
         hands: FloatProperty(name="Hands", default=1.3, min=0.05, soft_max=8)
         body: FloatProperty(name="Body / Arms", default=1.0, min=0.05, soft_max=8)
         legs: FloatProperty(name="Legs / Feet", default=0.8, min=0.05, soft_max=8)
+        props: FloatProperty(name="Props", default=1.5, min=0.05, soft_max=8,
+                             description="Hard-surface objects (sword, sheath, strap...)")
         head_from: FloatProperty(name="Head Starts At", default=0.78, min=0, max=1, subtype='FACTOR',
                                  description="Height (fraction of the character) where the head starts")
         legs_to: FloatProperty(name="Legs End At", default=0.45, min=0, max=1, subtype='FACTOR',
@@ -2185,15 +3030,19 @@ if bpy is not None:
                 return {'CANCELLED'}
             z0, z1 = min(zs), max(zs)
             hx = max(xs) or 1.0
-            counts = {"head": 0, "hands": 0, "body": 0, "legs": 0}
+            counts = {"head": 0, "hands": 0, "body": 0, "legs": 0, "props": 0}
+            kinds = object_types(context)
             for o, bm, cents in data:
                 dl = bm.faces.layers.float.get(DENSITY_ATTR) or bm.faces.layers.float.new(DENSITY_ATTR)
                 sl = bm.faces.layers.float.get(SCALE_ATTR) or bm.faces.layers.float.new(SCALE_ATTR)
+                is_prop = kinds.get(o.name) == 'HARD'
                 for f, c in cents:
                     if f[dl] > 0:
                         continue
                     t = (c.z - z0) / (z1 - z0) if z1 > z0 else 0.5
-                    if t >= self.head_from:
+                    if is_prop:
+                        part = "props"
+                    elif t >= self.head_from:
                         part = "head"
                     elif t < self.legs_to:
                         part = "legs"
@@ -2204,7 +3053,8 @@ if bpy is not None:
                     f[sl] = getattr(self, part)
                     counts[part] += 1
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
-            self.report({'INFO'}, "Faces: head %(head)d, hands %(hands)d, body %(body)d, legs %(legs)d" % counts)
+            self.report({'INFO'}, "Faces: head %(head)d, hands %(hands)d, body %(body)d, legs %(legs)d, "
+                                  "props %(props)d" % counts)
             return {'FINISHED'}
 
     def is_face_selected(context, f, uvl):
@@ -2279,6 +3129,121 @@ if bpy is not None:
             self.report({'INFO'}, "%d faces -> pixel %d, %d" % (len(sel), i, j))
             return {'FINISHED'}
 
+    SEAM_TYPE_ITEMS = [
+        ('AUTO', "Auto", "Guess from the shape: many creases = hard-surface, all-quad tube = tube, "
+                         "otherwise organic"),
+        ('ORGANIC', "Organic", "Body, head, cloth: cut at part borders, open tubes on the hidden side"),
+        ('HARD', "Hard Surface", "Props (sword, strap, armour): cut along the creases"),
+        ('TUBE', "Tube", "Rope, cable, belt: one cut along the hidden side, then straightened")]
+
+    def gather_seam_mesh(context, keep):
+        """World-space vertices / faces of every edited object, one group per object."""
+        verts, faces, groups, existing, parts = [], [], [], [], []
+        for o in edit_objects(context):
+            bm = bmesh.from_edit_mesh(o.data)
+            bm.verts.index_update()
+            mw = o.matrix_world
+            base = len(verts)
+            verts.extend(tuple(mw @ v.co) for v in bm.verts)
+            for f in bm.faces:
+                if not f.hide:
+                    faces.append([base + v.index for v in f.verts])
+                    groups.append(o.name)
+            if keep:
+                existing.extend((base + e.verts[0].index, base + e.verts[1].index)
+                                for e in bm.edges if e.seam)
+            parts.append((o, bm, base))
+        return verts, faces, groups, existing, parts
+
+    def object_types(context):
+        """Seam type per edited object (its own setting, or the automatic guess)."""
+        verts, faces, groups, _, parts = gather_seam_mesh(context, False)
+        out = {}
+        if not faces:
+            return out
+        mesh = SeamMesh(verts, faces, groups)
+        by = defaultdict(list)
+        for fi, g in enumerate(groups):
+            by[g].append(fi)
+        for o, _, _ in parts:
+            t = getattr(o, "pixuv_seam_type", 'AUTO')
+            out[o.name] = classify_group(mesh, by[o.name]) if (t == 'AUTO' and by[o.name]) else t
+        return out
+
+    class UV_OT_pixel_auto_seams(bpy.types.Operator):
+        bl_idname = "uv.pixel_auto_seams"
+        bl_label = "Auto Seams"
+        bl_description = ("Mark seams on the edited objects like a hand unwrap: learned from "
+                          "hand-unwrapped characters, mirrored left / right, every island a flat piece")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            s = context.scene.pixel_uv
+            verts, faces, groups, existing, parts = gather_seam_mesh(context, s.keep_seams)
+            if not faces:
+                self.report({'WARNING'}, "No visible faces")
+                return {'CANCELLED'}
+            types = {o.name: getattr(o, "pixuv_seam_type", 'AUTO') for o, _, _ in parts}
+            pairs, n_islands, used = auto_seams(verts, faces, groups, types, method=s.seam_method,
+                                                existing=existing)
+            cut = set(pairs)
+            n = 0
+            for o, bm, base in parts:
+                for e in bm.edges:
+                    if all(f.hide for f in e.link_faces):
+                        continue
+                    a, b = base + e.verts[0].index, base + e.verts[1].index
+                    on = (min(a, b), max(a, b)) in cut
+                    if on:
+                        n += 1
+                    if on or not s.keep_seams:
+                        e.seam = on
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            kinds = ", ".join("%s: %s" % (k, v.lower()) for k, v in sorted(used.items()))
+            self.report({'INFO'}, "%d seams, %d islands (%s)" % (n, n_islands, kinds))
+            return {'FINISHED'}
+
+    class UV_OT_pixel_auto_unwrap(bpy.types.Operator):
+        bl_idname = "uv.pixel_auto_unwrap"
+        bl_label = "Auto Unwrap Character"
+        bl_description = ("Auto Seams, unwrap, Character Density Preset, then Pixel Perfect UV "
+                          "(straighten, mirror stacking, snapping, packing) on every edited object")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            s = context.scene.pixel_uv
+            if bpy.ops.uv.pixel_auto_seams() != {'FINISHED'}:
+                return {'CANCELLED'}
+            saved = []
+            for o in edit_objects(context):
+                bm = bmesh.from_edit_mesh(o.data)
+                saved.append((o, bm, [v.select for v in bm.verts], [e.select for e in bm.edges],
+                               [f.select for f in bm.faces]))
+                for f in bm.faces:
+                    if not f.hide:
+                        f.select_set(True)
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            try:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True, margin=0.0)
+                if s.unwrap_preset:
+                    bpy.ops.uv.pixel_character_density()
+                result = bpy.ops.uv.pixel_perfect(step='ALL')
+            finally:
+                for o, bm, vs, es, fs in saved:
+                    for elems, st in ((bm.verts, vs), (bm.edges, es), (bm.faces, fs)):
+                        for e, v in zip(elems, st):
+                            e.select = v
+                    bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            return {'FINISHED'} if result == {'FINISHED'} else {'CANCELLED'}
+
     def active_face_density(context):
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
@@ -2298,6 +3263,20 @@ if bpy is not None:
     def draw_panel(layout, context):
         s = context.scene.pixel_uv
         W, H, img = texture_size(context, s)
+
+        box = layout.box()
+        box.label(text="Auto Unwrap", icon='MOD_UVPROJECT')
+        col = box.column()
+        col.scale_y = 1.4
+        col.operator("uv.pixel_auto_unwrap", icon='OUTLINER_OB_ARMATURE')
+        row = box.row(align=True)
+        row.prop(s, "seam_method", expand=True)
+        box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
+        box.prop(s, "keep_seams")
+        box.prop(s, "unwrap_preset")
+        obj = context.edit_object
+        if obj is not None:
+            box.prop(obj, "pixuv_seam_type", text=obj.name[:18])
 
         box = layout.box()
         box.label(text="Texture", icon='IMAGE_DATA')
@@ -2409,6 +3388,8 @@ if bpy is not None:
         UV_OT_pixel_move,
         UV_OT_pixel_character_density,
         UV_OT_pixel_fill,
+        UV_OT_pixel_auto_seams,
+        UV_OT_pixel_auto_unwrap,
         IMAGE_PT_pixel_perfect_uv,
         VIEW3D_PT_pixel_perfect_uv,
     )
@@ -2432,6 +3413,9 @@ if bpy is not None:
             kmi = km.keymap_items.new(UV_OT_pixel_move.bl_idname, 'G', 'PRESS', alt=True)
             addon_keymaps.append((km, kmi))
         bpy.types.Scene.pixel_uv = PointerProperty(type=PixelUVSettings)
+        bpy.types.Object.pixuv_seam_type = EnumProperty(
+            name="Seam Type", items=SEAM_TYPE_ITEMS, default='AUTO',
+            description="How Auto Seams cuts this object")
         bpy.types.IMAGE_MT_uvs.append(menu_func)
         bpy.types.VIEW3D_MT_uv_map.append(menu_func)
 
@@ -2446,6 +3430,7 @@ if bpy is not None:
         addon_keymaps.clear()
         bpy.types.VIEW3D_MT_uv_map.remove(menu_func)
         bpy.types.IMAGE_MT_uvs.remove(menu_func)
+        del bpy.types.Object.pixuv_seam_type
         del bpy.types.Scene.pixel_uv
         for c in reversed(classes):
             bpy.utils.unregister_class(c)
