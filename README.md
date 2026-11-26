@@ -34,6 +34,7 @@ Rotates, mirrors and scales the UV selection using the closest vertex below the 
 - CTRL+R = Rotate around the nearest vertex
 - CTRL+X = Mirror around the nearest vertex (X again switches to Y axis, again turns mirror off)
 - < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps in whole texture pixels, or 0.1 steps without a texture)
+- With Pixel Perfect UV's Preserve Texture on, 90º rotations and mirrors carry the painted pixels along (and Ctrl+Z undoes them)
 - Enter & LMB = Accept
 - Esc & RMB = Cancel
 
@@ -62,6 +63,7 @@ Lays UV islands out on the texture's pixel grid for low poly / pixel art charact
 - Pack: whole-pixel packing with pixel padding, optional 90º rotation. Stacked / mirrored islands that share pixels stay together
 - Preserve Texture (Pack button): the painted pixels move with their islands, so you can repack after painting. Packs every face of the edited objects
 - Resize Texture: Canvas (more / less room, the painting stays where it is; choose the anchor, e.g. Top keeps the painting at the top and adds the space below) or Upscale (every pixel becomes N x N for finer painting)
-- ALT+G (UV Editor) = Move Islands: moves the selected islands in whole pixels and the painted pixels follow live (needs Preserve Texture on). Mouse / Arrows (Shift = 8 px) move, R / Shift+R turn 90º, X / Y lock an axis, Enter & LMB accept, Esc & RMB cancel. The header warns when it overlaps another island or leaves the texture
-- Restore Texture: Ctrl+Z only undoes the UVs, this puts the image back as it was before the last Preserve pack, move or resize. Remember to save the image
+- ALT+G (UV Editor) = Move Islands: moves the selected islands in whole pixels and the painted pixels follow live (needs Preserve Texture on), together with a margin as wide as Padding. Mouse / Arrows (Shift = 8 px) move, R / Shift+R turn 90º, X / Y lock an axis, Enter & LMB accept, Esc & RMB cancel. The header warns when it overlaps another island or leaves the texture
+- Ctrl+Z / Ctrl+Shift+Z undo and redo the texture changes too (Pack, Move, Fill, Resize, Pivot Rotate / Mirror). Restore Texture is still there as a manual fallback. Remember to save the image
+- With UV Vertex Pivot Transform installed: its Ctrl+R (at 90º steps, e.g. holding Alt) and Ctrl+X carry the painted pixels too while Preserve Texture is on; the pivot snaps to the nearest pixel corner / centre so the pixels map exactly
 - Texture size comes from the image in the UV Editor (or the material's image texture), or a custom size

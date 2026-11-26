@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
@@ -10,6 +10,7 @@ bl_info = {
 }
 
 import math
+import sys
 
 import bpy
 import bmesh
@@ -168,6 +169,29 @@ def _mirror_uvs(objs, pivot, axis):
     _update_meshes(objs)
 
 
+def _texture_api():
+    """Pixel Perfect UV's texture session, when that add-on is enabled (optional)."""
+    for mod in list(sys.modules.values()):
+        api = getattr(mod, "PIXEL_UV_TEXTURE_API", None)
+        if api is not None and getattr(api, "version", 0) >= 1:
+            return api
+    return None
+
+
+def _texture_session(context, kind):
+    """Starts a session that moves the painted pixels along (Preserve Texture on), or None."""
+    if kind is None:
+        return None
+    api = _texture_api()
+    if api is None:
+        return None
+    try:
+        return api.start(context)
+    except Exception as exc:  # never block the transform because of the texture
+        print("UV Vertex Pivot Transform: texture session failed:", exc)
+        return None
+
+
 def _point_shader():
     # POINT_UNIFORM_COLOR draws sized points on every GPU backend (Metal/Vulkan too).
     try:
@@ -213,6 +237,20 @@ class _PivotTransform:
             for luv, u0, v0 in items:
                 luv.uv = (u0, v0)
         _update_meshes(self.objs)
+        if getattr(self, "tex", None) is not None:
+            self.tex.cancel()
+
+    tex_kind = None  # 'ROTATE' / 'MIRROR' when the texture can follow this transform
+
+    def tex_matrix(self, context):
+        """Pixel-space matrix of the current transform, or None if the texture can't follow."""
+        return None
+
+    def tex_update(self, context):
+        if getattr(self, "tex", None) is None:
+            return ""
+        ok = self.tex.update(self.tex_matrix(context), self.pivot)
+        return "   |  texture follows" if ok else "   |  texture follows at 90° steps"
 
     # -- redo / repeat (Adjust Last Operation panel, Shift+R) ---------------
 
@@ -221,7 +259,11 @@ class _PivotTransform:
         if not objs:
             self.report({'WARNING'}, "No UVs selected (or no active UV map)")
             return {'CANCELLED'}
+        tex = _texture_session(context, self.tex_kind)
         self.apply_props(context, objs)
+        if tex is not None:
+            tex.update(self.tex_matrix(context), self.pivot)
+            tex.finish()
         return {'FINISHED'}
 
     # -- lifecycle ----------------------------------------------------------
@@ -244,6 +286,10 @@ class _PivotTransform:
         self.alt = event.alt
         self._applied = None
         self._resync = False
+        self.tex = _texture_session(context, self.tex_kind)
+        if self.tex is not None:
+            # the texture can only follow around a pixel corner / centre
+            self.pivot = self.tex.snap_pivot(self.pivot, self.tex_kind)
 
         try:
             self.setup(context, event)
@@ -301,6 +347,8 @@ class _PivotTransform:
             self._end(context)
             self.store_props(context)
             _update_meshes(self.objs)
+            if getattr(self, "tex", None) is not None:
+                self.tex.finish()
             return {'FINISHED'}
 
         if et == 'ESC' and event.value == 'PRESS':
@@ -387,9 +435,24 @@ class UV_OT_vertex_pivot_rotate(_PivotTransform, bpy.types.Operator):
     angle: FloatProperty(name="Angle", subtype='ANGLE', default=0.0)
     pivot: FloatVectorProperty(name="Pivot", size=2, default=(0.0, 0.0))
 
+    tex_kind = 'ROTATE'
+
     @staticmethod
     def _sign():
         return -1.0 if _pref("angle_direction", 'CW') == 'CW' else 1.0
+
+    def tex_matrix(self, context):
+        api = _texture_api()
+        if api is None:
+            return None
+        if getattr(self, "_applied", None) is not None and hasattr(self, "sign"):
+            ccw = self._applied * self.sign        # modal
+        else:
+            ccw = self.angle * self._sign()        # redo panel
+        q = ccw / (math.pi / 2.0)
+        if abs(q - round(q)) > 1e-6:
+            return None
+        return api.ROTATIONS[int(round(q)) % 4]
 
     def setup(self, context, event):
         self.raw = 0.0                  # accumulated mouse angle (displayed convention)
@@ -401,7 +464,8 @@ class UV_OT_vertex_pivot_rotate(_PivotTransform, bpy.types.Operator):
         px, py = self._pivot_region()
         self.prev_vec = (self.mouse[0] - px, self.mouse[1] - py)
         self.status_text = ("Rotate  |  Mouse / type value: angle  |  Ctrl: snap  |  "
-                            "Alt: snap 90°  |  Shift: precision  |  LMB/Enter: confirm  |  Esc/RMB: cancel")
+                            "Alt: snap 90° (the texture follows with Pixel Perfect UV's Preserve Texture)  |  "
+                            "Shift: precision  |  LMB/Enter: confirm  |  Esc/RMB: cancel")
 
     # -- mouse -> angle (incremental, wraps past 180° like Blender) ---------
 
@@ -496,6 +560,7 @@ class UV_OT_vertex_pivot_rotate(_PivotTransform, bpy.types.Operator):
             text = f"Rotate: {math.degrees(value):.2f}°"
         if inc is not None:
             text += f"   (snap {math.degrees(inc):g}°)"
+        text += self.tex_update(context)
         self.area.header_text_set(text)
         self.area.tag_redraw()
 
@@ -531,6 +596,15 @@ class UV_OT_vertex_pivot_mirror(_PivotTransform, bpy.types.Operator):
     )
     pivot: FloatVectorProperty(name="Pivot", size=2, default=(0.0, 0.0))
 
+    tex_kind = 'MIRROR'
+
+    def tex_matrix(self, context):
+        api = _texture_api()
+        if api is None:
+            return None
+        axis = getattr(self, "cur_axis", None) or self.axis   # modal / redo panel
+        return {'X': api.MIRROR_X, 'Y': api.MIRROR_Y}.get(axis, api.ROTATIONS[0])
+
     def setup(self, context, event):
         self.cur_axis = 'X'
         self.status_text = ("Mirror  |  X: cycle axis (X > Y > off)  |  Y: Y axis  |  "
@@ -553,7 +627,7 @@ class UV_OT_vertex_pivot_mirror(_PivotTransform, bpy.types.Operator):
             _mirror_uvs(self.objs, self.pivot, self.cur_axis)
             self._applied = self.cur_axis
         label = {'X': "X axis", 'Y': "Y axis", 'NONE': "off"}[self.cur_axis]
-        self.area.header_text_set(f"Mirror: {label}")
+        self.area.header_text_set(f"Mirror: {label}" + self.tex_update(context))
         self.area.tag_redraw()
 
     def store_props(self, context):

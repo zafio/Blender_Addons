@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -41,6 +41,7 @@ DENSITY_ATTR = "pixuv_density"   # face float: fixed px/unit for the island (0 =
 SCALE_ATTR = "pixuv_scale"       # face float: multiplier on the global density (0/1 = none)
 
 EPS = 1e-6
+PIXEL_UV_TEXTURE_API = None  # set while the add-on is enabled (see TextureSession)
 
 
 # ============================================================================
@@ -1049,7 +1050,7 @@ def run_pack_only(islands, W, H, opt, keep_overlaps=True):
     return None, moves, masks
 
 
-def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0)):
+def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0), radius=1):
     """src: H x W x 4 array (numpy, row 0 = bottom). Returns a new array where each island's
     pixels (plus a 1 px bleed ring that no other island claims) follow its PackMove.
     Pixels not under any island are cleared."""
@@ -1060,26 +1061,37 @@ def move_pixels(src, W, H, moves, masks, clear=(0.0, 0.0, 0.0, 0.0)):
     for k, m in enumerate(masks):
         for c in m:
             claimed.setdefault(c, set()).add(k)
+    plan = []
     for mv in moves:
         members = set(mv.members)
         cells = set()
         for k in mv.members:
             cells |= masks[k]
         ring = set()
+        r = max(0, int(radius))
         for i, j in cells:
-            for di in (-1, 0, 1):
-                for dj in (-1, 0, 1):
+            for di in range(-r, r + 1):
+                for dj in range(-r, r + 1):
                     c = (i + di, j + dj)
-                    if c in cells or not (mv.mx <= c[0] < mv.mx + mv.w and mv.my <= c[1] < mv.my + mv.h):
+                    if c in cells or not (mv.mx - r <= c[0] < mv.mx + mv.w + r and
+                                          mv.my - r <= c[1] < mv.my + mv.h + r):
                         continue
                     if claimed.get(c, members) <= members:
                         ring.add(c)
-        for i, j in cells | ring:
-            if not (0 <= i < W and 0 <= j < H):
-                continue
-            ni, nj = mv.cell(i, j)
-            if 0 <= ni < W and 0 <= nj < H:
-                dst[nj, ni] = src[j, i]
+        plan.append((mv, cells, ring))
+    # bleed rings first, then every island's own pixels on top (rings never cover islands)
+    for mv, cells, ring in plan:
+        for i, j in ring:
+            if 0 <= i < W and 0 <= j < H:
+                ni, nj = mv.cell(i, j)
+                if 0 <= ni < W and 0 <= nj < H:
+                    dst[nj, ni] = src[j, i]
+    for mv, cells, ring in plan:
+        for i, j in cells:
+            if 0 <= i < W and 0 <= j < H:
+                ni, nj = mv.cell(i, j)
+                if 0 <= ni < W and 0 <= nj < H:
+                    dst[nj, ni] = src[j, i]
     return dst
 
 
@@ -1107,9 +1119,10 @@ class BlockMove:
         return a + self.ox, b + self.oy
 
 
-def lifted_cells(moving, masks, box):
-    """Pixels that travel with the moving islands: their own pixels plus a 1 px bleed ring that
-    no other island claims, inside the block."""
+def lifted_cells(moving, masks, box, radius=1):
+    """Pixels that travel with the moving islands: their own pixels plus a ring of `radius` px
+    (the padding / bleed area) that no other island claims. Returns (cells, others): `others`
+    are pixels used by islands that stay, which are copied but never cleared."""
     mx, my, w, h = box
     cells = set()
     for k in moving:
@@ -1118,21 +1131,24 @@ def lifted_cells(moving, masks, box):
     for k, m in enumerate(masks):
         if k not in moving:
             others |= m
+    r = max(0, int(radius))
     ring = set()
     for i, j in cells:
-        for di in (-1, 0, 1):
-            for dj in (-1, 0, 1):
+        for di in range(-r, r + 1):
+            for dj in range(-r, r + 1):
                 c = (i + di, j + dj)
-                if c not in cells and c not in others and mx <= c[0] < mx + w and my <= c[1] < my + h:
+                if (c not in cells and c not in others and mx - r <= c[0] < mx + w + r
+                        and my - r <= c[1] < my + h + r):
                     ring.add(c)
     return cells | ring, others
 
 
-def block_move_pixels(src, W, H, mv, cells, clear=(0.0, 0.0, 0.0, 0.0)):
-    """Copy of src with `cells` lifted (cleared) and pasted through the BlockMove."""
+def block_move_pixels(src, W, H, mv, cells, clear=(0.0, 0.0, 0.0, 0.0), keep=frozenset()):
+    """Copy of src with `cells` lifted (cleared, except those in `keep`) and pasted through mv
+    (anything with a .cell(i, j) method)."""
     dst = src.copy()
     for i, j in cells:
-        if 0 <= i < W and 0 <= j < H:
+        if (i, j) not in keep and 0 <= i < W and 0 <= j < H:
             dst[j, i] = clear
     for i, j in cells:
         if 0 <= i < W and 0 <= j < H:
@@ -1140,6 +1156,49 @@ def block_move_pixels(src, W, H, mv, cells, clear=(0.0, 0.0, 0.0, 0.0)):
             if 0 <= ni < W and 0 <= nj < H:
                 dst[nj, ni] = src[j, i]
     return dst
+
+
+# ---- 90 degree rotations / mirrors around a pivot ---------------------------
+
+ROTATIONS = {0: (1, 0, 0, 1), 1: (0, -1, 1, 0), 2: (-1, 0, 0, -1), 3: (0, 1, -1, 0)}
+MIRROR_X = (-1, 0, 0, 1)   # flips U (mirror line is vertical)
+MIRROR_Y = (1, 0, 0, -1)   # flips V
+
+
+def snap_pivot(p, kind):
+    """Nearest pivot (px) about which the transform maps whole pixels onto whole pixels:
+    rotations need a pixel corner or a pixel centre, mirrors a corner / centre line."""
+    x, y = p
+    if kind == "MIRROR":
+        return round(x * 2) / 2, round(y * 2) / 2
+    if kind == "MIRROR_X":
+        return round(x * 2) / 2, y
+    if kind == "MIRROR_Y":
+        return x, round(y * 2) / 2
+    a = (round(x), round(y))
+    b = (math.floor(x) + 0.5, math.floor(y) + 0.5)
+    return a if (a[0] - x) ** 2 + (a[1] - y) ** 2 <= (b[0] - x) ** 2 + (b[1] - y) ** 2 else b
+
+
+class PivotMove:
+    """x' = A (x - P) + P for a signed-permutation matrix A (90 degree turns, mirrors)."""
+
+    def __init__(self, A, P):
+        self.A, self.P = A, P
+
+    def uv(self, x, y):
+        a, b, c, d = self.A
+        dx, dy = x - self.P[0], y - self.P[1]
+        return a * dx + b * dy + self.P[0], c * dx + d * dy + self.P[1]
+
+    def cell(self, i, j):
+        x, y = self.uv(i + 0.5, j + 0.5)
+        return int(math.floor(x)), int(math.floor(y))
+
+    def exact(self):
+        """True when pixel centres land on pixel centres (otherwise the texture can't follow)."""
+        x, y = self.uv(0.5, 0.5)
+        return abs((x % 1) - 0.5) < 1e-6 and abs((y % 1) - 0.5) < 1e-6
 
 
 def canvas_offset(W, H, nw, nh, anchor_x, anchor_y):
@@ -1344,6 +1403,180 @@ if bpy is not None:
             pass
         return b
 
+    # ---- texture undo -------------------------------------------------------
+    # Ctrl+Z only restores mesh data in Edit Mode, never image pixels. Every texture change
+    # stamps a random revision into a hidden face attribute (part of the mesh undo) and keeps
+    # the pixels before / after; the undo / redo handlers compare the stamps and swap the image.
+    REV_ATTR = "pixuv_rev"
+    HISTORY = []
+    HISTORY_MAX = 24
+
+    class TexUndo:
+        __slots__ = ("img", "objs", "rev_before", "rev_after", "before", "after", "applied")
+
+    def read_revs(names):
+        out = []
+        for name in names:
+            o = bpy.data.objects.get(name)
+            v = 0
+            if o is not None and o.type == 'MESH':
+                me = o.data
+                if me.is_editmode:
+                    bm = bmesh.from_edit_mesh(me)
+                    lay = bm.faces.layers.int.get(REV_ATTR)
+                    if lay is not None and len(bm.faces):
+                        bm.faces.ensure_lookup_table()
+                        v = bm.faces[0][lay]
+                else:
+                    at = me.attributes.get(REV_ATTR)
+                    if at is not None and len(at.data):
+                        v = at.data[0].value
+            out.append(v)
+        return tuple(out)
+
+    def bump_revs(objs):
+        import random
+        for o in objs:
+            bm = bmesh.from_edit_mesh(o.data)
+            if not len(bm.faces):
+                continue
+            lay = bm.faces.layers.int.get(REV_ATTR) or bm.faces.layers.int.new(REV_ATTR)
+            bm.faces.ensure_lookup_table()
+            bm.faces[0][lay] = random.randint(1, 2 ** 31 - 1)
+            bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+
+    def push_texture_undo(img, objs, rev_before, before, after):
+        """Call at the end of an operator, after the UVs / pixels were changed."""
+        bump_revs(objs)
+        e = TexUndo()
+        e.img = img.name
+        e.objs = [o.name for o in objs]
+        e.rev_before = rev_before
+        e.rev_after = read_revs(e.objs)
+        e.before = before
+        e.after = after.copy()
+        e.applied = True
+        while HISTORY and not HISTORY[-1].applied:  # a new change drops the redo branch
+            HISTORY.pop()
+        HISTORY.append(e)
+        del HISTORY[:-HISTORY_MAX]
+
+    def _set_pixels(e, arr):
+        img = bpy.data.images.get(e.img)
+        if img is not None:
+            write_pixels(img, arr)
+
+    def _on_undo(*_args):
+        applied = [k for k, e in enumerate(HISTORY) if e.applied]
+        for k in reversed(applied):
+            if read_revs(HISTORY[k].objs) == HISTORY[k].rev_before:
+                for j in reversed(applied):   # undo everything newer, down to k
+                    if j < k:
+                        break
+                    _set_pixels(HISTORY[j], HISTORY[j].before)
+                    HISTORY[j].applied = False
+                return
+
+    def _on_redo(*_args):
+        pending = [k for k, e in enumerate(HISTORY) if not e.applied]
+        for k in reversed(pending):
+            if read_revs(HISTORY[k].objs) == HISTORY[k].rev_after:
+                for j in pending:            # redo everything older, up to k
+                    if j > k:
+                        break
+                    _set_pixels(HISTORY[j], HISTORY[j].after)
+                    HISTORY[j].applied = True
+                return
+
+    def _on_load(*_args):
+        HISTORY.clear()
+
+    def _handlers():
+        h = bpy.app.handlers
+        return ((h.undo_post, _on_undo), (h.redo_post, _on_redo), (h.load_post, _on_load))
+
+    # ---- texture session (used by Move Islands and other add-ons) -----------
+
+    def loop_selected(context, f, l, uvl):
+        if f.hide:
+            return False
+        ts = context.tool_settings
+        if ts.use_uv_select_sync:
+            msm = ts.mesh_select_mode
+            return f.select if (msm[2] and not msm[0]) else l.vert.select
+        return f.select and l[uvl].select
+
+    class TextureSession:
+        """Carries the painted pixels of the selected UV islands through 90 degree rotations /
+        mirrors around a pivot. Other add-ons (UV Vertex Pivot Transform) get one with
+        PIXEL_UV_TEXTURE_API.start(context): call update(), then finish() or cancel()."""
+
+        @classmethod
+        def start(cls, context):
+            s = context.scene.pixel_uv
+            if not s.preserve_texture:
+                return None
+            img = find_image(context)
+            if img is None:
+                return None
+            self = cls()
+            self.img = img
+            W, H = int(img.size[0]), int(img.size[1])
+            self.W, self.H = W, H
+            self.objs, recs = collect(context, W, H, all_faces=True)
+            islands = find_islands(recs)
+            moving = set()
+            for k, isl in enumerate(islands):
+                for fid in isl.face_ids:
+                    uvl, loops, _ = recs[fid].ref
+                    if any(loop_selected(context, loops[0].face, l, uvl) for l in loops):
+                        moving.add(k)
+                        break
+            if not moving:
+                return None
+            masks = [pixel_mask(isl, isl.uv, W, H) for isl in islands]
+            pts = [p for k in moving for p in islands[k].uv]
+            mx, my = math.floor(min(p[0] for p in pts)), math.floor(min(p[1] for p in pts))
+            box = (mx, my, math.ceil(max(p[0] for p in pts)) - mx, math.ceil(max(p[1] for p in pts)) - my)
+            self.cells, self.others = lifted_cells(moving, masks, box, radius=max(1, s.padding))
+            self.src = read_pixels(img)
+            self.rev_before = read_revs([o.name for o in self.objs])
+            self.state = None
+            self.cur = None
+            return self
+
+        def snap_pivot(self, uv, kind):
+            """kind: 'ROTATE', 'MIRROR', 'MIRROR_X' or 'MIRROR_Y'. Returns the pivot in UV space."""
+            x, y = snap_pivot((uv[0] * self.W, uv[1] * self.H), kind)
+            return x / self.W, y / self.H
+
+        def update(self, A, pivot_uv):
+            """A: 2x2 matrix as (a, b, c, d) in pixel space, or None for 'can't follow'."""
+            key = (A, tuple(pivot_uv)) if A is not None else None
+            if key == self.cur:
+                return self.state is not None
+            self.cur = key
+            mv = PivotMove(A, (pivot_uv[0] * self.W, pivot_uv[1] * self.H)) if A is not None else None
+            if mv is None or not mv.exact() or A == ROTATIONS[0]:
+                write_pixels(self.img, self.src)
+                self.state = None
+                return mv is not None and A == ROTATIONS[0]
+            self.dst = block_move_pixels(self.src, self.W, self.H, mv, self.cells, keep=self.others)
+            write_pixels(self.img, self.dst)
+            self.state = A
+            return True
+
+        def finish(self):
+            if self.state is None:
+                return False
+            backup_image(self.img, self.src)
+            push_texture_undo(self.img, self.objs, self.rev_before, self.src, self.dst)
+            return True
+
+        def cancel(self):
+            write_pixels(self.img, self.src)
+            self.state = None
+
     def image_users(img, exclude_meshes):
         """Other mesh objects (not being edited) whose materials use img."""
         names = []
@@ -1406,9 +1639,10 @@ if bpy is not None:
                         "pixels (the +X side is laid out, the -X side is stacked on it, flipped)")
         preserve_texture: BoolProperty(
             name="Preserve Texture", default=True,
-            description="Pack only: move the painted pixels with their islands so the model looks the "
-                        "same. Packs every face of the edited objects. Ctrl+Z only undoes the UVs: use "
-                        "Restore Texture after it to get the old pixels back")
+            description="Move the painted pixels with their islands so the model looks the same "
+                        "(Pack, Move Islands, Single Pixel Fill and UV Vertex Pivot Transform's 90° "
+                        "rotations / mirrors). Pack then packs every face of the edited objects. "
+                        "Ctrl+Z undoes the texture too")
         island_mode: EnumProperty(
             name="Island Density", items=[
                 ('FIXED', "Fixed px/unit", "The selected islands always use this density"),
@@ -1450,6 +1684,7 @@ if bpy is not None:
             if self.step in ('ALL', 'STRAIGHTEN') and s.straighten:
                 mixed = straighten_mixed(context, W, H, opt)
             objs, recs = collect(context, W, H, mixed, all_faces=img is not None)
+            rev_before = read_revs([o.name for o in objs]) if img is not None else None
             if not recs:
                 self.report({'WARNING'}, "No faces")
                 return {'CANCELLED'}
@@ -1475,7 +1710,8 @@ if bpy is not None:
                 if img is not None:
                     src = read_pixels(img)
                     backup_image(img, src)
-                    write_pixels(img, move_pixels(src, W, H, moves, masks))
+                    packed_px = move_pixels(src, W, H, moves, masks, radius=max(1, s.padding))
+                    write_pixels(img, packed_px)
                     msg += ", texture preserved (save the image!)"
                     others = image_users(img, {o.data for o in objs})
                     if others:
@@ -1496,6 +1732,8 @@ if bpy is not None:
                     s.density = round(st["density"], 3)
 
             write_back(objs, recs, islands, W, H)
+            if self.step == 'PACK' and img is not None:
+                push_texture_undo(img, objs, rev_before, src, packed_px)
             n_mixed = sum(1 for i in islands if i.keep_rot)
             if n_mixed:
                 msg += " (%d with triangles / n-gons)" % n_mixed
@@ -1658,7 +1896,6 @@ if bpy is not None:
                 col.row(align=True).prop(self, "anchor_x", expand=True)
             else:
                 col.prop(self, "factor")
-            col.label(text="Ctrl+Z won't undo the image: Restore Texture will", icon='INFO')
 
         def execute(self, context):
             import numpy as np
@@ -1670,6 +1907,7 @@ if bpy is not None:
             src = read_pixels(img)
             backup_image(img, src)
             objs = edit_objects(context)
+            rev_before = read_revs([o.name for o in objs])
             s = context.scene.pixel_uv
             if self.mode == 'UPSCALE':
                 f = self.factor
@@ -1686,14 +1924,15 @@ if bpy is not None:
                     msg += " (cropped: check for islands outside the texture)"
             if s.tex_source == 'CUSTOM':
                 s.tex_width, s.tex_height = int(img.size[0]), int(img.size[1])
+            push_texture_undo(img, objs, rev_before, src, read_pixels(img))
             self.report({'INFO'}, msg + ". Save the image!")
             return {'FINISHED'}
 
     class UV_OT_pixel_restore_texture(bpy.types.Operator):
         bl_idname = "uv.pixel_restore_texture"
         bl_label = "Restore Texture"
-        bl_description = ("Put back the pixels from before the last Preserve Texture pack or resize. "
-                          "Use it together with Ctrl+Z (which only undoes the UVs)")
+        bl_description = ("Put back the pixels from before the last texture change (normally Ctrl+Z "
+                          "already does it)")
         bl_options = {'REGISTER', 'UNDO'}
 
         @classmethod
@@ -1704,7 +1943,12 @@ if bpy is not None:
         def execute(self, context):
             img = find_image(context)
             b = bpy.data.images.get(img.name + BACKUP_SUFFIX)
-            write_pixels(img, read_pixels(b))
+            objs = edit_objects(context)
+            rev_before = read_revs([o.name for o in objs])
+            cur = read_pixels(img)
+            restored = read_pixels(b)
+            write_pixels(img, restored)
+            push_texture_undo(img, objs, rev_before, cur, restored)
             self.report({'INFO'}, "Texture restored (%d x %d)" % tuple(b.size))
             return {'FINISHED'}
 
@@ -1774,8 +2018,13 @@ if bpy is not None:
                     for l in loops:
                         uv = l[uvl].uv
                         self.corners.append((uvl, l, uv.x * W, uv.y * H))
-            self.cells, self.others = lifted_cells(moving, masks, self.box) if self.img else (set(), set())
+            if self.img:
+                self.cells, self.others = lifted_cells(moving, masks, self.box, radius=max(1, s.padding))
+            else:
+                self.cells, self.others = set(), set()
             self.src = read_pixels(self.img) if self.img else None
+            self.rev_before = read_revs([o.name for o in self.objs])
+            self.dst = None
             self.region = context.region
             self.area = context.area
             self.start = self.mouse_uv(event)
@@ -1818,9 +2067,10 @@ if bpy is not None:
             if self.axis:
                 text += "   [%s axis]" % self.axis
             if self.img is not None:
-                write_pixels(self.img, block_move_pixels(self.src, W, H, mv, self.cells))
+                self.dst = block_move_pixels(self.src, W, H, mv, self.cells, keep=self.others)
+                write_pixels(self.img, self.dst)
                 dest = {mv.cell(i, j) for i, j in self.cells}
-                if dest & self.others:
+                if dest & (self.others - self.cells):
                     text += "   OVERLAPS another island"
                 if any(not (0 <= c[0] < W and 0 <= c[1] < H) for c in dest):
                     text += "   OUTSIDE the texture (pixels lost)"
@@ -1852,8 +2102,9 @@ if bpy is not None:
             elif et in ('X', 'Y'):
                 self.axis = None if self.axis == et else et
             elif et in ('LEFTMOUSE', 'RET', 'NUMPAD_ENTER', 'SPACE'):
-                if self.img is not None and self.last != (0, 0, 0):
+                if self.img is not None and self.last != (0, 0, 0) and self.dst is not None:
                     backup_image(self.img, self.src)
+                    push_texture_undo(self.img, self.objs, self.rev_before, self.src, self.dst)
                 self.finish(context)
                 return {'FINISHED'}
             elif et in ('RIGHTMOUSE', 'ESC'):
@@ -1976,6 +2227,8 @@ if bpy is not None:
                 self.report({'ERROR'}, "No free pixel left (with a 1 px margin)")
                 return {'CANCELLED'}
             i, j = target
+            rev_before = read_revs([o.name for o in objs])
+            dst = None
             if img is not None:
                 src = read_pixels(img)
                 cells = set()
@@ -1997,6 +2250,8 @@ if bpy is not None:
                     l[uvl].uv = (u, v)
             for o in objs:
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            if dst is not None:
+                push_texture_undo(img, objs, rev_before, src, dst)
             del bms
             self.report({'INFO'}, "%d faces -> pixel %d, %d" % (len(sel), i, j))
             return {'FINISHED'}
@@ -2075,7 +2330,7 @@ if bpy is not None:
         box.prop(s, "stack_mirrored")
         box.prop(s, "preserve_texture")
         if s.preserve_texture:
-            box.label(text="Used by Pack and Move Islands", icon='INFO')
+            box.label(text="Pack, Move, Fill, Pivot Rotate / Mirror", icon='INFO')
         if context.space_data and context.space_data.type == 'IMAGE_EDITOR':
             box.operator("uv.pixel_move", text="Move Islands (Alt+G)", icon='VIEW_PAN')
 
@@ -2138,8 +2393,16 @@ if bpy is not None:
     addon_keymaps = []
 
     def register():
+        global PIXEL_UV_TEXTURE_API
         for c in classes:
             bpy.utils.register_class(c)
+        for lst, fn in _handlers():
+            if fn not in lst:
+                lst.append(fn)
+        import types as _types
+        PIXEL_UV_TEXTURE_API = _types.SimpleNamespace(
+            version=1, start=TextureSession.start, ROTATIONS=ROTATIONS,
+            MIRROR_X=MIRROR_X, MIRROR_Y=MIRROR_Y)
         kc = bpy.context.window_manager.keyconfigs.addon
         if kc:
             km = kc.keymaps.new(name="UV Editor", space_type='EMPTY')
@@ -2150,6 +2413,11 @@ if bpy is not None:
         bpy.types.VIEW3D_MT_uv_map.append(menu_func)
 
     def unregister():
+        global PIXEL_UV_TEXTURE_API
+        PIXEL_UV_TEXTURE_API = None
+        for lst, fn in _handlers():
+            if fn in lst:
+                lst.remove(fn)
         for km, kmi in addon_keymaps:
             km.keymap_items.remove(kmi)
         addon_keymaps.clear()
