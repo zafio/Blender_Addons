@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2064,6 +2064,23 @@ def auto_seams(verts, faces, groups, types=None, up=(0.0, 0.0, 1.0), front=(0.0,
 
 if bpy is not None:
 
+    # One BMesh wrapper per edit mesh, kept alive. When any wrapper of an edit mesh is freed,
+    # Blender invalidates every BMFace / BMLoop reference of that mesh, including ones taken
+    # through another wrapper ("BMesh data of type BMFace has been removed"). Fetching meshes
+    # only through here means no wrapper ever dies mid-operator. A wrapper is replaced once
+    # Blender rebuilds the edit mesh (undo, leaving Edit Mode), which makes it invalid.
+    _BM_CACHE = {}
+
+    def edit_bm(me):
+        key = me.as_pointer()
+        bm = _BM_CACHE.get(key)
+        if bm is None or not bm.is_valid:
+            bm = bmesh.from_edit_mesh(me)
+            _BM_CACHE[key] = bm
+            for k in [k for k, v in _BM_CACHE.items() if not v.is_valid]:
+                del _BM_CACHE[k]
+        return bm
+
     def find_image(context):
         sp = context.space_data
         if sp and sp.type == 'IMAGE_EDITOR' and sp.image and sp.image.size[0] > 0:
@@ -2108,7 +2125,7 @@ if bpy is not None:
         _KEEP_BMESH.clear()
         any_sel = False
         for o in objs:
-            bm = bmesh.from_edit_mesh(o.data)
+            bm = edit_bm(o.data)
             bms.append((o, bm))
             _KEEP_BMESH.append(bm)
             if not all_faces and not any_sel and any(f.select and not f.hide for f in bm.faces):
@@ -2161,7 +2178,7 @@ if bpy is not None:
         done = set()
         if not todo:
             return done
-        bms = [(o, bmesh.from_edit_mesh(o.data)) for o in objs]
+        bms = [(o, edit_bm(o.data)) for o in objs]
         saved_sel = [([v.select for v in bm.verts], [e.select for e in bm.edges],
                       [f.select for f in bm.faces]) for _, bm in bms]
         for isl, g in todo:
@@ -2260,7 +2277,7 @@ if bpy is not None:
             if o is not None and o.type == 'MESH':
                 me = o.data
                 if me.is_editmode:
-                    bm = bmesh.from_edit_mesh(me)
+                    bm = edit_bm(me)
                     lay = bm.faces.layers.int.get(REV_ATTR)
                     if lay is not None and len(bm.faces):
                         bm.faces.ensure_lookup_table()
@@ -2275,7 +2292,7 @@ if bpy is not None:
     def bump_revs(objs):
         import random
         for o in objs:
-            bm = bmesh.from_edit_mesh(o.data)
+            bm = edit_bm(o.data)
             if not len(bm.faces):
                 continue
             lay = bm.faces.layers.int.get(REV_ATTR) or bm.faces.layers.int.new(REV_ATTR)
@@ -2345,6 +2362,7 @@ if bpy is not None:
     @bpy.app.handlers.persistent
     def _on_load(*_args):
         HISTORY.clear()
+        _BM_CACHE.clear()
 
     def _handlers():
         h = bpy.app.handlers
@@ -2649,7 +2667,7 @@ if bpy is not None:
             s = context.scene.pixel_uv
             count = 0
             for o in edit_objects(context):
-                bm = bmesh.from_edit_mesh(o.data)
+                bm = edit_bm(o.data)
                 sel = [f for f in bm.faces if f.select and not f.hide]
                 if not sel:
                     continue
@@ -2682,7 +2700,7 @@ if bpy is not None:
 
         def execute(self, context):
             for o in edit_objects(context):
-                bm = bmesh.from_edit_mesh(o.data)
+                bm = edit_bm(o.data)
                 dl = bm.faces.layers.float.get(DENSITY_ATTR)
                 sl = bm.faces.layers.float.get(SCALE_ATTR)
                 for f in bm.faces:
@@ -2698,7 +2716,7 @@ if bpy is not None:
     def transform_all_uvs(objs, img, fx, fy, ox=0.0, oy=0.0):
         """uv -> uv * f + o for every face of the edited objects and other meshes using img."""
         for o in objs:
-            bm = bmesh.from_edit_mesh(o.data)
+            bm = edit_bm(o.data)
             uvl = bm.loops.layers.uv.verify()
             for f in bm.faces:
                 for l in f.loops:
@@ -3017,7 +3035,7 @@ if bpy is not None:
             data = []
             zs, xs = [], []
             for o in objs:
-                bm = bmesh.from_edit_mesh(o.data)
+                bm = edit_bm(o.data)
                 mw = o.matrix_world
                 cents = []
                 for f in bm.faces:
@@ -3140,7 +3158,7 @@ if bpy is not None:
         """World-space vertices / faces of every edited object, one group per object."""
         verts, faces, groups, existing, parts = [], [], [], [], []
         for o in edit_objects(context):
-            bm = bmesh.from_edit_mesh(o.data)
+            bm = edit_bm(o.data)
             bm.verts.index_update()
             mw = o.matrix_world
             base = len(verts)
@@ -3224,7 +3242,7 @@ if bpy is not None:
                 return {'CANCELLED'}
             saved = []
             for o in edit_objects(context):
-                bm = bmesh.from_edit_mesh(o.data)
+                bm = edit_bm(o.data)
                 saved.append((o, bm, [v.select for v in bm.verts], [e.select for e in bm.edges],
                                [f.select for f in bm.faces]))
                 for f in bm.faces:
@@ -3248,7 +3266,7 @@ if bpy is not None:
         obj = context.edit_object
         if not obj or obj.type != 'MESH':
             return None
-        bm = bmesh.from_edit_mesh(obj.data)
+        bm = edit_bm(obj.data)
         f = bm.faces.active
         if f is None or not f.select:
             return None
