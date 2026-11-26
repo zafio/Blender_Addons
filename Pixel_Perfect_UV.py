@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 6, 1),
+    "version": (0, 6, 2),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -801,9 +801,14 @@ def snap_bounds(pts):
 
 
 def snap_island(isl, pts, mode):
-    if mode == "ALL" or (isl.mask and any(isl.mask)):
-        # straight rows / columns always snap fully, everything else follows the mode
-        return snap(pts, isl.mask if isl.mask is not None else False, isl)
+    """Straightened islands: strict grid snap (rows / columns never collapse). Anything else:
+    Bounds (outer edges only) or, in ALL mode, plain rounding + repair. A free-form island
+    that just happens to contain a few axis-aligned quads must not get the strict grid snap:
+    its many distinct coordinates would be pushed apart pixel by pixel and faces would flip."""
+    if isl.kind == "straight" and isl.mask is not None and any(isl.mask):
+        return snap(pts, isl.mask, isl)
+    if mode == "ALL":
+        return snap(pts, False, isl)
     return snap_bounds(pts)
 
 
@@ -912,6 +917,7 @@ def run_snap_only(islands, mode="ALL"):
             isl.new = None
             continue
         isl.mask = grid_mask(isl, isl.uv)
+        isl.kind = "straight" if is_grid(isl, isl.uv) else "keep"
         isl.new = snap_island(isl, isl.uv, mode)
     return {"broken": sum(broken_faces(i, i.new) for i in islands if i.new is not None)}
 
