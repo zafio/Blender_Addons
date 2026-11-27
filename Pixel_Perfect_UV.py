@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 7),
+    "version": (0, 9, 8),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1886,7 +1886,7 @@ class SeamMesh:
                     self.add_mirrored(cuts, comp)
         return cuts
 
-    def split_plane(self, chart, cuts):
+    def split_plane(self, chart, cuts, out=None):
         """Cuts the chart at the cheapest cross-section, trying planes across its main axis and
         across the model's front and up directions (a head splits into face and back of the head,
         not into an upper and a lower face). Cuts through the face cost a lot more."""
@@ -1925,7 +1925,38 @@ class SeamMesh:
                 score = cost / (0.2 + balance)
                 if best is None or score < best[0]:
                     best = (score, cut)
+                if out is not None:
+                    out.append((score, cut))
         return best[1] if best else None
+
+    def split_candidates(self, chart, cuts, per_axis=3):
+        """Ways to split a chart: the cheapest planes of split_plane, plus front / back and
+        left / right by which way the faces point (side seams on a torso, like a hand-made unwrap)."""
+        planes = []
+        self.split_plane(chart, cuts, out=planes)
+        planes.sort(key=lambda p: p[0])
+        cands, seen = [], set()
+        for _, cut in planes:
+            key = frozenset(cut)
+            if key not in seen:
+                seen.add(key)
+                cands.append(cut)
+            if len(cands) >= per_axis * 3:
+                break
+        fs = set(chart)
+        side_ax = _normalize(_cross(self.up, self.front))
+        for axis in (self.front, side_ax):
+            side = {f: _dot(self.fn[f], axis) > 0 for f in chart}
+            n_pos = sum(side.values())
+            if min(n_pos, len(chart) - n_pos) < 4:
+                continue
+            cut = [e for f in chart for e in self.FE[f] if len(self.EF[e]) == 2 and e not in cuts
+                   and all(g in fs for g in self.EF[e]) and side[self.EF[e][0]] != side[self.EF[e][1]]]
+            cut = list(set(cut))
+            if cut and frozenset(cut) not in seen:
+                seen.add(frozenset(cut))
+                cands.append(cut)
+        return cands
 
     def diskify(self, chart, cuts):
         """Adds cuts until the chart is a disk. Returns True if something was cut."""
@@ -2230,13 +2261,26 @@ class SeamMesh:
                     worst = (st, ch)
             if worst is None:
                 return
-            p = self.split_plane(worst[1], cuts)
-            if not p:
+            # try each way of splitting and keep the one that leaves the least stretch (a cheap
+            # horizontal cut across a torso tube barely helps; front / back side seams do)
+            best = None
+            for p in self.split_candidates(worst[1], cuts):
+                trial = set(cuts)
+                self.add_mirrored(trial, p)
+                for _ in range(50):
+                    if not any(self.diskify(c, trial) for c in self.charts(trial)):
+                        break
+                fs = set(worst[1])
+                pieces = [c for c in self.charts(trial) if fs.intersection(c)]
+                st = max(self.chart_stretch(c, trial) if len(c) >= 3 else 0.0 for c in pieces)
+                cost = sum(self.cost[e] for e in trial - cuts)
+                score = st + 0.002 * cost + 0.02 * len(pieces)
+                if best is None or score < best[0]:
+                    best = (score, trial)
+            if best is None:
                 return
-            self.add_mirrored(cuts, p)
-            for _ in range(50):
-                if not any(self.diskify(c, cuts) for c in self.charts(cuts)):
-                    break
+            cuts.clear()
+            cuts.update(best[1])
 
     def _segments(self, edges):
         """Connected stretches of edges (sharing vertices), longest first."""
