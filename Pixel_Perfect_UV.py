@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 8, 2),
+    "version": (0, 9, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -684,6 +684,92 @@ def pack_rects(sizes, W, H, pad, allow_rotate):
     return out
 
 
+def raster_cover(isl, coords, w, h):
+    """numpy bool mask (h x w, rows = y) of every pixel the island touches, conservatively
+    (pixel centre and corners, plus the faces' own corner pixels). coords start at 0."""
+    import numpy as np
+    m = np.zeros((max(1, h), max(1, w)), dtype=bool)
+    h, w = m.shape
+    samples = ((0.5, 0.5), (0.02, 0.02), (0.98, 0.02), (0.02, 0.98), (0.98, 0.98))
+    for f in isl.faces:
+        poly = [coords[v] for v in f]
+        x0 = max(0, int(math.floor(min(p[0] for p in poly))))
+        x1 = min(w - 1, int(math.ceil(max(p[0] for p in poly))))
+        y0 = max(0, int(math.floor(min(p[1] for p in poly))))
+        y1 = min(h - 1, int(math.ceil(max(p[1] for p in poly))))
+        for j in range(y0, y1 + 1):
+            for i in range(x0, x1 + 1):
+                if not m[j, i] and any(_point_in_poly(i + sx, j + sy, poly) for sx, sy in samples):
+                    m[j, i] = True
+        for x, y in poly:
+            m[min(h - 1, max(0, int(math.floor(y - 1e-6)))), min(w - 1, max(0, int(math.floor(x - 1e-6))))] = True
+    return m
+
+
+def _dilate(m, r):
+    import numpy as np
+    if r <= 0:
+        return m.copy()
+    h, w = m.shape
+    g = np.zeros((h + 2 * r, w + 2 * r), dtype=bool)
+    for dj in range(2 * r + 1):
+        for di in range(2 * r + 1):
+            g[dj:dj + h, di:di + w] |= m
+    return g
+
+
+def _rot_mask(m):
+    """Mask turned like _rot90 (90 degrees counter-clockwise in UV): new[i, h-1-j] = old[j, i]."""
+    return m.T[:, ::-1].copy()
+
+
+def pack_shapes(masks, W, H, pad, allow_rotate=False):
+    """Packs island pixel masks (largest first) at the lowest, then leftmost, free spot. Every
+    position is tested at once with an FFT correlation against the placed islands grown by
+    `pad`, so islands keep `pad` pixels between them and to the border. Returns a list of
+    (x, y, rotated) for each mask's origin, or None if something doesn't fit."""
+    import numpy as np
+    # texture with `pad` extra pixels round it; the frame blocks those plus the texture's own
+    # outer `pad` pixels, so islands keep `pad` pixels to the border
+    occ = np.zeros((H + 2 * pad, W + 2 * pad), dtype=np.float64)
+    if pad:
+        b = 2 * pad
+        occ[:b, :] = 1.0
+        occ[-b:, :] = 1.0
+        occ[:, :b] = 1.0
+        occ[:, -b:] = 1.0
+    OH, OW = occ.shape
+    order = sorted(range(len(masks)), key=lambda k: -int(masks[k].sum()))
+    out = [None] * len(masks)
+    for k in order:
+        best = None
+        for rot in ((False, True) if allow_rotate else (False,)):
+            m = _rot_mask(masks[k]) if rot else masks[k]
+            h, w = m.shape
+            if h > OH or w > OW:
+                continue
+            fh, fw = OH + h, OW + w
+            corr = np.fft.irfft2(np.fft.rfft2(occ, (fh, fw)) *
+                                 np.conj(np.fft.rfft2(m.astype(np.float64), (fh, fw))), (fh, fw))
+            valid = corr[:OH - h + 1, :OW - w + 1] < 0.5
+            ys, xs = np.nonzero(valid)
+            if len(ys) == 0:
+                continue
+            i = int(np.lexsort((xs, ys))[0])
+            if best is None or (ys[i], xs[i]) < best[:2]:
+                best = (int(ys[i]), int(xs[i]), rot, m)
+        if best is None:
+            return None
+        y, x, rot, m = best
+        g = _dilate(m, pad)
+        gy, gx = y - pad, x - pad
+        y0, x0 = max(0, gy), max(0, gx)
+        y1, x1 = min(OH, gy + g.shape[0]), min(OW, gx + g.shape[1])
+        occ[y0:y1, x0:x1] += g[y0 - gy:y1 - gy, x0 - gx:x1 - gx]
+        out[k] = (x - pad, y - pad, rot)
+    return out
+
+
 def _local(snapped):
     mx = min(p[0] for p in snapped)
     my = min(p[1] for p in snapped)
@@ -713,6 +799,7 @@ class Options:
         self.padding = 1
         self.allow_rotate = False
         self.stack_mirrored = True
+        self.pack_shapes = True         # pack the islands' pixel shapes, not their boxes
         self.keep_density = False      # Preserve Texel Density
         self.density_tolerance = 0.05  # largest size change snapping may cause when preserving
         self.__dict__.update(kw)
@@ -910,6 +997,31 @@ def orient_centre_line(isl, lay, up, axis=0):
         dx, dy = -dx, -dy
     rot = math.pi / 2 - math.atan2(dy, dx)
     cs, sn = math.cos(rot), math.sin(rot)
+    out = [(x * cs - y * sn, x * sn + y * cs) for x, y in lay]
+    # islands wrapping round the body hold the centre line twice (front and back): then the
+    # points' main direction runs across them. Only trust it when it agrees with "up".
+    ux, uy, w, tot = dir_in_uv(isl, out, up)
+    if w > 0 and math.hypot(ux, uy) > 1e-9:
+        dev = abs(math.degrees(math.atan2(ux, uy)))
+        if dev > 30:
+            return None
+    return out
+
+
+def orient_exact(isl, lay, up, front):
+    """Free-form islands: rotate by the exact angle that makes the model's up point up (front for
+    islands lying flat). None when the island has no clear direction."""
+    sx, sy, w, tot = dir_in_uv(isl, lay, up)
+    if tot <= 0:
+        return None
+    if w < 0.5 * tot:
+        fx, fy, fw, _ = dir_in_uv(isl, lay, front)
+        if fw > w:
+            sx, sy, w = fx, fy, fw
+    if math.hypot(sx, sy) < 0.3 * w or w <= 0:     # directions disagree: no clear up
+        return None
+    rot = math.pi / 2 - math.atan2(sy, sx)
+    cs, sn = math.cos(rot), math.sin(rot)
     return [(x * cs - y * sn, x * sn + y * cs) for x, y in lay]
 
 
@@ -951,8 +1063,12 @@ def build_layouts(islands, opt):
         lay = align_layout(isl, rotate=opt.align and not isl.keep_rot)
         if lay is not None:
             if orient and (opt.align or isl.keep_rot):
-                centred = None if isl.keep_rot else orient_centre_line(isl, lay, opt.up)
-                lay = centred if centred is not None else orient_layout(isl, lay, opt.up, opt.front)
+                turned = None
+                if not isl.keep_rot:
+                    turned = orient_centre_line(isl, lay, opt.up)
+                    if turned is None and not is_grid(isl, lay):
+                        turned = orient_exact(isl, lay, opt.up, opt.front)
+                lay = turned if turned is not None else orient_layout(isl, lay, opt.up, opt.front)
             isl.units = lay
             isl.kind = "straight" if isl.keep_rot else ("aligned" if opt.align else "keep")
             isl.mask = grid_mask(isl, lay)
@@ -1023,7 +1139,9 @@ def _place(isl, base, do_snap, mode="ALL", keep_density=None):
     return snap_island(isl, pts, mode, keep_density) if do_snap else pts
 
 
-def _try_pack(islands, base, W, H, opt):
+def _try_pack(islands, base, W, H, opt, shapes=None):
+    """shapes: pack the islands' pixel shapes (True) or their bounding boxes (False)."""
+    shapes = getattr(opt, "pack_shapes", False) if shapes is None else shapes
     locs = []
     sizes = []
     for isl in islands:
@@ -1034,8 +1152,16 @@ def _try_pack(islands, base, W, H, opt):
         loc, w, h = _local(_place(isl, base, opt.snap, opt.snap_mode, _keep(opt)))
         locs.append(loc)
         sizes.append((max(1, math.ceil(w - 1e-9)), max(1, math.ceil(h - 1e-9))))
-    res = pack_rects(sizes, W, H, opt.padding, opt.allow_rotate)
-    return res, locs, sizes
+    if not shapes:
+        return pack_rects(sizes, W, H, opt.padding, opt.allow_rotate), locs, sizes
+    import numpy as np
+    masks = []
+    for isl, loc, (w, h) in zip(islands, locs, sizes):
+        if isl.kind == "pixel":
+            masks.append(np.ones((1, 1), dtype=bool))
+        else:
+            masks.append(raster_cover(isl, loc, w, h))
+    return pack_shapes(masks, W, H, max(0, int(opt.padding)), opt.allow_rotate), locs, sizes
 
 
 def run(islands, W, H, opt):
@@ -1069,12 +1195,25 @@ def run(islands, W, H, opt):
                     return None, "Islands don't fit even at a tiny density (fixed-density islands too big?)"
                 for _ in range(40):
                     mid = (lo + hi) / 2
-                    if _try_pack(active, mid, W, H, opt)[0] is None:
+                    if _try_pack(active, mid, W, H, opt, shapes=False)[0] is None:
                         hi = mid
                     else:
                         lo = mid
                 base = lo
+                if getattr(opt, "pack_shapes", False):
+                    # shapes fit tighter than boxes: push the density up from the box result
+                    lo2, hi2 = base, base * 2.0
+                    if _try_pack(active, lo2, W, H, opt)[0] is not None:
+                        for _ in range(12):
+                            mid = (lo2 + hi2) / 2
+                            if _try_pack(active, mid, W, H, opt)[0] is None:
+                                hi2 = mid
+                            else:
+                                lo2 = mid
+                        base = lo2
         res, locs, sizes = _try_pack(active, base, W, H, opt)
+        if res is None and getattr(opt, "pack_shapes", False):
+            res, locs, sizes = _try_pack(active, base, W, H, opt, shapes=False)
         if res is None:
             return None, ("Islands don't fit in %d x %d at %.2f px/unit. Lower the density, use Fit, "
                           "or a bigger texture" % (W, H, base))
@@ -2900,6 +3039,7 @@ if bpy is not None:
             density_mode=s.density_mode, density=s.density, snap=True, pack=s.pack,
             padding=s.padding, allow_rotate=s.allow_rotate, snap_mode=s.snap_mode,
             stack_mirrored=s.stack_mirrored, keep_density=s.keep_density, orient=s.orient,
+            pack_shapes=s.pack_shapes,
             density_tolerance=s.density_tolerance / 100.0)
 
     class PixelUVSettings(bpy.types.PropertyGroup):
@@ -2920,6 +3060,10 @@ if bpy is not None:
                                description="Texel density in pixels per Blender unit (metre)")
         padding: IntProperty(name="Padding (px)", default=1, min=0, max=64,
                              description="Pixels between islands and to the texture border")
+        pack_shapes: BoolProperty(
+            name="Pack Shapes", default=True,
+            description="Pack the islands' actual pixel shapes, so small islands fill the gaps of big "
+                        "ones (tighter, higher density). Off: pack their bounding boxes (faster)")
         allow_rotate: BoolProperty(name="Rotate 90°", default=False,
                                    description="Allow islands to be rotated by 90° when packing")
         straighten: BoolProperty(name="Straighten Quad Islands", default=True,
@@ -3837,6 +3981,7 @@ if bpy is not None:
         sub = box.column()
         sub.enabled = s.pack
         sub.prop(s, "padding")
+        sub.prop(s, "pack_shapes")
         sub.prop(s, "allow_rotate")
         box.prop(s, "stack_mirrored")
         box.prop(s, "preserve_texture")
