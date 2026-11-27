@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 14),
+    "version": (0, 9, 15),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2658,6 +2658,7 @@ class SeamMesh:
         self.merge_face(cuts)
         self.stretch_split(cuts, types)
         self.overlap_split(cuts)
+        self.drop_inner_seams(cuts)
         self.ear_cut(cuts, types)
         self.nose_cut(cuts)
         return cuts
@@ -2850,7 +2851,45 @@ class SeamMesh:
             return 0.0
         return uv_overlap(lscm_uv(verts, faces), faces)
 
-    def overlap_split(self, cuts, limit=0.005, min_faces=8, max_iter=12):
+    def drop_inner_seams(self, cuts, limit=0.005, max_stretch=0.25, max_iter=6):
+        """Seams with the same island on both sides (dead ends running in from the border, slits)
+        separate nothing; they only let the unwrap pull faces apart. Each run of them is removed
+        when the island still lies flat without it: still a disk, no new overlap, no more stretch."""
+        locked = getattr(self, "locked", set())
+        for _ in range(max_iter):
+            changed = False
+            for ch in self.charts(cuts):
+                fs = set(ch)
+                inner = {e for f in ch for e in self.FE[f] if e in cuts and e not in locked
+                         and len(self.EF[e]) == 2 and all(g in fs for g in self.EF[e])}
+                if not inner:
+                    continue
+                ov0 = st0 = None
+                for seg in self._segments(inner):
+                    trial = set(cuts)
+                    for e in seg:     # each side on its own: the mirror island gets its own check
+                        trial.discard(e)
+                    loops, genus, _, _ = self.topology(ch, trial)
+                    if len(loops) != 1 or genus != 0:
+                        continue          # it opens a tube or a hole: needed
+                    if ov0 is None:
+                        ov0, st0 = self.chart_overlap(ch, cuts), self.chart_stretch(ch, cuts)
+                    ov = self.chart_overlap(ch, trial)
+                    if ov > max(limit, ov0):
+                        continue
+                    st = self.chart_stretch(ch, trial)
+                    if st > max(max_stretch, st0) + 1e-9 and st > st0 + 0.01:
+                        continue
+                    cuts.clear()
+                    cuts.update(trial)
+                    changed = True
+                    break
+                if changed:
+                    break
+            if not changed:
+                return
+
+    def overlap_split(self, cuts, limit=0.03, min_faces=8, max_iter=12):
         """Islands that fold over themselves when flattened are split where it removes the
         overlap (never the face: it stays whole)."""
         face = getattr(self, "face_faces", set())
