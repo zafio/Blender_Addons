@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 0),
+    "version": (0, 9, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -157,7 +157,7 @@ def find_islands(recs):
         isl = Island()
         local = {}
         dens = []
-        sc_sum = sc_w = 0.0
+        sc_area = defaultdict(float)
         for fi in fl:
             r = recs[fi]
             face = []
@@ -174,13 +174,13 @@ def find_islands(recs):
             isl.face_ids.append(fi)
             if r.density > 0:
                 dens.append(r.density)
-            a = area3d(r.p3) + 1e-12
-            sc_sum += (r.scale if r.scale > 0 else 1.0) * a
-            sc_w += a
+            sc_area[round(r.scale if r.scale > 0 else 1.0, 4)] += area3d(r.p3) + 1e-12
         isl.group = recs[fl[0]].group
         isl.keep_rot = any(recs[fi].keep_rot for fi in fl)
         isl.density = max(dens) if dens else 0.0
-        isl.scale = sc_sum / sc_w if sc_w else 1.0  # area-weighted multiplier
+        # the multiplier of the part covering most of the island (a face island that runs down
+        # to the neck keeps the head's x2 instead of an in-between average)
+        isl.scale = max(sc_area.items(), key=lambda kv: kv[1])[0] if sc_area else 1.0
         islands.append(isl)
     return islands
 
@@ -3112,6 +3112,12 @@ if bpy is not None:
         keep_seams: BoolProperty(
             name="Keep My Seams", default=False,
             description="Keep the seams already marked (and build around them) instead of replacing them")
+        preset_head: FloatProperty(name="Head", default=2.4, min=0.05, soft_max=8,
+                                   description="Density multiplier for the head (Character Density Preset)")
+        preset_hands: FloatProperty(name="Hands", default=1.3, min=0.05, soft_max=8)
+        preset_legs: FloatProperty(name="Legs", default=0.8, min=0.05, soft_max=8)
+        preset_props: FloatProperty(name="Props", default=1.5, min=0.05, soft_max=8,
+                                    description="Hard-surface objects (sword, sheath, strap...)")
         unwrap_preset: BoolProperty(
             name="Character Density Preset", default=True,
             description="Auto Unwrap applies the Character Density Preset (head x2, hands, legs, props)")
@@ -3594,8 +3600,15 @@ if bpy is not None:
             self.apply(context)
             return {'RUNNING_MODAL'}
 
-    CHARACTER_PRESET = dict(head=2.0, hands=1.3, body=1.0, legs=0.8, props=1.5,
+    # head x2.4: islands that are mostly neck keep the body value, so x2.4 ends up as the x2
+    # head / body ratio of the hand-made sample unwraps
+    CHARACTER_PRESET = dict(head=2.4, hands=1.3, body=1.0, legs=0.8, props=1.5,
                             head_from=0.78, legs_to=0.45, hands_from=0.6)
+
+    def character_preset(s):
+        """The preset values shown in the panel."""
+        return dict(CHARACTER_PRESET, head=s.preset_head, hands=s.preset_hands, legs=s.preset_legs,
+                    props=s.preset_props)
 
     class _Stage:
         """Stands in for an operator when Auto Unwrap runs another operator's code directly."""
@@ -3617,7 +3630,7 @@ if bpy is not None:
                           "(world Z) and distance from the centre. Faces with a fixed px/unit keep it")
         bl_options = {'REGISTER', 'UNDO'}
 
-        head: FloatProperty(name="Head", default=2.0, min=0.05, soft_max=8)
+        head: FloatProperty(name="Head", default=2.4, min=0.05, soft_max=8)
         hands: FloatProperty(name="Hands", default=1.3, min=0.05, soft_max=8)
         body: FloatProperty(name="Body / Arms", default=1.0, min=0.05, soft_max=8)
         legs: FloatProperty(name="Legs / Feet", default=0.8, min=0.05, soft_max=8)
@@ -3629,6 +3642,12 @@ if bpy is not None:
                                description="Height (fraction of the character) where the legs end")
         hands_from: FloatProperty(name="Hands From", default=0.6, min=0, max=1, subtype='FACTOR',
                                   description="Sideways distance (fraction of half the width) where hands start")
+
+        def invoke(self, context, event):
+            for k, v in character_preset(context.scene.pixel_uv).items():
+                if k in ("head", "hands", "legs", "props"):
+                    setattr(self, k, v)
+            return self.execute(context)
 
         @classmethod
         def poll(cls, context):
@@ -3877,7 +3896,7 @@ if bpy is not None:
                 if res != {'FINISHED'}:
                     raise _StageError("Blender's Unwrap was cancelled")
                 if s.unwrap_preset:
-                    stage("Density preset", UV_OT_pixel_character_density, **CHARACTER_PRESET)
+                    stage("Density preset", UV_OT_pixel_character_density, **character_preset(s))
                 stage("Pixel Perfect", UV_OT_pixel_perfect, step='ALL')
             except _StageError as exc:
                 self.report({'ERROR'}, "Auto Unwrap: %s" % exc)
@@ -3921,6 +3940,13 @@ if bpy is not None:
         box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
         box.prop(s, "keep_seams")
         box.prop(s, "unwrap_preset")
+        if s.unwrap_preset:
+            row = box.row(align=True)
+            row.prop(s, "preset_head")
+            row.prop(s, "preset_hands")
+            row = box.row(align=True)
+            row.prop(s, "preset_legs")
+            row.prop(s, "preset_props")
         obj = context.edit_object
         if obj is not None:
             box.prop(obj, "pixuv_seam_type", text=obj.name[:18])
