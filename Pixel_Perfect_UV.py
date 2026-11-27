@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 8),
+    "version": (0, 9, 9),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -183,6 +183,87 @@ def find_islands(recs):
         isl.scale = max(sc_area.items(), key=lambda kv: kv[1])[0] if sc_area else 1.0
         islands.append(isl)
     return islands
+
+
+def harmonize_parts(parts, centres, normals, areas, links, overlap=0.5):
+    """One body part per seam island, the same front and back.
+    parts: part name per face; links: (face a, face b, across_seam) for each shared edge.
+    Every island takes its area-majority part; then islands that are the front and back of the same
+    piece (sharing a seam, facing opposite ways, covering mostly the same stretch along the
+    piece) share one part, so a neck, arm or leg gets the same density all round. Returns the
+    new part per face."""
+    n = len(parts)
+    par = list(range(n))
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    for a, b, seam in links:
+        if not seam:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                par[ra] = rb
+    isl = defaultdict(list)
+    for f in range(n):
+        isl[find(f)].append(f)
+    keys = list(isl)
+    idx = {k: i for i, k in enumerate(keys)}
+    info = []
+    for k in keys:
+        fs = isl[k]
+        a = sum(areas[f] for f in fs) or 1e-12
+        c = tuple(sum(centres[f][i] * areas[f] for f in fs) / a for i in range(3))
+        nrm = _normalize(tuple(sum(normals[f][i] * areas[f] for f in fs) for i in range(3)))
+        info.append((fs, a, c, nrm))
+    gpar = list(range(len(keys)))
+
+    def gfind(x):
+        while gpar[x] != x:
+            gpar[x] = gpar[gpar[x]]
+            x = gpar[x]
+        return x
+    pairs = {(min(idx[find(a)], idx[find(b)]), max(idx[find(a)], idx[find(b)]))
+             for a, b, seam in links if seam and find(a) != find(b)}
+    for i, j in pairs:
+        fi, ai, ci, ni = info[i]
+        fj, aj, cj, nj = info[j]
+        if _dot(ni, nj) > -0.2:      # not front / back of each other
+            continue
+        # the piece's long direction: main axis of both islands together (sideways from the normals)
+        pts = [centres[f] for f in fi + fj]
+        m = tuple(sum(p[k] for p in pts) / len(pts) for k in range(3))
+        cov = [[sum((p[r] - m[r]) * (p[q] - m[q]) for p in pts) for q in range(3)] for r in range(3)]
+        nav = _normalize(_sub(ni, nj))
+        ax = (0.3, 1.0, 0.5)
+        for _ in range(30):
+            ax = tuple(sum(cov[r][q] * ax[q] for q in range(3)) for r in range(3))
+            ax = _sub(ax, _mul(nav, _dot(ax, nav)))
+            if _dot(ax, ax) < 1e-18:
+                break
+            ax = _normalize(ax)
+        best = 0.0
+        if _dot(ax, ax) > 0.5:
+            pi = [_dot(centres[f], ax) for f in fi]
+            pj = [_dot(centres[f], ax) for f in fj]
+            lo, hi = max(min(pi), min(pj)), min(max(pi), max(pj))
+            span = min(max(pi) - min(pi), max(pj) - min(pj))
+            if span > 1e-9:
+                best = (hi - lo) / span
+        if best >= overlap:
+            gpar[gfind(i)] = gfind(j)
+    group_votes = defaultdict(lambda: defaultdict(float))
+    for i, (fs, a, c, nrm) in enumerate(info):
+        for f in fs:
+            group_votes[gfind(i)][parts[f]] += areas[f]
+    out = list(parts)
+    for i, (fs, a, c, nrm) in enumerate(info):
+        votes = group_votes[gfind(i)]
+        part = max(votes, key=votes.get)
+        for f in fs:
+            out[f] = part
+    return out
 
 
 def island_areas(isl, coords):
@@ -1904,7 +1985,7 @@ class SeamMesh:
         face = getattr(self, "face_faces", set())
         fs = set(chart)
         best = None
-        for axis in (ax, self.front, self.up):
+        for ai, axis in enumerate((ax, self.front, self.up)):
             proj = {f: _dot(_sub(self.fc[f], c), axis) for f in chart}
             lo, hi = min(proj.values()), max(proj.values())
             if hi - lo < 1e-9:
@@ -1926,7 +2007,7 @@ class SeamMesh:
                 if best is None or score < best[0]:
                     best = (score, cut)
                 if out is not None:
-                    out.append((score, cut))
+                    out.append((score, cut, ai))
         return best[1] if best else None
 
     def split_candidates(self, chart, cuts, per_axis=3):
@@ -1935,14 +2016,13 @@ class SeamMesh:
         planes = []
         self.split_plane(chart, cuts, out=planes)
         planes.sort(key=lambda p: p[0])
-        cands, seen = [], set()
-        for _, cut in planes:
+        cands, seen, taken = [], set(), defaultdict(int)
+        for _, cut, ai in planes:      # the best few across each direction
             key = frozenset(cut)
-            if key not in seen:
+            if key not in seen and taken[ai] < per_axis:
                 seen.add(key)
+                taken[ai] += 1
                 cands.append(cut)
-            if len(cands) >= per_axis * 3:
-                break
         fs = set(chart)
         side_ax = _normalize(_cross(self.up, self.front))
         for axis in (self.front, side_ax):
@@ -2117,7 +2197,24 @@ class SeamMesh:
                     continue
                 fs = set(ch)
                 best = None
-                for k in range(17):   # the cheapest line that really separates: the neck
+                inner = set()
+                base = self.neck_base(t, hw, low, high)
+                if base is not None:
+                    # the base of the neck all round: the whole neck goes with the head (same density
+                    # front and back, one ring island like hand-made unwraps)
+                    hset = {f for f in ch if t[f] >= high or
+                            (t[f] >= base and abs(self.fc[f][self.axis]) <= 1.3 * hw)}
+                    cut = {e for f in hset for e in self.FE[f] if len(self.EF[e]) == 2 and e not in cuts
+                           and all(g in fs for g in self.EF[e])
+                           and (self.EF[e][0] in hset) != (self.EF[e][1] in hset)}
+                    if cut:
+                        trial = set(cuts)
+                        self.add_mirrored(trial, cut)
+                        sep = next(c for c in self.charts(trial) if head[0] in c)
+                        if min(t[f] for f in sep) >= low:
+                            best = (0.0, cut)
+                            inner = self.neck_top(trial, sep, t, base, hw, cut)
+                for k in range(17 if best is None else 0):   # else the cheapest line that separates
                     h = low + (high - low) * k / 16.0
                     cut = set()
                     for f in ch:
@@ -2136,17 +2233,62 @@ class SeamMesh:
                     sep = next(c for c in self.charts(trial) if head[0] in c)
                     if min(t[f] for f in sep) < low:      # still connected to the body
                         continue
+                    # the lowest line that separates is the base of the neck: the whole neck goes
+                    # with the head (same density all round), like hand-made unwraps
                     c = sum(self.cost[e] for e in cut)
-                    if best is None or c < best[0]:
+                    if best is None:
                         best = (c, cut)
                 if best:
                     before = set(cuts)
+                    if base is not None and best[0] == 0.0:
+                        cuts -= inner
                     self.add_mirrored(cuts, best[1])
                     self.locked |= cuts - before
                     done = False
                     break
             if done:
                 return
+
+    def neck_top(self, trial, head, t, base, hw, cut, top=0.93):
+        """Adds (to `cut`) the outline of the neck below the cheapest level between the neck and
+        the head, never through the face zone (the front of the neck stays with the face), so the
+        back and sides of the neck are one island. Returns the seams inside it, to be removed."""
+        fs = set(head)
+        face = getattr(self, "face_faces", set())
+        best = None
+        for k in range(1, 13):
+            h = base + 0.012 + (top - base - 0.012) * k / 12.0
+            nf = {f for f in head if t[f] < h and f not in face and abs(self.fc[f][self.axis]) <= 1.3 * hw}
+            if len(nf) < 8:
+                continue
+            line = {e for f in nf for e in self.FE[f] if len(self.EF[e]) == 2 and e not in trial
+                    and all(g in fs for g in self.EF[e]) and (self.EF[e][0] in nf) != (self.EF[e][1] in nf)}
+            if not line:
+                continue
+            c = sum(self.cost[e] for e in line) / len(nf) ** 0.5
+            if best is None or c < best[0]:
+                best = (c, line, nf)
+        if not best:
+            return set()
+        cut |= best[1]
+        nf = best[2]
+        return {e for f in nf for e in self.FE[f] if e in trial and len(self.EF[e]) == 2
+                and all(g in nf for g in self.EF[e])}
+
+    def neck_base(self, t, hw, low, high, step=0.006):
+        """Height (0-1) where the neck meets the shoulders: going down from the head, the first
+        level with vertices well outside the head's width (shoulders / trapezius)."""
+        hs = [_dot(p, self.up) for p in self.V]
+        h0, h1 = min(hs), max(hs)
+        rng = (h1 - h0) or 1.0
+        tv = [(h - h0) / rng for h in hs]
+        lvl = high
+        while lvl > low:
+            if any(abs(tv[i] - lvl) <= step and 1.3 * hw < abs(self.V[i][self.axis]) < 2.6 * hw
+                   for i in range(len(self.V))):
+                return lvl
+            lvl -= step
+        return None
 
     def run(self, types, max_iter=400):
         """types: group -> 'HARD' / 'ORGANIC' / 'TUBE'. Returns the set of cut edge ids."""
@@ -3956,7 +4098,7 @@ if bpy is not None:
     # head x2.4: islands that are mostly neck keep the body value, so x2.4 ends up as the x2
     # head / body ratio of the hand-made sample unwraps
     CHARACTER_PRESET = dict(head=2.4, hands=1.3, body=1.0, legs=0.8, props=1.5,
-                            head_from=0.78, legs_to=0.45, hands_from=0.6)
+                            head_from=0.78, legs_to=0.45, hands_from=0.6, uniform_islands=True)
 
     def character_preset(s):
         """The preset values shown in the panel."""
@@ -3995,6 +4137,9 @@ if bpy is not None:
                                description="Height (fraction of the character) where the legs end")
         hands_from: FloatProperty(name="Hands From", default=0.6, min=0, max=1, subtype='FACTOR',
                                   description="Sideways distance (fraction of half the width) where hands start")
+        uniform_islands: BoolProperty(name="Same Front and Back", default=True,
+                                      description="One multiplier per seam island, and the same for "
+                                                  "islands that are the front and back of a neck, arm or leg")
 
         def invoke(self, context, event):
             for k, v in character_preset(context.scene.pixel_uv).items():
@@ -4030,9 +4175,8 @@ if bpy is not None:
             for o, bm, cents in data:
                 dl, sl = face_layers(bm)
                 is_prop = kinds.get(o.name) == 'HARD'
+                parts = []
                 for f, c in cents:
-                    if f[dl] > 0:
-                        continue
                     t = (c.z - z0) / (z1 - z0) if z1 > z0 else 0.5
                     if is_prop:
                         part = "props"
@@ -4044,6 +4188,24 @@ if bpy is not None:
                         part = "hands"
                     else:
                         part = "body"
+                    parts.append(part)
+                if self.uniform_islands and not is_prop:
+                    # one part per seam island, the same front and back (neck, arms, legs)
+                    mw = o.matrix_world
+                    nm = mw.to_3x3()
+                    fidx = {f.index: i for i, (f, _) in enumerate(cents)}
+                    links = []
+                    for e in bm.edges:
+                        lf = e.link_faces
+                        if len(lf) == 2 and lf[0].index in fidx and lf[1].index in fidx:
+                            links.append((fidx[lf[0].index], fidx[lf[1].index], e.seam))
+                    parts = harmonize_parts(
+                        parts, [(c.x, c.y, c.z) for _, c in cents],
+                        [tuple((nm @ f.normal).normalized()) for f, _ in cents],
+                        [f.calc_area() for f, _ in cents], links)
+                for (f, c), part in zip(cents, parts):
+                    if f[dl] > 0:
+                        continue
                     f[sl] = getattr(self, part)
                     counts[part] += 1
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
