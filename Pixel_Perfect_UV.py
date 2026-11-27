@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 10),
+    "version": (0, 9, 11),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -996,6 +996,11 @@ def find_mirror_pairs(islands, axis=0, tol_rel=6e-3):
             if len(B.faces) != len(A.faces) or len(B.pl) != len(A.pl):
                 continue
             if sum((cents[b][k] - ma[k]) ** 2 for k in range(3)) > (size * 0.02) ** 2:
+                continue
+            # halves that touch (sharing the centre line) are not stacked: on top of each other
+            # they'd read as one island folded over itself
+            ka = {tuple(round(c / tol) for c in p) for p in A.pl if abs(p[axis]) <= tol}
+            if ka and any(tuple(round(c / tol) for c in p) in ka for p in B.pl if abs(p[axis]) <= tol):
                 continue
             mp = _match_mirror(A, B, axis, tol)
             if mp is None:
@@ -2255,10 +2260,15 @@ class SeamMesh:
         back and sides of the neck are one island. Returns the seams inside it, to be removed."""
         fs = set(head)
         face = getattr(self, "face_faces", set())
+        # the jaw stays with the face: in front of the middle of the head only the low neck counts
+        upper = [f for f in head if t[f] >= 0.9]
+        mid = sum(_dot(self.fc[f], self.front) for f in upper) / len(upper) if upper else None
+        jaw = lambda f: mid is not None and _dot(self.fc[f], self.front) > mid and t[f] > base + 0.02
         best = None
         for k in range(1, 13):
             h = base + 0.012 + (top - base - 0.012) * k / 12.0
-            nf = {f for f in head if t[f] < h and f not in face and abs(self.fc[f][self.axis]) <= 1.3 * hw}
+            nf = {f for f in head if t[f] < h and f not in face and not jaw(f)
+                  and abs(self.fc[f][self.axis]) <= 1.3 * hw}
             if len(nf) < 8:
                 continue
             line = {e for f in nf for e in self.FE[f] if len(self.EF[e]) == 2 and e not in trial
@@ -2323,6 +2333,7 @@ class SeamMesh:
         self.merge_small(cuts, tex_px=getattr(self, "tex_px", 256 * 256))
         self.merge_face(cuts)
         self.stretch_split(cuts, types)
+        self.overlap_split(cuts)
         self.nose_cut(cuts)
         return cuts
 
@@ -2389,6 +2400,79 @@ class SeamMesh:
                 face.append(ids[r])
             faces.append(face)
         return lscm_stretch(verts, faces)
+
+    def chart_flat(self, chart, cuts):
+        """(verts, faces) of a chart with its vertices split along its seams, ready to flatten."""
+        fs = set(chart)
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for f in chart:
+            for e in self.FE[f]:
+                fl = self.EF[e]
+                if e in cuts or len(fl) != 2 or not all(g in fs for g in fl):
+                    continue
+                for v in self.E[e]:
+                    ra, rb = find((fl[0], v)), find((fl[1], v))
+                    if ra != rb:
+                        parent[ra] = rb
+        ids, verts, faces = {}, [], []
+        for f in chart:
+            face = []
+            for v in self.F[f]:
+                r = find((f, v))
+                if r not in ids:
+                    ids[r] = len(verts)
+                    verts.append(self.V[v])
+                face.append(ids[r])
+            faces.append(face)
+        return verts, faces
+
+    def chart_overlap(self, chart, cuts):
+        """Share of the chart's flattened area that lands on itself (0 = clean)."""
+        verts, faces = self.chart_flat(chart, cuts)
+        if len(faces) < 3:
+            return 0.0
+        return uv_overlap(lscm_uv(verts, faces), faces)
+
+    def overlap_split(self, cuts, limit=0.005, min_faces=8, max_iter=12):
+        """Islands that fold over themselves when flattened are split where it removes the
+        overlap (never the face: it stays whole)."""
+        face = getattr(self, "face_faces", set())
+        for _ in range(max_iter):
+            worst = None
+            for ch in self.charts(cuts):
+                if len(ch) < min_faces or face.intersection(ch):
+                    continue
+                ov = self.chart_overlap(ch, cuts)
+                if ov > limit and (worst is None or ov > worst[0]):
+                    worst = (ov, ch)
+            if worst is None:
+                return
+            fs = set(worst[1])
+            best = None
+            for p in self.split_candidates(worst[1], cuts):
+                trial = set(cuts)
+                self.add_mirrored(trial, p)
+                for _ in range(50):
+                    if not any(self.diskify(c, trial) for c in self.charts(trial)):
+                        break
+                pieces = [c for c in self.charts(trial) if fs.intersection(c)]
+                ov = max(self.chart_overlap(c, trial) for c in pieces)
+                st = max(self.chart_stretch(c, trial) if len(c) >= 3 else 0.0 for c in pieces)
+                cost = sum(self.cost[e] for e in trial - cuts)
+                score = (0 if ov <= limit else 1) + ov + 0.2 * st + 0.002 * cost + 0.02 * len(pieces)
+                if best is None or score < best[0]:
+                    best = (score, trial, ov)
+            if best is None or best[2] >= worst[0]:
+                return
+            cuts.clear()
+            cuts.update(best[1])
 
     def stretch_split(self, cuts, types, limit=0.25, min_faces=12, max_iter=12):
         """Any island that would still stretch more than `limit` when flattened is split across
@@ -2664,14 +2748,13 @@ class SeamMesh:
                 return
 
 
-def lscm_stretch(verts, faces):
-    """Flattens a patch with least squares conformal maps (like Blender's unwrap family) and
-    returns its average edge stretch (0 = none; same measure as `distortion`). verts: 3D points,
-    faces: lists of indices into verts. Returns inf if it can't be flattened."""
+def lscm_uv(verts, faces):
+    """Least squares conformal flattening of a patch (like Blender's unwrap family): a 2D point
+    per vertex, or None if it can't be flattened."""
     import numpy as np
     n = len(verts)
     if n < 3 or not faces:
-        return 0.0
+        return None
     rows = []
     for f in faces:
         for k in range(1, len(f) - 1):
@@ -2694,13 +2777,13 @@ def lscm_stretch(verts, faces):
                 row[ids[j]] = complex(xb - xa, yb - ya) * s
             rows.append(row)
     if not rows:
-        return float("inf")
+        return None
     # pin the two vertices furthest apart
     a = 0
     b = max(range(n), key=lambda i: _length(_sub(verts[i], verts[a])))
     a = max(range(n), key=lambda i: _length(_sub(verts[i], verts[b])))
     if a == b:
-        return float("inf")
+        return None
     free = [i for i in range(n) if i not in (a, b)]
     col = {v: k for k, v in enumerate(free)}
     pin = {a: complex(0.0, 0.0), b: complex(1.0, 0.0)}
@@ -2720,12 +2803,24 @@ def lscm_stretch(verts, faces):
     try:
         sol = np.linalg.lstsq(A, rhs, rcond=None)[0]
     except Exception:
-        return float("inf")
+        return None
     uv = [None] * n
     for v, z in pin.items():
         uv[v] = (z.real, z.imag)
     for v, k in col.items():
         uv[v] = (sol[2 * k], sol[2 * k + 1])
+    return uv
+
+
+def lscm_stretch(verts, faces):
+    """Flattens a patch with least squares conformal maps (like Blender's unwrap family) and
+    returns its average edge stretch (0 = none; same measure as `distortion`). verts: 3D points,
+    faces: lists of indices into verts. Returns inf if it can't be flattened."""
+    if len(verts) < 3 or not faces:
+        return 0.0
+    uv = lscm_uv(verts, faces)
+    if uv is None:
+        return float("inf")
     a3 = sum(area3d([verts[i] for i in f]) for f in faces)
     a2 = sum(abs(signed_area2d([uv[i] for i in f])) for f in faces)
     if a3 < 1e-14 or a2 < 1e-14:
@@ -2744,6 +2839,34 @@ def lscm_stretch(verts, faces):
             tot += abs(math.log(l2 / l3)) * l3
             wsum += l3
     return tot / wsum if wsum else 0.0
+
+
+def uv_overlap(uv, faces, res=96):
+    """Share (0-1) of a flattened patch's area covered twice or more: folded faces or a border
+    that runs over itself. Sampled on a res x res grid."""
+    import numpy as np
+    if not uv or any(p is None for p in uv):
+        return 1.0
+    pts = np.array(uv, float)
+    lo, hi = pts.min(0), pts.max(0)
+    size = float(max(hi - lo)) or 1.0
+    n = res
+    xs, ys = np.meshgrid(lo[0] + (np.arange(n) + 0.5) * size / n, lo[1] + (np.arange(n) + 0.5) * size / n)
+    cnt = np.zeros(xs.shape, np.int16)
+
+    def side(p, q):
+        return (q[0] - p[0]) * (ys - p[1]) - (q[1] - p[1]) * (xs - p[0])
+    for f in faces:
+        hit = np.zeros(xs.shape, bool)
+        for k in range(1, len(f) - 1):
+            a, b, c = pts[f[0]], pts[f[k]], pts[f[k + 1]]
+            if abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) < 1e-18:
+                continue
+            d1, d2, d3 = side(a, b), side(b, c), side(c, a)
+            hit |= ((d1 > 0) & (d2 > 0) & (d3 > 0)) | ((d1 < 0) & (d2 < 0) & (d3 < 0))
+        cnt += hit
+    covered = int((cnt >= 1).sum())
+    return float((cnt >= 2).sum()) / covered if covered else 0.0
 
 
 def classify_group(mesh, faces):
