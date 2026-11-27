@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 7, 2),
+    "version": (0, 7, 3),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1725,7 +1725,63 @@ class SeamMesh:
                     break
             if not changed:
                 break
+        self.merge_small(cuts, tex_px=getattr(self, "tex_px", 256 * 256))
         return cuts
+
+    def merge_small(self, cuts, min_px=4.0, tex_px=256 * 256, fill=0.65, max_iter=300):
+        """Islands that would end up smaller than min_px pixels (estimated at the density that
+        fills `fill` of a texture of tex_px pixels) are merged into the neighbour they share the
+        most seam with, if the result is still a disk (mirrored twins follow)."""
+        total = sum(self.fa) or 1.0
+        px_per_area = fill * tex_px / total
+        min_area_abs = min_px / px_per_area
+        garea = defaultdict(lambda: 1.0)
+        for _ in range(max_iter):
+            charts = self.charts(cuts)
+            owner = {}
+            for ci, ch in enumerate(charts):
+                for f in ch:
+                    owner[f] = ci
+            merged = False
+            order = sorted(range(len(charts)), key=lambda ci: sum(self.fa[f] for f in charts[ci]))
+            for ci in order:
+                ch = charts[ci]
+                area = sum(self.fa[f] for f in ch)
+                if area >= min_area_abs:
+                    continue
+                shared = defaultdict(list)
+                for f in ch:
+                    for e in self.FE[f]:
+                        if e in cuts and len(self.EF[e]) == 2:
+                            o = owner[self.EF[e][0]] if owner[self.EF[e][0]] != ci else owner[self.EF[e][1]]
+                            if o != ci:
+                                shared[o].append(e)
+                for o, es in sorted(shared.items(), key=lambda kv: -len(kv[1])):
+                    trial = set(cuts)
+                    for e in es:
+                        trial.discard(e)
+                        trial.discard(self.emir.get(e, -1))
+                    merged_chart = ch + charts[o]
+                    loops, genus, _, _ = self.topology(merged_chart, trial)
+                    if len(loops) != 1 or genus != 0:
+                        continue
+                    ok = True
+                    for f in (ch[0],):   # the mirrored twin must stay a disk too
+                        mf = None
+                    for c2 in self.charts(trial):
+                        lp, gn, _, _ = self.topology(c2, trial)
+                        if len(lp) != 1 or gn != 0:
+                            ok = False
+                            break
+                    if ok:
+                        cuts.clear()
+                        cuts.update(trial)
+                        merged = True
+                        break
+                if merged:
+                    break
+            if not merged:
+                return
 
 
 def classify_group(mesh, faces):
@@ -2074,9 +2130,11 @@ def predict_seams(rows, model=None):
 
 
 def auto_seams(verts, faces, groups, types=None, up=(0.0, 0.0, 1.0), front=(0.0, -1.0, 0.0),
-               method="LEARNED", existing=(), threshold=None):
-    """Returns (cut edges as vertex pairs, chart count, types used). types: group -> type or 'AUTO'."""
+               method="LEARNED", existing=(), threshold=None, tex_px=256 * 256):
+    """Returns (cut edges as vertex pairs, chart count, types used). types: group -> type or 'AUTO'.
+    tex_px: texture pixel count, used to merge islands that would end up under ~4 px."""
     mesh = SeamMesh(verts, faces, groups, up=up, front=front, existing_seams=existing)
+    mesh.tex_px = tex_px
     by_group = defaultdict(list)
     for fi, g in enumerate(mesh.G):
         by_group[g].append(fi)
@@ -2610,7 +2668,7 @@ if bpy is not None:
                     return {'CANCELLED'}
                 W, H = int(img.size[0]), int(img.size[1])
             mixed = set()
-            if self.step in ('ALL', 'STRAIGHTEN') and s.straighten:
+            if getattr(self, "step", 'ALL') in ('ALL', 'STRAIGHTEN') and s.straighten:
                 mixed = straighten_mixed(context, W, H, opt)
             objs, recs = collect(context, W, H, mixed, all_faces=img is not None)
             rev_before = read_revs([o.name for o in objs]) if img is not None else None
@@ -3052,6 +3110,22 @@ if bpy is not None:
             self.apply(context)
             return {'RUNNING_MODAL'}
 
+    CHARACTER_PRESET = dict(head=2.0, hands=1.3, body=1.0, legs=0.8, props=1.5,
+                            head_from=0.78, legs_to=0.45, hands_from=0.6)
+
+    class _Stage:
+        """Stands in for an operator when Auto Unwrap runs another operator's code directly."""
+
+        def __init__(self, **props):
+            self.__dict__.update(props)
+            self.messages = []
+
+        def report(self, level, msg):
+            self.messages.append((level, msg))
+
+    class _StageError(Exception):
+        pass
+
     class UV_OT_pixel_character_density(bpy.types.Operator):
         bl_idname = "uv.pixel_character_density"
         bl_label = "Character Density Preset"
@@ -3252,8 +3326,9 @@ if bpy is not None:
                 self.report({'WARNING'}, "No visible faces")
                 return {'CANCELLED'}
             types = {o.name: getattr(o, "pixuv_seam_type", 'AUTO') for o, _, _ in parts}
+            W, H, _ = texture_size(context, s)
             pairs, n_islands, used = auto_seams(verts, faces, groups, types, method=s.seam_method,
-                                                existing=existing)
+                                                existing=existing, tex_px=W * H)
             cut = set(pairs)
             n = 0
             for o, bm, base in parts:
@@ -3284,29 +3359,53 @@ if bpy is not None:
 
         def execute(self, context):
             s = context.scene.pixel_uv
-            if bpy.ops.uv.pixel_auto_seams() != {'FINISHED'}:
-                return {'CANCELLED'}
+            done = []
+
+            def stage(name, op_class, **props):
+                """Runs another operator's code directly (no bpy.ops round trip), keeping its
+                messages, and raises with the stage name if it doesn't finish."""
+                proxy = _Stage(**props)
+                try:
+                    result = op_class.execute(proxy, context)
+                except Exception as exc:
+                    raise _StageError("%s failed: %s" % (name, exc))
+                if result != {'FINISHED'}:
+                    msg = "; ".join(m for _, m in proxy.messages) or "cancelled"
+                    raise _StageError("%s stopped: %s" % (name, msg))
+                done.append("%s: %s" % (name, "; ".join(m for _, m in proxy.messages)))
+
             saved = []
-            for o in edit_objects(context):
-                bm = edit_bm(o.data)
-                saved.append((o, bm, [v.select for v in bm.verts], [e.select for e in bm.edges],
-                               [f.select for f in bm.faces]))
-                for f in bm.faces:
-                    if not f.hide:
-                        f.select_set(True)
-                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
             try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True, margin=0.0)
+                stage("Seams", UV_OT_pixel_auto_seams)
+                for o in edit_objects(context):
+                    bm = edit_bm(o.data)
+                    saved.append((o, bm, [v.select for v in bm.verts], [e.select for e in bm.edges],
+                                   [f.select for f in bm.faces]))
+                    for f in bm.faces:
+                        if not f.hide:
+                            f.select_set(True)
+                    bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+                try:
+                    res = bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True,
+                                            margin=0.0)
+                except Exception as exc:
+                    raise _StageError("Unwrap failed: %s" % exc)
+                if res != {'FINISHED'}:
+                    raise _StageError("Blender's Unwrap was cancelled")
                 if s.unwrap_preset:
-                    bpy.ops.uv.pixel_character_density()
-                result = bpy.ops.uv.pixel_perfect(step='ALL')
+                    stage("Density preset", UV_OT_pixel_character_density, **CHARACTER_PRESET)
+                stage("Pixel Perfect", UV_OT_pixel_perfect, step='ALL')
+            except _StageError as exc:
+                self.report({'ERROR'}, "Auto Unwrap: %s" % exc)
+                return {'CANCELLED'}
             finally:
                 for o, bm, vs, es, fs in saved:
                     for elems, st in ((bm.verts, vs), (bm.edges, es), (bm.faces, fs)):
                         for e, v in zip(elems, st):
                             e.select = v
                     bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
-            return {'FINISHED'} if result == {'FINISHED'} else {'CANCELLED'}
+            self.report({'INFO'}, " | ".join(done))
+            return {'FINISHED'}
 
     def active_face_density(context):
         obj = context.edit_object
