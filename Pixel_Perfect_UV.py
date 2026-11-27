@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 12),
+    "version": (0, 9, 13),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -635,9 +635,55 @@ def mixed_grid(isl, max_distortion, skip=(), parallel=True):
         if lattice_layout(isl) is not None:
             return None          # a clean grid: build_layouts straightens it directly
         sub, back = grid_part(isl)
-        groups = [(sub, back)] if sub is not None and len(sub.faces) >= 2 else []
     else:
-        groups = [_sub_island(isl, c) for c in _quad_groups(isl) if len(c) >= 2]
+        if _finger_strips(isl) >= 2:
+            return _hand_grid(isl, max_distortion, skip, parallel)
+        sub, back = quad_part(isl)
+    # anything that isn't a hand: the main quad group only, placed where it is (as before 0.9.12)
+    if sub is None or len(sub.faces) < 2:
+        return None
+    lay = lattice_layout(sub)
+    if lay is None or distortion(sub, lay) > max_distortion:
+        return None
+    k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
+    co = _centroid(sub.uv)
+    return {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
+
+
+def _finger_strips(isl):
+    """How many of an island's quad groups are fingers: a single row of 2-6 quads attached to
+    the rest of the island at one end only."""
+    n = 0
+    for comp in _quad_groups(isl):
+        if not 2 <= len(comp) <= 6:
+            continue
+        sub, back = _sub_island(isl, comp)
+        lay = lattice_layout(sub)
+        if lay is None:
+            continue
+        xs = {round(p[0], 3) for p in lay}
+        ys = {round(p[1], 3) for p in lay}
+        if min(len(xs), len(ys)) != 2:
+            continue             # not one quad wide
+        inside = set(back)
+        gf = set(sub.face_ids)
+        anchors = {v for f, fid in zip(isl.faces, isl.face_ids) if fid not in gf for v in f if v in inside}
+        if not anchors or len(anchors) > 4:
+            continue
+        # attached at one end: all anchors in the first or the last row of the strip
+        long_axis = 0 if len(xs) > len(ys) else 1
+        pos = [lay[i][long_axis] for i, v in enumerate(back) if v in anchors]
+        lo, hi = min(p[long_axis] for p in lay), max(p[long_axis] for p in lay)
+        step = (hi - lo) / max(1, max(len(xs), len(ys)) - 1)
+        if all(p <= lo + 0.5 * step for p in pos) or all(p >= hi - 0.5 * step for p in pos):
+            n += 1
+    return n
+
+
+def _hand_grid(isl, max_distortion, skip=(), parallel=True):
+    """mixed_grid for hands: every quad group straightened (each finger, not only the biggest),
+    the fingers pointing the same way when parallel, kept attached where they join the palm."""
+    groups = [_sub_island(isl, c) for c in _quad_groups(isl) if len(c) >= 2]
     ready = []
     for sub, back in groups:
         lay = lattice_layout(sub)
@@ -1284,6 +1330,84 @@ def orient_layout(isl, lay, up, front):
     return lay
 
 
+def straighten_lines(isl, lay, max_distortion, min_ratio=2.0, cos_lim=0.85, rotate=True):
+    """Partial straightening for islands that aren't clean quad grids (a hand with its palm
+    triangles, an arm): edges that run along the island's long direction in 3D are joined into
+    lines and each line is made straight in UV (one shared horizontal or vertical position), the
+    other coordinate keeping the unwrap. Only for elongated islands, and only kept if nothing
+    flips or overlaps and the stretch stays in bounds. Returns the new layout or None."""
+    n = len(lay)
+    if n < 4 or len(isl.faces) < 3:
+        return None
+    pts = isl.p3
+    c = tuple(sum(p[k] for p in pts) / n for k in range(3))
+    cov = [[sum((p[r] - c[r]) * (p[q] - c[q]) for p in pts) for q in range(3)] for r in range(3)]
+    ax = (0.3, 1.0, 0.6)
+    for _ in range(40):
+        ax = _normalize(tuple(sum(cov[r][q] * ax[q] for q in range(3)) for r in range(3)))
+    l1 = sum(sum(cov[r][q] * ax[q] for q in range(3)) * ax[r] for r in range(3))
+    tr = cov[0][0] + cov[1][1] + cov[2][2]
+    l2 = (tr - l1) / 2.0         # average of the other two spreads
+    if l1 < min_ratio * max(l2, EPS):
+        return None              # not elongated: no clear direction for the lines
+    got = dir_in_uv(isl, lay, ax)
+    if not got:
+        return None
+    d = (got[0], got[1])
+    if math.hypot(*d) < EPS:
+        return None
+    # the axis it is closest to in UV (orientation was decided before; just make it exact)
+    ang = math.atan2(d[1], d[0])
+    snap = round(ang / (math.pi / 2)) * (math.pi / 2)
+    rot = snap - ang if rotate else 0.0
+    cs, sn = math.cos(rot), math.sin(rot)
+    cx = sum(p[0] for p in lay) / n
+    cy = sum(p[1] for p in lay) / n
+    pts2 = [((x - cx) * cs - (y - cy) * sn + cx, (x - cx) * sn + (y - cy) * cs + cy) for x, y in lay]
+    k = 0 if abs(math.cos(snap)) < 0.5 else 1      # the coordinate across the lines
+    par = list(range(n))
+
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+    for f in isl.faces:
+        for i in range(len(f)):
+            a, b = f[i], f[(i + 1) % len(f)]
+            e = _sub(pts[b], pts[a])
+            ln = math.sqrt(_dot3(e, e))
+            if ln > EPS and abs(_dot3(e, ax)) / ln >= cos_lim:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    par[ra] = rb
+    groups = defaultdict(list)
+    for v in range(n):
+        groups[find(v)].append(v)
+    new = [list(p) for p in pts2]
+    moved = False
+    for vs in groups.values():
+        if len(vs) < 2:
+            continue
+        m = sum(pts2[v][k] for v in vs) / len(vs)
+        for v in vs:
+            new[v][k] = m
+        moved = True
+    if not moved:
+        return None
+    new = [tuple(p) for p in new]
+    before = [signed_area2d([lay[i] for i in f]) for f in isl.faces]
+    after = [signed_area2d([new[i] for i in f]) for f in isl.faces]
+    if any(b * a <= 0 for b, a in zip(before, after) if abs(b) > EPS):
+        return None              # a face would flip or collapse
+    if uv_overlap(new, isl.faces) > max(0.005, uv_overlap(lay, isl.faces)):
+        return None
+    d0, d1 = distortion(isl, lay), distortion(isl, new)
+    if d1 > max(max_distortion, d0 + 0.02):
+        return None
+    return new
+
+
 def build_layouts(islands, opt):
     for isl in islands:
         isl.units = None
@@ -1309,6 +1433,11 @@ def build_layouts(islands, opt):
                     if turned is None and not is_grid(isl, lay):
                         turned = orient_exact(isl, lay, opt.up, opt.front)
                 lay = turned if turned is not None else orient_layout(isl, lay, opt.up, opt.front)
+            if getattr(opt, "straighten_lines", False) and opt.straighten:
+                lined = straighten_lines(isl, lay, opt.max_distortion, rotate=not isl.keep_rot)
+                if lined is not None:
+                    lay = lined
+                    isl.lined = True
             isl.units = lay
             isl.kind = "straight" if isl.keep_rot else ("aligned" if opt.align else "keep")
             isl.mask = grid_mask(isl, lay)
@@ -2493,6 +2622,10 @@ class SeamMesh:
         return cuts
 
     def ear_cut(self, cuts, types=None, depth=0.2, box=0.6, low=0.86, high=0.97):
+        for sgn in (1.0, -1.0):   # each ear found on its own side (no mirror copy)
+            self._ear_side(cuts, types, sgn, depth, box, low, high)
+
+    def _ear_side(self, cuts, types, sgn, depth, box, low, high):
         """Cuts each ear out like the hand-made unwraps: the outside of the ear (faces pointing
         out and forward) as one whole island, the back of the ear (turned to the head) as another.
         Grown from the most sideways face of the head; mirrored to the other ear."""
@@ -2503,7 +2636,7 @@ class SeamMesh:
         h0, h1 = min(hs), max(hs)
         rng = (h1 - h0) or 1.0
         t = lambda f: (_dot(self.fc[f], self.up) - h0) / rng
-        side = tuple(1.0 if k == self.axis else 0.0 for k in range(3))
+        side = tuple(sgn if k == self.axis else 0.0 for k in range(3))
         sx = lambda f: _dot(self.fc[f], side)
         organic = lambda f: (types or {}).get(self.G[f], "ORGANIC") == "ORGANIC"
         # ears sit just outside the skull (a hood or collar further out is not an ear)
@@ -2565,15 +2698,12 @@ class SeamMesh:
                     fl = self.EF[e]
                     if len(fl) == 2 and all(g in piece for g in fl) and e in cuts and e not in locked:
                         cuts.discard(e)
-                        m = self.emir.get(e, -1)
-                        if m not in locked:
-                            cuts.discard(m)
         ear = outer | back
         new = [e for f in ear for e in self.FE[f] if len(self.EF[e]) == 2 and
                (sum(1 for g in self.EF[e] if g in ear) == 1 or
                 (self.EF[e][0] in outer) != (self.EF[e][1] in outer) and all(g in ear for g in self.EF[e]))]
         before = set(cuts)
-        self.add_mirrored(cuts, new)
+        cuts.update(new)
         self.locked |= cuts - before
 
     def nose_cut(self, cuts, width=0.3, depth=0.25, height=0.5):
