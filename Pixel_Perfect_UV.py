@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 8, 0),
+    "version": (0, 8, 1),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -882,6 +882,37 @@ def dir_in_uv(isl, coords, vec):
     return sx, sy, w, tot
 
 
+def orient_centre_line(isl, lay, up, axis=0):
+    """Islands that cross the model's centre line (face, chest, back): rotate so the centre line
+    is exactly vertical, with the model's up pointing up. None if the island doesn't cross it."""
+    pts = isl.pl or isl.p3
+    if not pts:
+        return None
+    size = max(max(p[k] for p in pts) - min(p[k] for p in pts) for k in range(3)) or 1.0
+    tol = size * 2e-3
+    if not (any(p[axis] > tol * 3 for p in pts) and any(p[axis] < -tol * 3 for p in pts)):
+        return None
+    cen = [i for i, p in enumerate(pts) if abs(p[axis]) <= tol]
+    if len(cen) < 2:
+        return None
+    c2 = [lay[i] for i in cen]
+    mx = sum(p[0] for p in c2) / len(c2)
+    my = sum(p[1] for p in c2) / len(c2)
+    sxx = sum((p[0] - mx) ** 2 for p in c2)
+    syy = sum((p[1] - my) ** 2 for p in c2)
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in c2)
+    if sxx + syy < 1e-12:
+        return None
+    ang = 0.5 * math.atan2(2 * sxy, sxx - syy)     # main direction of the centre line
+    dx, dy = math.cos(ang), math.sin(ang)
+    ux, uy, w, tot = dir_in_uv(isl, lay, up)
+    if ux * dx + uy * dy < 0:
+        dx, dy = -dx, -dy
+    rot = math.pi / 2 - math.atan2(dy, dx)
+    cs, sn = math.cos(rot), math.sin(rot)
+    return [(x * cs - y * sn, x * sn + y * cs) for x, y in lay]
+
+
 def orient_layout(isl, lay, up, front):
     """Turns the layout by a multiple of 90 degrees so the model's up points up (+V); islands
     lying flat (top of the head, soles) use the front direction instead."""
@@ -920,7 +951,8 @@ def build_layouts(islands, opt):
         lay = align_layout(isl, rotate=opt.align and not isl.keep_rot)
         if lay is not None:
             if orient and (opt.align or isl.keep_rot):
-                lay = orient_layout(isl, lay, opt.up, opt.front)
+                centred = None if isl.keep_rot else orient_centre_line(isl, lay, opt.up)
+                lay = centred if centred is not None else orient_layout(isl, lay, opt.up, opt.front)
             isl.units = lay
             isl.kind = "straight" if isl.keep_rot else ("aligned" if opt.align else "keep")
             isl.mask = grid_mask(isl, lay)
@@ -1889,7 +1921,49 @@ class SeamMesh:
             if not changed:
                 break
         self.merge_small(cuts, tex_px=getattr(self, "tex_px", 256 * 256))
+        self.merge_face(cuts)
         return cuts
+
+    def merge_face(self, cuts, max_iter=60):
+        """Pieces of the face (charts touching the protected middle of the face) are merged into
+        one island, as long as the result is still a disk: forehead, cheeks and chin stay with
+        the face instead of becoming separate islands."""
+        zone = set()
+        for e in getattr(self, "protected", ()):
+            zone.update(self.EF[e])
+        if not zone:
+            return
+        for _ in range(max_iter):
+            charts = self.charts(cuts)
+            owner = {}
+            for ci, ch in enumerate(charts):
+                for f in ch:
+                    owner[f] = ci
+            zc = [ci for ci, ch in enumerate(charts) if any(f in zone for f in ch)]
+            if len(zc) < 2:
+                return
+            main = max(zc, key=lambda ci: sum(1 for f in charts[ci] if f in zone))
+            shared = defaultdict(list)
+            for f in charts[main]:
+                for e in self.FE[f]:
+                    if e in cuts and len(self.EF[e]) == 2:
+                        o = owner[self.EF[e][1]] if owner[self.EF[e][0]] == main else owner[self.EF[e][0]]
+                        if o != main and o in zc:
+                            shared[o].append(e)
+            merged = False
+            for o, es in sorted(shared.items(), key=lambda kv: -len(kv[1])):
+                trial = set(cuts)
+                for e in es:
+                    trial.discard(e)
+                    trial.discard(self.emir.get(e, -1))
+                if all(len(lp) == 1 and gn == 0 for lp, gn, _, _ in
+                       (self.topology(c, trial) for c in self.charts(trial))):
+                    cuts.clear()
+                    cuts.update(trial)
+                    merged = True
+                    break
+            if not merged:
+                return
 
     def merge_small(self, cuts, min_px=4.0, tex_px=256 * 256, fill=0.65, max_iter=300):
         """Islands that would end up smaller than min_px pixels (estimated at the density that
