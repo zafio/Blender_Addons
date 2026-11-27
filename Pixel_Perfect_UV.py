@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 13),
+    "version": (0, 9, 14),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -626,7 +626,7 @@ def _fit_grid(sub, back, lay, anchors, aim=None):
     return {back[i]: p for i, p in enumerate(best[1])}
 
 
-def mixed_grid(isl, max_distortion, skip=(), parallel=True):
+def mixed_grid(isl, max_distortion, skip=(), parallel=True, extended=True):
     """For a quad + non-quad island: straight layouts of its quad groups (every finger of a hand,
     not only the biggest group), each turned to the way it lies now and kept attached where it
     joins the rest. skip: indices of quad groups to leave out. Returns {island_vertex: (x, y)}
@@ -639,15 +639,56 @@ def mixed_grid(isl, max_distortion, skip=(), parallel=True):
         if _finger_strips(isl) >= 2:
             return _hand_grid(isl, max_distortion, skip, parallel)
         sub, back = quad_part(isl)
-    # anything that isn't a hand: the main quad group only, placed where it is (as before 0.9.12)
+    # anything that isn't a hand: the main quad group, placed where it is (as before 0.9.12)
     if sub is None or len(sub.faces) < 2:
         return None
     lay = lattice_layout(sub)
+    if lay is None and extended:
+        # the group has a pole: its biggest clean grid instead of nothing
+        part, pb = grid_part(sub)
+        if part is not None and len(part.faces) >= 2:
+            sub, back = part, [back[i] for i in pb]
+            lay = lattice_layout(sub)
     if lay is None or distortion(sub, lay) > max_distortion:
         return None
     k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
     co = _centroid(sub.uv)
-    return {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
+    pins = {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
+    if extended:
+        # quads left over (a strip hanging off the grid): each straight too, kept attached
+        done = set(sub.face_ids)
+        rest = [fi for fi, (f, fid) in enumerate(zip(isl.faces, isl.face_ids))
+                if len(f) == 4 and len(set(f)) == 4 and fid not in done]
+        if rest:
+            tmp = Island()
+            tmp.faces = [isl.faces[fi] for fi in rest]
+            tmp.face_ids = [isl.face_ids[fi] for fi in rest]
+            tmp.uv, tmp.p3 = isl.uv, isl.p3
+            for comp in _quad_groups(tmp):
+                if len(comp) < 2:
+                    continue
+                part, pb = _sub_island(isl, [rest[c] for c in comp])
+                play = lattice_layout(part)
+                if play is None or distortion(part, play) > max_distortion:
+                    continue
+                inside = set(pb)
+                gf = set(part.face_ids)
+                anchors = {v for f, fid in zip(isl.faces, isl.face_ids) if fid not in gf
+                           for v in f if v in inside}
+                placed = _fit_grid(part, pb, play, anchors)
+                if not placed:
+                    continue
+                shared = [v for v in placed if v in pins]
+                if shared:
+                    # follow the grid where they meet (it has moved since the unwrap)
+                    ox = sum(pins[v][0] - placed[v][0] for v in shared) / len(shared)
+                    oy = sum(pins[v][1] - placed[v][1] for v in shared) / len(shared)
+                    placed = {v: (p[0] + ox, p[1] + oy) for v, p in placed.items()}
+                    if max(math.hypot(pins[v][0] - placed[v][0], pins[v][1] - placed[v][1])
+                           for v in shared) > 0.5 * math.sqrt(abs_area(part, part.uv) / len(part.faces)):
+                        continue  # can't join the grid without bending it
+                pins.update({v: p for v, p in placed.items() if v not in pins})
+    return pins
 
 
 def _finger_strips(isl):
@@ -3779,7 +3820,8 @@ if bpy is not None:
             if not ok:
                 # fingers each straight along their own nearest axis, then without the one finger
                 # that can't be straightened without folding the rest
-                tries = [mixed_grid(isl, opt.max_distortion, parallel=False)]
+                tries = [mixed_grid(isl, opt.max_distortion, parallel=False),
+                         mixed_grid(isl, opt.max_distortion, extended=False)]   # as in 0.9.13
                 n = len(_quad_groups(isl))
                 tries += [mixed_grid(isl, opt.max_distortion, skip={k}, parallel=p)
                           for p in (True, False) for k in range(n)]
