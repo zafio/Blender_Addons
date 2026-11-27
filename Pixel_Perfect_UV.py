@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 3),
+    "version": (0, 9, 4),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1609,6 +1609,8 @@ def _normalize(a):
     return (a[0] / l, a[1] / l, a[2] / l) if l > 1e-12 else (0.0, 0.0, 0.0)
 
 
+FACE_STRETCH = 0.15   # face merges must flatten at least this well (the sample faces: ~9%)
+
 SEAM_TYPES = {
     # angle: feature edge angle; chain: min edges in a sharp chain to count as a border
     # curv: max total |Gaussian curvature| (radians) a chart may keep before being split
@@ -2119,7 +2121,61 @@ class SeamMesh:
                 break
         self.merge_small(cuts, tex_px=getattr(self, "tex_px", 256 * 256))
         self.merge_face(cuts)
+        self.stretch_split(cuts, types)
         return cuts
+
+    def chart_stretch(self, chart, cuts):
+        """LSCM-flattened stretch of a chart (vertices split along its seams)."""
+        fs = set(chart)
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for f in chart:
+            for e in self.FE[f]:
+                fl = self.EF[e]
+                if e in cuts or len(fl) != 2 or not all(g in fs for g in fl):
+                    continue
+                for v in self.E[e]:
+                    ra, rb = find((fl[0], v)), find((fl[1], v))
+                    if ra != rb:
+                        parent[ra] = rb
+        ids, verts, faces = {}, [], []
+        for f in chart:
+            face = []
+            for v in self.F[f]:
+                r = find((f, v))
+                if r not in ids:
+                    ids[r] = len(verts)
+                    verts.append(self.V[v])
+                face.append(ids[r])
+            faces.append(face)
+        return lscm_stretch(verts, faces)
+
+    def stretch_split(self, cuts, types, limit=0.25, min_faces=12, max_iter=12):
+        """Any island that would still stretch more than `limit` when flattened is split across
+        its main axis (and made flat-able again)."""
+        for _ in range(max_iter):
+            worst = None
+            for ch in self.charts(cuts):
+                if len(ch) < min_faces:
+                    continue
+                st = self.chart_stretch(ch, cuts)
+                if st > limit and (worst is None or st > worst[0]):
+                    worst = (st, ch)
+            if worst is None:
+                return
+            p = self.split_plane(worst[1], cuts)
+            if not p:
+                return
+            self.add_mirrored(cuts, p)
+            for _ in range(50):
+                if not any(self.diskify(c, cuts) for c in self.charts(cuts)):
+                    break
 
     def _segments(self, edges):
         """Connected stretches of edges (sharing vertices), longest first."""
@@ -2145,7 +2201,7 @@ class SeamMesh:
             out.append(comp)
         return sorted(out, key=len, reverse=True)
 
-    def _try_join(self, cuts, es, max_curv=None, allow_holes=False):
+    def _try_join(self, cuts, es, max_curv=None, allow_holes=False, max_stretch=None):
         """Removes the shared seam (all of it first, else one connected stretch, each with its
         mirror) if every chart stays a disk and, with max_curv, the joined chart doesn't get more
         curved than that (a too curved island stretches badly when flattened)."""
@@ -2172,10 +2228,11 @@ class SeamMesh:
                     break
             if not ok:
                 continue
-            if max_curv is not None:
-                joined = [c for c in charts if near & set(c)]
-                if any(self.curvature(c, trial) > max_curv for c in joined):
-                    continue
+            joined = [c for c in charts if near & set(c)]
+            if max_curv is not None and any(self.curvature(c, trial) > max_curv for c in joined):
+                continue
+            if max_stretch is not None and any(self.chart_stretch(c, trial) > max_stretch for c in joined):
+                continue
             cuts.clear()
             cuts.update(trial)
             return True
@@ -2240,7 +2297,8 @@ class SeamMesh:
                                     not (nose and nose & set(charts[o])):
                                 shared[o].append(e)
                 lim = SEAM_TYPES["ORGANIC"]["curv"]
-                if any(self._try_join(cuts, es, lim) for _, es in sorted(shared.items(), key=lambda kv: -len(kv[1]))):
+                if any(self._try_join(cuts, es, lim, max_stretch=FACE_STRETCH)
+                       for _, es in sorted(shared.items(), key=lambda kv: -len(kv[1]))):
                     joined = True
                     break
             if not joined:
@@ -2290,7 +2348,7 @@ class SeamMesh:
                 shared[(min(a, b), max(a, b))].append(e)
             pairs = sorted(shared.items(), key=lambda kv: (main not in kv[0], -len(kv[1])))
             lim = SEAM_TYPES["ORGANIC"]["curv"]
-            if not any(self._try_join(cuts, es, lim, allow_holes=True) for _, es in pairs):
+            if not any(self._try_join(cuts, es, lim, max_stretch=FACE_STRETCH) for _, es in pairs):
                 return
 
 
@@ -2350,6 +2408,88 @@ class SeamMesh:
                     break
             if not merged:
                 return
+
+
+def lscm_stretch(verts, faces):
+    """Flattens a patch with least squares conformal maps (like Blender's unwrap family) and
+    returns its average edge stretch (0 = none; same measure as `distortion`). verts: 3D points,
+    faces: lists of indices into verts. Returns inf if it can't be flattened."""
+    import numpy as np
+    n = len(verts)
+    if n < 3 or not faces:
+        return 0.0
+    rows = []
+    for f in faces:
+        for k in range(1, len(f) - 1):
+            ids = (f[0], f[k], f[k + 1])
+            p0, p1, p2 = (verts[i] for i in ids)
+            e1, e2 = _sub(p1, p0), _sub(p2, p0)
+            l1 = _length(e1)
+            nrm = _cross(e1, e2)
+            a2 = _length(nrm)
+            if l1 < 1e-12 or a2 < 1e-14:
+                continue
+            ex = _mul(e1, 1.0 / l1)
+            ey = _normalize(_cross(_normalize(nrm), ex))
+            loc = ((0.0, 0.0), (l1, 0.0), (_dot(e2, ex), _dot(e2, ey)))
+            s = 1.0 / math.sqrt(a2)
+            row = {}
+            for j in range(3):
+                xa, ya = loc[(j + 1) % 3]
+                xb, yb = loc[(j + 2) % 3]
+                row[ids[j]] = complex(xb - xa, yb - ya) * s
+            rows.append(row)
+    if not rows:
+        return float("inf")
+    # pin the two vertices furthest apart
+    a = 0
+    b = max(range(n), key=lambda i: _length(_sub(verts[i], verts[a])))
+    a = max(range(n), key=lambda i: _length(_sub(verts[i], verts[b])))
+    if a == b:
+        return float("inf")
+    free = [i for i in range(n) if i not in (a, b)]
+    col = {v: k for k, v in enumerate(free)}
+    pin = {a: complex(0.0, 0.0), b: complex(1.0, 0.0)}
+    m = len(free)
+    A = np.zeros((2 * len(rows), 2 * m))
+    rhs = np.zeros(2 * len(rows))
+    for r, row in enumerate(rows):
+        for v, c in row.items():
+            if v in pin:
+                z = c * pin[v]
+                rhs[2 * r] -= z.real
+                rhs[2 * r + 1] -= z.imag
+            else:
+                k = col[v]
+                A[2 * r, 2 * k], A[2 * r, 2 * k + 1] = c.real, -c.imag
+                A[2 * r + 1, 2 * k], A[2 * r + 1, 2 * k + 1] = c.imag, c.real
+    try:
+        sol = np.linalg.lstsq(A, rhs, rcond=None)[0]
+    except Exception:
+        return float("inf")
+    uv = [None] * n
+    for v, z in pin.items():
+        uv[v] = (z.real, z.imag)
+    for v, k in col.items():
+        uv[v] = (sol[2 * k], sol[2 * k + 1])
+    a3 = sum(area3d([verts[i] for i in f]) for f in faces)
+    a2 = sum(abs(signed_area2d([uv[i] for i in f])) for f in faces)
+    if a3 < 1e-14 or a2 < 1e-14:
+        return float("inf")
+    k = math.sqrt(a3 / a2)
+    tot = wsum = 0.0
+    for f in faces:
+        for i in range(len(f)):
+            p, q = f[i], f[(i + 1) % len(f)]
+            l3 = _length(_sub(verts[p], verts[q]))
+            l2 = math.hypot(uv[p][0] - uv[q][0], uv[p][1] - uv[q][1]) * k
+            if l3 < 1e-12:
+                continue
+            if l2 < 1e-12:
+                return float("inf")
+            tot += abs(math.log(l2 / l3)) * l3
+            wsum += l3
+    return tot / wsum if wsum else 0.0
 
 
 def classify_group(mesh, faces):
