@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 9),
+    "version": (0, 9, 10),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2417,6 +2417,13 @@ class SeamMesh:
                 st = max(self.chart_stretch(c, trial) if len(c) >= 3 else 0.0 for c in pieces)
                 cost = sum(self.cost[e] for e in trial - cuts)
                 score = st + 0.002 * cost + 0.02 * len(pieces)
+                face = getattr(self, "face_faces", set())
+                if face & fs:
+                    # a head: keep the face as big as possible (cheeks, temples, forehead with it)
+                    # as long as every piece flattens well; the back of the head stays one piece
+                    biggest = max(len(c) for c in pieces if face.intersection(c))
+                    score = (0 if st <= limit else 1) + st * 0.2 - biggest / float(len(fs)) \
+                        + 0.02 * len(pieces)
                 if best is None or score < best[0]:
                     best = (score, trial)
             if best is None:
