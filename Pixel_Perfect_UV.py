@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 6),
+    "version": (0, 9, 7),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1887,10 +1887,11 @@ class SeamMesh:
         return cuts
 
     def split_plane(self, chart, cuts):
-        """Cut the chart across its main axis at the narrowest, cheapest cross-section."""
+        """Cuts the chart at the cheapest cross-section, trying planes across its main axis and
+        across the model's front and up directions (a head splits into face and back of the head,
+        not into an upper and a lower face). Cuts through the face cost a lot more."""
         pts = [self.fc[f] for f in chart]
         c = _mul(tuple(map(sum, zip(*pts))), 1.0 / len(pts))
-        # main axis by power iteration on the covariance
         cov = [[0.0] * 3 for _ in range(3)]
         for p in pts:
             d = _sub(p, c)
@@ -1900,28 +1901,30 @@ class SeamMesh:
         ax = (1.0, 0.7, 0.3)
         for _ in range(30):
             ax = _normalize(tuple(sum(cov[i][j] * ax[j] for j in range(3)) for i in range(3)))
-        proj = {f: _dot(_sub(self.fc[f], c), ax) for f in chart}
-        lo, hi = min(proj.values()), max(proj.values())
-        if hi - lo < 1e-9:
-            return None
+        face = getattr(self, "face_faces", set())
         fs = set(chart)
         best = None
-        for step in range(1, 20):
-            t = lo + (hi - lo) * step / 20.0
-            side = {f: proj[f] > t for f in chart}
-            n_pos = sum(side.values())
-            if n_pos < 2 or len(chart) - n_pos < 2:
+        for axis in (ax, self.front, self.up):
+            proj = {f: _dot(_sub(self.fc[f], c), axis) for f in chart}
+            lo, hi = min(proj.values()), max(proj.values())
+            if hi - lo < 1e-9:
                 continue
-            cut = [e for f in chart for e in self.FE[f]
-                   if len(self.EF[e]) == 2 and e not in cuts and all(g in fs for g in self.EF[e])
-                   and side[self.EF[e][0]] != side[self.EF[e][1]]]
-            cut = list(set(cut))
-            if not cut:
-                continue
-            balance = min(n_pos, len(chart) - n_pos) / len(chart)
-            score = sum(self.cost[e] for e in cut) / (0.2 + balance)
-            if best is None or score < best[0]:
-                best = (score, cut)
+            for step in range(1, 20):
+                t = lo + (hi - lo) * step / 20.0
+                side = {f: proj[f] > t for f in chart}
+                n_pos = sum(side.values())
+                if n_pos < 2 or len(chart) - n_pos < 2:
+                    continue
+                cut = list({e for f in chart for e in self.FE[f]
+                            if len(self.EF[e]) == 2 and e not in cuts and all(g in fs for g in self.EF[e])
+                            and side[self.EF[e][0]] != side[self.EF[e][1]]})
+                if not cut:
+                    continue
+                balance = min(n_pos, len(chart) - n_pos) / len(chart)
+                cost = sum(self.cost[e] for e in cut)   # face edges already cost 30x
+                score = cost / (0.2 + balance)
+                if best is None or score < best[0]:
+                    best = (score, cut)
         return best[1] if best else None
 
     def diskify(self, chart, cuts):
@@ -1929,6 +1932,25 @@ class SeamMesh:
         loops, genus, interior, bverts = self.topology(chart, cuts)
         if len(loops) == 1 and genus == 0:
             return False
+        face = getattr(self, "face_faces", set())
+        if len(loops) > 1 and face and face & set(chart):
+            # face islands: seams inside the face that separate nothing are dropped (opening them
+            # would slice the face); a hole round another island (the nose) is fine, Blender's
+            # unwrap fills it
+            fs = set(chart)
+            outer = max(loops, key=len)
+            slits = [lp for lp in loops if lp is not outer and
+                     all(e in cuts and len(self.EF[e]) == 2 and all(g in fs for g in self.EF[e]) for e in lp)]
+            if slits:
+                for lp in slits:
+                    for e in lp:
+                        if e in getattr(self, "locked", ()):
+                            continue
+                        cuts.discard(e)
+                        cuts.discard(self.emir.get(e, -1))
+                return True
+            if all(any(not all(g in fs for g in self.EF[e]) for e in lp) for lp in loops if lp is not outer):
+                return False
         if genus > 0 or len(loops) == 0:
             if len(loops) == 0 and genus == 0:
                 # closed sphere: cut from the most hidden vertex to a far hidden vertex
@@ -2040,6 +2062,10 @@ class SeamMesh:
             self.cost[ei] *= 60.0
             if getattr(self, "prob", None) is not None:
                 self.prob[ei] = 0.0
+        # cuts added to open or split islands go round the face, not across it
+        for ei, fl in enumerate(self.EF):
+            if len(fl) == 2 and fl[0] in self.face_faces and fl[1] in self.face_faces and ei not in self.protected:
+                self.cost[ei] *= 30.0
 
     def neck_cut(self, cuts, types, head_from=0.78, low=0.7, high=0.9):
         """Organic objects: an island holding both the head and the body below the neck is cut
