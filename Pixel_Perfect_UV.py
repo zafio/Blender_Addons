@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 11),
+    "version": (0, 9, 12),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -542,23 +542,177 @@ def grid_part(isl):
     return sub, back
 
 
-def mixed_grid(isl, max_distortion):
-    """For a quad + non-quad island: straight layout of its main quad group, scaled to the
-    group's current size and placed where it is now (px). Returns {island_vertex: (x, y)} or None."""
+def _quad_groups(isl):
+    """Edge-connected groups of quads in an island (lists of face indices), biggest first."""
+    quads = [fi for fi, f in enumerate(isl.faces) if len(f) == 4 and len(set(f)) == 4]
+    edge_faces = defaultdict(list)
+    for fi in quads:
+        f = isl.faces[fi]
+        for k in range(4):
+            edge_faces[frozenset((f[k], f[(k + 1) % 4]))].append(fi)
+    seen, out = set(), []
+    for start in quads:
+        if start in seen:
+            continue
+        comp, stack = [], [start]
+        seen.add(start)
+        while stack:
+            fi = stack.pop()
+            comp.append(fi)
+            f = isl.faces[fi]
+            for k in range(4):
+                for g in edge_faces[frozenset((f[k], f[(k + 1) % 4]))]:
+                    if g not in seen:
+                        seen.add(g)
+                        stack.append(g)
+        out.append(comp)
+    return sorted(out, key=len, reverse=True)
+
+
+def _sub_island(isl, comp):
+    sub = Island()
+    remap, back = {}, []
+    for fi in comp:
+        face = []
+        for v in isl.faces[fi]:
+            if v not in remap:
+                remap[v] = len(back)
+                back.append(v)
+                sub.uv.append(isl.uv[v])
+                sub.p3.append(isl.p3[v])
+            face.append(remap[v])
+        sub.faces.append(face)
+        sub.face_ids.append(isl.face_ids[fi])
+    return sub, back
+
+
+def _fit_grid(sub, back, lay, anchors, aim=None):
+    """Places a straight layout of a quad group: scaled to the group's current size, turned in
+    90 degree steps (mirrored only to keep the faces' winding) to the way it lies now, and moved
+    so the vertices where it joins the rest of the island stay put. {island vertex: (x, y)}."""
+    k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
+    cur = sub.uv
+    sign_cur = sum(signed_area2d([cur[i] for i in f]) for f in sub.faces)
+    idx = [i for i, v in enumerate(back) if v in anchors] or list(range(len(back)))
+    tips = [i for i in range(len(back)) if i not in idx]
+    ca = (sum(cur[i][0] for i in idx) / len(idx), sum(cur[i][1] for i in idx) / len(idx))
+    best = None
+    for mirror in (False, True):
+        for rot in range(4):
+            pts = []
+            for x, y in lay:
+                x, y = x * k, y * k
+                if mirror:
+                    x = -x
+                for _ in range(rot):
+                    x, y = -y, x
+                pts.append((x, y))
+            sign = sum(signed_area2d([pts[i] for i in f]) for f in sub.faces)
+            if sign * sign_cur < 0:
+                continue
+            la = (sum(pts[i][0] for i in idx) / len(idx), sum(pts[i][1] for i in idx) / len(idx))
+            pts = [(x - la[0] + ca[0], y - la[1] + ca[1]) for x, y in pts]
+            err = sum((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 for p, c in zip(pts, cur))
+            if aim is not None and tips:
+                # every finger points the same way: anchor -> tip along the island's common axis
+                tx = sum(pts[i][0] for i in tips) / len(tips) - ca[0]
+                ty = sum(pts[i][1] for i in tips) / len(tips) - ca[1]
+                ln = math.hypot(tx, ty) or 1.0
+                err = (0 if (tx * aim[0] + ty * aim[1]) / ln > 0.7 else 1e12) + err
+            if best is None or err < best[0]:
+                best = (err, pts)
+    if best is None:
+        return {}
+    return {back[i]: p for i, p in enumerate(best[1])}
+
+
+def mixed_grid(isl, max_distortion, skip=(), parallel=True):
+    """For a quad + non-quad island: straight layouts of its quad groups (every finger of a hand,
+    not only the biggest group), each turned to the way it lies now and kept attached where it
+    joins the rest. skip: indices of quad groups to leave out. Returns {island_vertex: (x, y)}
+    to pin, or None."""
     if all(len(f) == 4 for f in isl.faces):
         if lattice_layout(isl) is not None:
             return None          # a clean grid: build_layouts straightens it directly
         sub, back = grid_part(isl)
+        groups = [(sub, back)] if sub is not None and len(sub.faces) >= 2 else []
     else:
-        sub, back = quad_part(isl)
-    if sub is None or len(sub.faces) < 2:
-        return None
-    lay = lattice_layout(sub)
-    if lay is None or distortion(sub, lay) > max_distortion:
-        return None
-    k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
-    co = _centroid(sub.uv)
-    return {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
+        groups = [_sub_island(isl, c) for c in _quad_groups(isl) if len(c) >= 2]
+    ready = []
+    for sub, back in groups:
+        lay = lattice_layout(sub)
+        if lay is None:
+            part, pb = grid_part(sub)
+            if part is None or len(part.faces) < 2:
+                continue
+            sub, back = part, [back[i] for i in pb]
+            lay = lattice_layout(sub)
+            if lay is None:
+                continue
+        if distortion(sub, lay) > max_distortion:
+            continue
+        inside = set(back)
+        gfaces = set(sub.face_ids)
+        anchors = {v for f, fid in zip(isl.faces, isl.face_ids) if fid not in gfaces
+                   for v in f if v in inside}
+        ready.append((sub, back, lay, anchors))
+    # strips hanging off the rest (fingers): the axis they point along on average
+    aim = None
+    sx = sy = 0.0
+    strips = 0
+    for sub, back, lay, anchors in ready:
+        a = [i for i, v in enumerate(back) if v in anchors]
+        t = [i for i, v in enumerate(back) if v not in anchors]
+        if not a or not t or len(sub.faces) > 6:
+            continue
+        dx = sum(sub.uv[i][0] for i in t) / len(t) - sum(sub.uv[i][0] for i in a) / len(a)
+        dy = sum(sub.uv[i][1] for i in t) / len(t) - sum(sub.uv[i][1] for i in a) / len(a)
+        ln = math.hypot(dx, dy)
+        if ln > EPS:
+            sx += dx / ln
+            sy += dy / ln
+            strips += 1
+    if strips >= 2 and parallel:
+        aim = (1.0 if sx > 0 else -1.0, 0.0) if abs(sx) >= abs(sy) else (0.0, 1.0 if sy > 0 else -1.0)
+    def along_aim(sub, back, anchors):
+        a = [i for i, v in enumerate(back) if v in anchors]
+        t = [i for i, v in enumerate(back) if v not in anchors]
+        if aim is None or not a or not t:
+            return False
+        dx = sum(sub.uv[i][0] for i in t) / len(t) - sum(sub.uv[i][0] for i in a) / len(a)
+        dy = sum(sub.uv[i][1] for i in t) / len(t) - sum(sub.uv[i][1] for i in a) / len(a)
+        ln = math.hypot(dx, dy)
+        return ln > EPS and (dx * aim[0] + dy * aim[1]) / ln > 0.5   # a thumb keeps its own way
+    pins = {}
+    fingers = []
+    if skip:
+        ready = [r for k, r in enumerate(ready) if k not in skip]
+    for sub, back, lay, anchors in ready:
+        is_finger = len(sub.faces) <= 6 and along_aim(sub, back, anchors)
+        placed = _fit_grid(sub, back, lay, anchors, aim if is_finger else None)
+        if not placed or any(v in pins for v in placed):
+            continue             # touches a group already placed
+        if is_finger:
+            fingers.append(placed)
+        pins.update(placed)
+    if len(fingers) >= 2:
+        # side by side along the palm, in their order, none on top of another
+        perp = (-aim[1], aim[0])
+        span = lambda d: (min(p[0] * perp[0] + p[1] * perp[1] for p in d.values()),
+                          max(p[0] * perp[0] + p[1] * perp[1] for p in d.values()))
+        fingers.sort(key=lambda d: sum(span(d)))
+        shifts, edge = [], None
+        for d in fingers:
+            lo, hi = span(d)
+            sh = 0.0 if edge is None else max(0.0, edge - lo)
+            shifts.append(sh)
+            edge = hi + sh
+        mid = (max(shifts) + min(shifts)) / 2.0
+        for d, sh in zip(fingers, shifts):
+            off = sh - mid
+            for v, p in d.items():
+                pins[v] = (p[0] + perp[0] * off, p[1] + perp[1] * off)
+    return pins or None
 
 
 def convex_hull(pts):
@@ -2334,8 +2488,93 @@ class SeamMesh:
         self.merge_face(cuts)
         self.stretch_split(cuts, types)
         self.overlap_split(cuts)
+        self.ear_cut(cuts, types)
         self.nose_cut(cuts)
         return cuts
+
+    def ear_cut(self, cuts, types=None, depth=0.2, box=0.6, low=0.86, high=0.97):
+        """Cuts each ear out like the hand-made unwraps: the outside of the ear (faces pointing
+        out and forward) as one whole island, the back of the ear (turned to the head) as another.
+        Grown from the most sideways face of the head; mirrored to the other ear."""
+        hw = getattr(self, "head_half_width", 0.0)
+        if hw <= 0 or self.axis is None:
+            return
+        hs = [_dot(p, self.up) for p in self.V]
+        h0, h1 = min(hs), max(hs)
+        rng = (h1 - h0) or 1.0
+        t = lambda f: (_dot(self.fc[f], self.up) - h0) / rng
+        side = tuple(1.0 if k == self.axis else 0.0 for k in range(3))
+        sx = lambda f: _dot(self.fc[f], side)
+        organic = lambda f: (types or {}).get(self.G[f], "ORGANIC") == "ORGANIC"
+        # ears sit just outside the skull (a hood or collar further out is not an ear)
+        head = [f for f in range(len(self.F)) if low <= t(f) <= high and 0 < sx(f) <= 1.25 * hw and organic(f)]
+        if not head:
+            return
+        def ear_from(tip):
+            lim = sx(tip) - depth * hw
+            near = lambda f: abs(_dot(_sub(self.fc[f], self.fc[tip]), self.up)) <= box * hw and \
+                abs(_dot(_sub(self.fc[f], self.fc[tip]), self.front)) <= box * hw
+            region, queue = {tip}, deque([tip])
+            while queue:
+                f = queue.popleft()
+                for e in self.FE[f]:
+                    for g in self.EF[e]:
+                        if g not in region and sx(g) >= lim and near(g):
+                            region.add(g)
+                            queue.append(g)
+            out_f = {f for f in region if _dot(self.fn[f], side) > 0.3 and _dot(self.fn[f], self.front) > 0.2}
+            if not out_f:
+                return None
+
+            def component(start, allowed):
+                comp, queue = {start}, deque([start])
+                while queue:
+                    f = queue.popleft()
+                    for e in self.FE[f]:
+                        for g in self.EF[e]:
+                            if g in allowed and g not in comp:
+                                comp.add(g)
+                                queue.append(g)
+                return comp
+            outer = component(tip if tip in out_f else max(out_f, key=sx), out_f)
+            back_f = region - outer
+            touching = {g for f in outer for e in self.FE[f] for g in self.EF[e] if g in back_f}
+            back = set()
+            for g in touching:
+                if g not in back:
+                    back |= component(g, back_f)
+            if not 5 <= len(outer) <= 40 or not 3 <= len(back) <= 40:
+                return None
+            return outer, back, region
+        found, tried = None, set()
+        for tip in sorted(head, key=sx, reverse=True)[:80]:   # most sideways first: a hood edge
+            if tip in tried or sx(tip) < 0.7 * hw:             # can come before the ear
+                continue
+            got = ear_from(tip)
+            if got:
+                found = got
+                break
+            tried.add(tip)
+        if not found:
+            return
+        outer, back, _ = found
+        locked = getattr(self, "locked", set())
+        for piece in (outer, back):
+            for f in piece:
+                for e in self.FE[f]:
+                    fl = self.EF[e]
+                    if len(fl) == 2 and all(g in piece for g in fl) and e in cuts and e not in locked:
+                        cuts.discard(e)
+                        m = self.emir.get(e, -1)
+                        if m not in locked:
+                            cuts.discard(m)
+        ear = outer | back
+        new = [e for f in ear for e in self.FE[f] if len(self.EF[e]) == 2 and
+               (sum(1 for g in self.EF[e] if g in ear) == 1 or
+                (self.EF[e][0] in outer) != (self.EF[e][1] in outer) and all(g in ear for g in self.EF[e]))]
+        before = set(cuts)
+        self.add_mirrored(cuts, new)
+        self.locked |= cuts - before
 
     def nose_cut(self, cuts, width=0.3, depth=0.25, height=0.5):
         """Cuts the nose out as its own island: the narrow region round the face's most forward
@@ -3379,31 +3618,48 @@ if bpy is not None:
                 for l, idx in zip(loops, face):
                     corners.append((uvl, l, idx, o))
             saved = [(l[uvl].uv.copy(), l[uvl].pin_uv) for uvl, l, _, _ in corners]
-            for uvl, l, idx, _ in corners:
-                if idx in g:
-                    x, y = g[idx]
-                    l[uvl].uv = (x / W, y / H)
-                    l[uvl].pin_uv = True
-                else:
-                    l[uvl].pin_uv = False
-            for _, bm in bms:
-                for elems in (bm.verts, bm.edges, bm.faces):
-                    for e in elems:
-                        e.select = False
-            for _, l, _, _ in corners:
-                l.face.select_set(True)
-            for o, _ in bms:
-                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
-            try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True, margin=0.0)
-                ok = True
-            except RuntimeError:
-                ok = False
-            if ok:
+
+            def attempt(g):
+                for (uv, _), (uvl, l, idx, _) in zip(saved, corners):
+                    l[uvl].uv = uv
+                    if idx in g:
+                        x, y = g[idx]
+                        l[uvl].uv = (x / W, y / H)
+                        l[uvl].pin_uv = True
+                    else:
+                        l[uvl].pin_uv = False
+                for _, bm in bms:
+                    for elems in (bm.verts, bm.edges, bm.faces):
+                        for e in elems:
+                            e.select = False
+                for _, l, _, _ in corners:
+                    l.face.select_set(True)
+                for o, _ in bms:
+                    bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+                try:
+                    bpy.ops.uv.unwrap(method='ANGLE_BASED', fill_holes=True, correct_aspect=True, margin=0.0)
+                except RuntimeError:
+                    return False
                 coords = [None] * len(isl.uv)
                 for uvl, l, idx, _ in corners:
                     coords[idx] = (l[uvl].uv.x * W, l[uvl].uv.y * H)
-                ok = distortion(isl, coords) <= max(opt.max_distortion, 0.05) + 0.05
+                return distortion(isl, coords) <= max(opt.max_distortion, 0.05) + 0.05 and \
+                    uv_overlap(coords, isl.faces) <= 0.005   # never keep a folded result
+            ok = attempt(g)
+            if not ok:
+                # fingers each straight along their own nearest axis, then without the one finger
+                # that can't be straightened without folding the rest
+                tries = [mixed_grid(isl, opt.max_distortion, parallel=False)]
+                n = len(_quad_groups(isl))
+                tries += [mixed_grid(isl, opt.max_distortion, skip={k}, parallel=p)
+                          for p in (True, False) for k in range(n)]
+                seen = [g]
+                for g2 in tries:
+                    if g2 and g2 not in seen:
+                        seen.append(g2)
+                        if attempt(g2):
+                            ok = True
+                            break
             for (uv, pin), (uvl, l, _, o) in zip(saved, corners):
                 if not ok:
                     l[uvl].uv = uv
