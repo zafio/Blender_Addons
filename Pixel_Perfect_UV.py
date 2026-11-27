@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 4),
+    "version": (0, 9, 5),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2016,8 +2016,10 @@ class SeamMesh:
         hs = [_dot(p, self.up) for p in self.V]
         h0, h1 = min(hs), max(hs)
         rng = (h1 - h0) or 1.0
-        head = [abs(p[self.axis]) for p, h in zip(self.V, hs) if (h - h0) / rng >= head_from]
-        half_width = max(head) if head else 0.0
+        # the head's width from its top part only: lower down, shoulders can reach the head band
+        # and would make the "head" as wide as the shoulders
+        head = sorted(abs(p[self.axis]) for p, h in zip(self.V, hs) if (h - h0) / rng >= 0.9)
+        half_width = head[int(0.95 * (len(head) - 1))] if head else 0.0
         self.protected = set()
         self.face_faces = set()
         self.head_half_width = half_width
@@ -2039,7 +2041,7 @@ class SeamMesh:
             if getattr(self, "prob", None) is not None:
                 self.prob[ei] = 0.0
 
-    def neck_cut(self, cuts, types, head_from=0.78, low=0.7):
+    def neck_cut(self, cuts, types, head_from=0.78, low=0.7, high=0.9):
         """Organic objects: an island holding both the head and the body below the neck is cut
         at the cheapest horizontal line through the neck (only edges within the neck's width, so
         arms are never cut). The cut is locked: later merges never remove it."""
@@ -2053,22 +2055,22 @@ class SeamMesh:
             for ch in self.charts(cuts):
                 if types.get(self.G[ch[0]], "ORGANIC") != "ORGANIC":
                     continue
-                head = [f for f in ch if t[f] >= head_from + 0.03 and abs(self.fc[f][self.axis]) <= hw]
+                head = [f for f in ch if t[f] >= high and abs(self.fc[f][self.axis]) <= hw]
                 if not head or min(t[f] for f in ch) >= low:
                     continue
                 fs = set(ch)
                 best = None
-                for k in range(10):
-                    h = low + (head_from + 0.02 - low) * k / 9.0
+                for k in range(17):   # the cheapest line that really separates: the neck
+                    h = low + (high - low) * k / 16.0
                     cut = set()
                     for f in ch:
-                        if t[f] < h or abs(self.fc[f][self.axis]) > 1.6 * hw:
+                        if t[f] < h or abs(self.fc[f][self.axis]) > 1.5 * hw:
                             continue
                         for e in self.FE[f]:
                             fl = self.EF[e]
                             if len(fl) == 2 and e not in cuts and all(g in fs for g in fl):
                                 o = fl[0] if fl[1] == f else fl[1]
-                                if t[o] < h and abs(self.fc[o][self.axis]) <= 1.6 * hw:
+                                if t[o] < h and abs(self.fc[o][self.axis]) <= 1.5 * hw:
                                     cut.add(e)
                     if not cut:
                         continue
