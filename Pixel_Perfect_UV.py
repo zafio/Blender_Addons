@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 15),
+    "version": (0, 9, 16),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1195,7 +1195,54 @@ def _match_mirror(A, B, axis, tol):
     return mp
 
 
+def symmetry_offset(points, axis=0, tol_rel=2e-3, need=0.8):
+    """Where a model's mirror plane is along `axis` when it isn't at 0 (a character moved off
+    centre in its mesh or in the scene): the middle of its bounds, if at least `need` of the
+    points have a mirror twin there. 0.0 otherwise."""
+    pts = [tuple(p) for p in points]
+    if len(pts) < 4:
+        return 0.0
+    lo = min(p[axis] for p in pts)
+    hi = max(p[axis] for p in pts)
+    c = (lo + hi) / 2.0
+    size = max(max(p[k] for p in pts) - min(p[k] for p in pts) for k in range(3)) or 1.0
+    tol = size * tol_rel
+    if abs(c) <= tol:
+        return 0.0
+    cells = set(tuple(int(math.floor(p[k] / tol)) for k in range(3)) for p in pts)
+    hit = 0
+    for p in pts:
+        q = list(p)
+        q[axis] = 2 * c - q[axis]
+        key = tuple(int(math.floor(q[k] / tol)) for k in range(3))
+        if any((key[0] + i, key[1] + j, key[2] + k) in cells
+               for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)):
+            hit += 1
+    return c if hit >= need * len(pts) else 0.0
+
+
 def find_mirror_pairs(islands, axis=0, tol_rel=6e-3):
+    """find_mirror_pairs_centred, measured from each object's own mirror plane (a character
+    that isn't centred on X = 0 still has its left and right islands paired)."""
+    by_group = defaultdict(list)
+    for isl in islands:
+        by_group[isl.group].extend(isl.pl)
+    offs = {g: symmetry_offset(p, axis) for g, p in by_group.items()}
+    if not any(offs.values()):
+        return find_mirror_pairs_centred(islands, axis, tol_rel)
+    saved = [isl.pl for isl in islands]
+    try:
+        for isl in islands:
+            o = offs.get(isl.group, 0.0)
+            if o:
+                isl.pl = [tuple(p[k] - o if k == axis else p[k] for k in range(3)) for p in isl.pl]
+        return find_mirror_pairs_centred(islands, axis, tol_rel)
+    finally:
+        for isl, pl in zip(islands, saved):
+            isl.pl = pl
+
+
+def find_mirror_pairs_centred(islands, axis=0, tol_rel=6e-3):
     """Islands that are mirror images of each other across the object's X = 0 plane (small
     asymmetries of about half a percent of the model size are tolerated).
     Returns [(master, slave, slave_vertex -> master_vertex)], master on the +X side."""
@@ -3667,6 +3714,16 @@ def auto_seams(verts, faces, groups, types=None, up=(0.0, 0.0, 1.0), front=(0.0,
                method="LEARNED", existing=(), threshold=None, tex_px=256 * 256):
     """Returns (cut edges as vertex pairs, chart count, types used). types: group -> type or 'AUTO'.
     tex_px: texture pixel count, used to merge islands that would end up under ~4 px."""
+    # measure everything from the body's own mirror plane (the biggest object), even when the
+    # character isn't centred on X = 0
+    count = defaultdict(int)
+    for g in groups:
+        count[g] += 1
+    body = max(count, key=count.get) if count else None
+    body_v = {v for f, g in zip(faces, groups) if g == body for v in f}
+    off = symmetry_offset([verts[v] for v in body_v], 0)
+    if off:
+        verts = [(p[0] - off, p[1], p[2]) for p in verts]
     mesh = SeamMesh(verts, faces, groups, up=up, front=front, existing_seams=existing)
     mesh.tex_px = tex_px
     by_group = defaultdict(list)
@@ -3771,6 +3828,12 @@ if bpy is not None:
             if not all_faces and not any_sel and any(f.select and not f.hide for f in bm.faces):
                 any_sel = True
         recs = []
+        # world positions measured from the character's own mirror plane (the biggest mesh's)
+        off = 0.0
+        if bms:
+            bo, bb = max(bms, key=lambda ob: len(ob[1].verts))
+            bw = bo.matrix_world
+            off = symmetry_offset([tuple(bw @ v.co) for v in bb.verts], 0)
         for o, bm in bms:
             uvl = bm.loops.layers.uv.verify()
             dl = bm.faces.layers.float.get(DENSITY_ATTR)
@@ -3781,6 +3844,8 @@ if bpy is not None:
                     continue
                 loops = list(f.loops)
                 p3 = [tuple(mw @ l.vert.co) for l in loops]
+                if off:
+                    p3 = [(p[0] - off, p[1], p[2]) for p in p3]
                 uv = [(l[uvl].uv.x * W, l[uvl].uv.y * H) for l in loops]
                 recs.append(FaceRec(
                     [l.vert for l in loops], uv, p3,
@@ -4762,10 +4827,14 @@ if bpy is not None:
                     c = mw @ f.calc_center_median()
                     cents.append((f, c))
                     zs.append(c.z)
-                    xs.append(abs(c.x))
                 data.append((o, bm, cents))
             if not zs:
                 return {'CANCELLED'}
+            # sideways distances from the body's own mirror plane (it may not be at X = 0)
+            body = max((d for d in data if kinds.get(d[0].name) != 'HARD'), key=lambda d: len(d[2]),
+                       default=None)
+            off = symmetry_offset([(c.x, c.y, c.z) for _, c in body[2]], 0) if body else 0.0
+            xs = [abs(c.x - off) for _, _, cents in data for _, c in cents]
             z0, z1 = min(zs), max(zs)
             hx = max(xs) or 1.0
             counts = {"head": 0, "hands": 0, "body": 0, "legs": 0, "props": 0}
@@ -4781,7 +4850,7 @@ if bpy is not None:
                         part = "head"
                     elif t < self.legs_to:
                         part = "legs"
-                    elif abs(c.x) / hx >= self.hands_from:
+                    elif abs(c.x - off) / hx >= self.hands_from:
                         part = "hands"
                     else:
                         part = "body"
