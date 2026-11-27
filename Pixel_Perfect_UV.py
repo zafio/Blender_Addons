@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 1),
+    "version": (0, 9, 3),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2037,14 +2037,66 @@ class SeamMesh:
             if getattr(self, "prob", None) is not None:
                 self.prob[ei] = 0.0
 
+    def neck_cut(self, cuts, types, head_from=0.78, low=0.7):
+        """Organic objects: an island holding both the head and the body below the neck is cut
+        at the cheapest horizontal line through the neck (only edges within the neck's width, so
+        arms are never cut). The cut is locked: later merges never remove it."""
+        hs = [_dot(p, self.up) for p in self.V]
+        h0, h1 = min(hs), max(hs)
+        rng = (h1 - h0) or 1.0
+        t = [(_dot(c, self.up) - h0) / rng for c in self.fc]
+        hw = getattr(self, "head_half_width", 0.0) or 1.0
+        for _ in range(6):
+            done = True
+            for ch in self.charts(cuts):
+                if types.get(self.G[ch[0]], "ORGANIC") != "ORGANIC":
+                    continue
+                head = [f for f in ch if t[f] >= head_from + 0.03 and abs(self.fc[f][self.axis]) <= hw]
+                if not head or min(t[f] for f in ch) >= low:
+                    continue
+                fs = set(ch)
+                best = None
+                for k in range(10):
+                    h = low + (head_from + 0.02 - low) * k / 9.0
+                    cut = set()
+                    for f in ch:
+                        if t[f] < h or abs(self.fc[f][self.axis]) > 1.6 * hw:
+                            continue
+                        for e in self.FE[f]:
+                            fl = self.EF[e]
+                            if len(fl) == 2 and e not in cuts and all(g in fs for g in fl):
+                                o = fl[0] if fl[1] == f else fl[1]
+                                if t[o] < h and abs(self.fc[o][self.axis]) <= 1.6 * hw:
+                                    cut.add(e)
+                    if not cut:
+                        continue
+                    trial = set(cuts)
+                    self.add_mirrored(trial, cut)
+                    sep = next(c for c in self.charts(trial) if head[0] in c)
+                    if min(t[f] for f in sep) < low:      # still connected to the body
+                        continue
+                    c = sum(self.cost[e] for e in cut)
+                    if best is None or c < best[0]:
+                        best = (c, cut)
+                if best:
+                    before = set(cuts)
+                    self.add_mirrored(cuts, best[1])
+                    self.locked |= cuts - before
+                    done = False
+                    break
+            if done:
+                return
+
     def run(self, types, max_iter=400):
         """types: group -> 'HARD' / 'ORGANIC' / 'TUBE'. Returns the set of cut edge ids."""
+        self.locked = set()
         faces_by_type = defaultdict(list)
         for f, g in enumerate(self.G):
             faces_by_type[types.get(g, "ORGANIC")].append(f)
         ftype = {f: types.get(g, "ORGANIC") for f, g in enumerate(self.G)}
         self.protect_front(types)
         cuts = self.prob_cuts() if getattr(self, "prob", None) is not None else self.feature_cuts(faces_by_type)
+        self.neck_cut(cuts, types)
         for _ in range(max_iter):
             changed = False
             for chart in self.charts(cuts):
@@ -2093,21 +2145,40 @@ class SeamMesh:
             out.append(comp)
         return sorted(out, key=len, reverse=True)
 
-    def _try_join(self, cuts, es):
+    def _try_join(self, cuts, es, max_curv=None, allow_holes=False):
         """Removes the shared seam (all of it first, else one connected stretch, each with its
-        mirror) if every chart stays a disk."""
+        mirror) if every chart stays a disk and, with max_curv, the joined chart doesn't get more
+        curved than that (a too curved island stretches badly when flattened)."""
+        locked = getattr(self, "locked", set())
+        es = [e for e in es if e not in locked]
+        if not es:
+            return False
         segs = self._segments(es)
         for seg in ([list(es)] if len(segs) > 1 else []) + segs:
             trial = set(cuts)
             for e in seg:
                 trial.discard(e)
                 trial.discard(self.emir.get(e, -1))
-            self._drop_slits(trial, {f for e in seg for f in self.EF[e]})
-            if all(len(lp) == 1 and gn == 0 for lp, gn, _, _ in
-                   (self.topology(c, trial) for c in self.charts(trial))):
-                cuts.clear()
-                cuts.update(trial)
-                return True
+            near = {f for e in seg for f in self.EF[e]}
+            self._drop_slits(trial, near)
+            charts = self.charts(trial)
+            # allow_holes: an island may surround another one (the face round the nose); Blender's
+            # unwrap fills such holes, only handles (genus) are not allowed
+            ok = True
+            for c in charts:
+                lp, gn, _, _ = self.topology(c, trial)
+                if gn != 0 or len(lp) == 0 or (len(lp) > 1 and not allow_holes):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            if max_curv is not None:
+                joined = [c for c in charts if near & set(c)]
+                if any(self.curvature(c, trial) > max_curv for c in joined):
+                    continue
+            cuts.clear()
+            cuts.update(trial)
+            return True
         return False
 
     def _drop_slits(self, cuts, near_faces):
@@ -2138,9 +2209,42 @@ class SeamMesh:
         if not zone:
             return
         self._merge_face(cuts, zone, max_iter, allow_nose=False)
-        left = [ch for ch in self.charts(cuts) if any(f in zone for f in ch)]
-        if len(left) > 2:   # more than face + nose: join the rest even if the nose comes along
-            self._merge_face(cuts, zone, max_iter, allow_nose=True)
+        self._join_head_leftovers(cuts, zone)
+
+    def _join_head_leftovers(self, cuts, zone, head_from=0.78, max_iter=40):
+        """Face pieces that couldn't join the face (the forehead, when the nose sits in between)
+        join another head island they touch, such as the top of the head."""
+        hs = [_dot(p, self.up) for p in self.V]
+        h0, h1 = min(hs), max(hs)
+        rng = (h1 - h0) or 1.0
+        in_head = lambda f: (_dot(self.fc[f], self.up) - h0) / rng >= head_from
+        nose = getattr(self, "_nose", frozenset())
+        for _ in range(max_iter):
+            charts = self.charts(cuts)
+            owner = {f: ci for ci, ch in enumerate(charts) for f in ch}
+            zc = sorted((ci for ci, ch in enumerate(charts) if any(f in zone for f in ch)),
+                        key=lambda ci: -sum(1 for f in charts[ci] if f in zone))
+            if len(zc) < 2:
+                return
+            main = zc[0]
+            joined = False
+            for ci in zc[1:]:
+                if nose and nose & set(charts[ci]):
+                    continue
+                shared = defaultdict(list)
+                for f in charts[ci]:
+                    for e in self.FE[f]:
+                        if e in cuts and len(self.EF[e]) == 2:
+                            o = owner[self.EF[e][1]] if owner[self.EF[e][0]] == ci else owner[self.EF[e][0]]
+                            if o != ci and o != main and all(in_head(g) for g in charts[o]) and \
+                                    not (nose and nose & set(charts[o])):
+                                shared[o].append(e)
+                lim = SEAM_TYPES["ORGANIC"]["curv"]
+                if any(self._try_join(cuts, es, lim) for _, es in sorted(shared.items(), key=lambda kv: -len(kv[1]))):
+                    joined = True
+                    break
+            if not joined:
+                return
 
     def _merge_face(self, cuts, zone, max_iter, allow_nose):
         hw = getattr(self, "head_half_width", 0.0) or 1.0
@@ -2170,6 +2274,7 @@ class SeamMesh:
                         if best is None or ahead > best[0]:
                             best = (ahead, frozenset(ch))
                 nose = best[1] if best else frozenset()
+                self._nose = nose
             # seams shared between pairs of face pieces; pairs with the main face first
             shared = defaultdict(list)
             zset = set(zc)
@@ -2184,7 +2289,8 @@ class SeamMesh:
                     continue
                 shared[(min(a, b), max(a, b))].append(e)
             pairs = sorted(shared.items(), key=lambda kv: (main not in kv[0], -len(kv[1])))
-            if not any(self._try_join(cuts, es) for _, es in pairs):
+            lim = SEAM_TYPES["ORGANIC"]["curv"]
+            if not any(self._try_join(cuts, es, lim, allow_holes=True) for _, es in pairs):
                 return
 
 
@@ -2217,6 +2323,8 @@ class SeamMesh:
                             if o != ci:
                                 shared[o].append(e)
                 for o, es in sorted(shared.items(), key=lambda kv: -len(kv[1])):
+                    if any(e in getattr(self, "locked", ()) for e in es):
+                        continue
                     trial = set(cuts)
                     for e in es:
                         trial.discard(e)
