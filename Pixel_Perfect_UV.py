@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 7, 4),
+    "version": (0, 8, 0),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -391,10 +391,85 @@ def quad_part(isl):
     return sub, back
 
 
+def grid_part(isl):
+    """Largest clean grid inside an all-quad island that isn't a clean grid itself (it has a pole:
+    a vertex where 3 or 5 quads meet). Grows a lattice from the best-connected quad and skips
+    any quad that doesn't fit. Returns (sub_island, sub_index -> island_index) or (None, None)."""
+    faces = isl.faces
+    if not faces or any(len(f) != 4 or len(set(f)) != 4 for f in faces):
+        return None, None
+    edge_faces = defaultdict(list)
+    for fi, f in enumerate(faces):
+        for k in range(4):
+            edge_faces[frozenset((f[k], f[(k + 1) % 4]))].append(fi)
+
+    def nbrs(fi):
+        f = faces[fi]
+        return sum(len(edge_faces[frozenset((f[k], f[(k + 1) % 4]))]) - 1 for k in range(4))
+    start = max(range(len(faces)), key=nbrs)
+    lat, used = {}, {}
+    for c, p in zip(faces[start], ((0, 0), (1, 0), (1, 1), (0, 1))):
+        lat[c] = p
+        used[p] = c
+    accepted, rejected = {start}, set()
+    queue = deque([start])
+    while queue:
+        fi = queue.popleft()
+        f = faces[fi]
+        for k in range(4):
+            a, b = f[k], f[(k + 1) % 4]
+            a_prev = f[(k - 1) % 4]
+            step = (lat[a][0] - lat[a_prev][0], lat[a][1] - lat[a_prev][1])
+            for nf in edge_faces[frozenset((a, b))]:
+                if nf in accepted or nf in rejected:
+                    continue
+                g = faces[nf]
+                ia, ib = g.index(a), g.index(b)
+                if g[(ia + 1) % 4] == b:
+                    oa, ob = g[(ia - 1) % 4], g[(ib + 1) % 4]
+                elif g[(ia - 1) % 4] == b:
+                    oa, ob = g[(ia + 1) % 4], g[(ib - 1) % 4]
+                else:
+                    rejected.add(nf)
+                    continue
+                want = ((oa, (lat[a][0] + step[0], lat[a][1] + step[1])),
+                        (ob, (lat[b][0] + step[0], lat[b][1] + step[1])))
+                ok = all((lat[v] == p) if v in lat else (used.get(p, v) == v) for v, p in want)
+                if not ok:
+                    rejected.add(nf)
+                    continue
+                for v, p in want:
+                    lat[v] = p
+                    used[p] = v
+                accepted.add(nf)
+                queue.append(nf)
+    if len(accepted) < 2 or len(accepted) == len(faces):
+        return None, None
+    sub = Island()
+    remap, back = {}, []
+    for fi in sorted(accepted):
+        face = []
+        for v in faces[fi]:
+            if v not in remap:
+                remap[v] = len(back)
+                back.append(v)
+                sub.uv.append(isl.uv[v])
+                sub.p3.append(isl.p3[v])
+            face.append(remap[v])
+        sub.faces.append(face)
+        sub.face_ids.append(isl.face_ids[fi])
+    return sub, back
+
+
 def mixed_grid(isl, max_distortion):
     """For a quad + non-quad island: straight layout of its main quad group, scaled to the
     group's current size and placed where it is now (px). Returns {island_vertex: (x, y)} or None."""
-    sub, back = quad_part(isl)
+    if all(len(f) == 4 for f in isl.faces):
+        if lattice_layout(isl) is not None:
+            return None          # a clean grid: build_layouts straightens it directly
+        sub, back = grid_part(isl)
+    else:
+        sub, back = quad_part(isl)
     if sub is None or len(sub.faces) < 2:
         return None
     lay = lattice_layout(sub)
@@ -625,7 +700,10 @@ def _rot90(loc, h):
 class Options:
     def __init__(self, **kw):
         self.straighten = True
-        self.max_distortion = 0.12
+        self.max_distortion = 0.25
+        self.orient = True              # turn islands so the model's up points up
+        self.up = (0.0, 0.0, 1.0)       # Blender: Z up, character facing -Y
+        self.front = (0.0, -1.0, 0.0)
         self.align = True
         self.density_mode = "FIT"     # FIT, FIXED, CURRENT
         self.density = 32.0           # px / unit for FIXED
@@ -769,6 +847,60 @@ def stack_mirrored(islands, pairs):
 
 # ---- pipeline ----------------------------------------------------------------
 
+def _dot3(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross3(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def dir_in_uv(isl, coords, vec):
+    """Average UV direction that the 3D direction vec maps to (area x in-plane weighted)."""
+    sx = sy = w = tot = 0.0
+    for f in isl.faces:
+        for j in range(1, len(f) - 1):
+            a, b, c = f[0], f[j], f[j + 1]
+            p0, p1, p2 = isl.p3[a], isl.p3[b], isl.p3[c]
+            e1, e2 = _sub(p1, p0), _sub(p2, p0)
+            n = _cross3(e1, e2); ln = math.sqrt(_dot3(n, n))
+            if ln < 1e-12: continue
+            area = ln / 2; tot += area
+            nn = (n[0]/ln, n[1]/ln, n[2]/ln)
+            d = _dot3(vec, nn); v = (vec[0]-nn[0]*d, vec[1]-nn[1]*d, vec[2]-nn[2]*d)
+            lv = math.sqrt(_dot3(v, v))
+            if lv < 1e-6: continue
+            g11, g12, g22 = _dot3(e1, e1), _dot3(e1, e2), _dot3(e2, e2); det = g11*g22 - g12*g12
+            if abs(det) < 1e-18: continue
+            r1, r2 = _dot3(v, e1), _dot3(v, e2)
+            s, t = (r1*g22 - r2*g12)/det, (r2*g11 - r1*g12)/det
+            q0, q1, q2 = coords[a], coords[b], coords[c]
+            dx = s*(q1[0]-q0[0]) + t*(q2[0]-q0[0]); dy = s*(q1[1]-q0[1]) + t*(q2[1]-q0[1])
+            L = math.hypot(dx, dy)
+            if L < 1e-12: continue
+            sx += dx/L*area*lv; sy += dy/L*area*lv; w += area*lv
+    return sx, sy, w, tot
+
+
+def orient_layout(isl, lay, up, front):
+    """Turns the layout by a multiple of 90 degrees so the model's up points up (+V); islands
+    lying flat (top of the head, soles) use the front direction instead."""
+    sx, sy, w, tot = dir_in_uv(isl, lay, up)
+    if tot <= 0:
+        return lay
+    if w < 0.5 * tot:
+        fx, fy, fw, _ = dir_in_uv(isl, lay, front)
+        if fw > w:
+            sx, sy = fx, fy
+    if abs(sx) < 1e-12 and abs(sy) < 1e-12:
+        return lay
+    ang = math.atan2(sy, sx)                       # where "up" points now
+    k = int(round((math.pi / 2 - ang) / (math.pi / 2))) % 4
+    for _ in range(k):
+        lay = [(-y, x) for x, y in lay]
+    return lay
+
+
 def build_layouts(islands, opt):
     for isl in islands:
         isl.units = None
@@ -776,14 +908,19 @@ def build_layouts(islands, opt):
         if is_pixel_island(isl):
             isl.kind = "pixel"
             continue
+        orient = getattr(opt, "orient", True)
         lay = lattice_layout(isl) if opt.straighten else None
         if lay is not None:
             d = distortion(isl, lay)
             if d <= opt.max_distortion:
+                if orient:
+                    lay = orient_layout(isl, lay, opt.up, opt.front)
                 isl.units, isl.kind, isl.mask, isl.distortion = lay, "straight", [True] * len(lay), d
                 continue
         lay = align_layout(isl, rotate=opt.align and not isl.keep_rot)
         if lay is not None:
+            if orient and (opt.align or isl.keep_rot):
+                lay = orient_layout(isl, lay, opt.up, opt.front)
             isl.units = lay
             isl.kind = "straight" if isl.keep_rot else ("aligned" if opt.align else "keep")
             isl.mask = grid_mask(isl, lay)
@@ -1551,7 +1688,8 @@ class SeamMesh:
             prm = SEAM_TYPES[typ]
             fs = set(faces)
             sharp = {e for f in faces for e in self.FE[f]
-                     if self.angle[e] >= prm["angle"] and all(g in fs for g in self.EF[e])}
+                     if self.angle[e] >= prm["angle"] and all(g in fs for g in self.EF[e])
+                     and e not in getattr(self, "protected", ())}
             # keep chains of at least `chain` edges
             vb = defaultdict(list)
             for e in sharp:
@@ -1698,12 +1836,37 @@ class SeamMesh:
                 self.add_mirrored(cuts, comp)
         return cuts
 
+    def protect_front(self, types, head_from=0.78, min_front=0.3, band=0.5):
+        """Organic objects: no cuts on the front of the head (the face), so it is never split down the
+        middle or stacked. Paths may still cross there if nothing else works."""
+        hs = [_dot(p, self.up) for p in self.V]
+        h0, h1 = min(hs), max(hs)
+        head = [abs(p[self.axis]) for p, h in zip(self.V, hs) if (h - h0) / ((h1 - h0) or 1.0) >= head_from]
+        half_width = max(head) if head else 0.0
+        self.protected = set()
+        for ei, (a, b) in enumerate(self.E):
+            fl = self.EF[ei]
+            if len(fl) != 2 or types.get(self.G[fl[0]], "ORGANIC") != "ORGANIC" or ei in self.existing:
+                continue
+            n = _normalize(_add(self.fn[fl[0]], self.fn[fl[1]]))
+            if _dot(n, self.front) <= min_front:
+                continue
+            t = ((hs[a] + hs[b]) / 2 - h0) / ((h1 - h0) or 1.0)
+            x = abs(self.V[a][self.axis] + self.V[b][self.axis]) / 2
+            if t >= head_from and x <= band * half_width:   # the middle of the face, not its sides
+                self.protected.add(ei)
+        for ei in self.protected:
+            self.cost[ei] *= 60.0
+            if getattr(self, "prob", None) is not None:
+                self.prob[ei] = 0.0
+
     def run(self, types, max_iter=400):
         """types: group -> 'HARD' / 'ORGANIC' / 'TUBE'. Returns the set of cut edge ids."""
         faces_by_type = defaultdict(list)
         for f, g in enumerate(self.G):
             faces_by_type[types.get(g, "ORGANIC")].append(f)
         ftype = {f: types.get(g, "ORGANIC") for f, g in enumerate(self.G)}
+        self.protect_front(types)
         cuts = self.prob_cuts() if getattr(self, "prob", None) is not None else self.feature_cuts(faces_by_type)
         for _ in range(max_iter):
             changed = False
@@ -2318,7 +2481,7 @@ if bpy is not None:
                 coords = [None] * len(isl.uv)
                 for uvl, l, idx, _ in corners:
                     coords[idx] = (l[uvl].uv.x * W, l[uvl].uv.y * H)
-                ok = distortion(isl, coords) <= max(opt.max_distortion * 1.5, 0.05)
+                ok = distortion(isl, coords) <= max(opt.max_distortion, 0.05) + 0.05
             for (uv, pin), (uvl, l, _, o) in zip(saved, corners):
                 if not ok:
                     l[uvl].uv = uv
@@ -2578,7 +2741,7 @@ if bpy is not None:
             straighten=s.straighten, max_distortion=s.max_distortion / 100.0, align=s.align,
             density_mode=s.density_mode, density=s.density, snap=True, pack=s.pack,
             padding=s.padding, allow_rotate=s.allow_rotate, snap_mode=s.snap_mode,
-            stack_mirrored=s.stack_mirrored, keep_density=s.keep_density,
+            stack_mirrored=s.stack_mirrored, keep_density=s.keep_density, orient=s.orient,
             density_tolerance=s.density_tolerance / 100.0)
 
     class PixelUVSettings(bpy.types.PropertyGroup):
@@ -2604,9 +2767,13 @@ if bpy is not None:
         straighten: BoolProperty(name="Straighten Quad Islands", default=True,
                                  description="Lay quad-grid islands out as rectangles")
         max_distortion: FloatProperty(
-            name="Max Distortion %", default=12.0, min=0.0, max=100.0, subtype='PERCENTAGE',
+            name="Max Distortion %", default=25.0, min=0.0, max=100.0, subtype='PERCENTAGE',
             description="Only straighten an island if the average edge stretch stays below this. "
                         "Otherwise the original unwrap is kept (no added distortion)")
+        orient: BoolProperty(
+            name="Orient Up", default=True,
+            description="Turn islands (in 90° steps) so the model's up points up in the UV; islands "
+                        "lying flat (top of the head, soles) get the front pointing up")
         align: BoolProperty(name="Align Other Islands", default=True,
                             description="Rotate islands that aren't straightened so their bounds are axis aligned")
         pack: BoolProperty(name="Pack", default=True)
@@ -3498,6 +3665,7 @@ if bpy is not None:
         sub.enabled = s.straighten
         sub.prop(s, "max_distortion")
         box.prop(s, "align")
+        box.prop(s, "orient")
         box.row().prop(s, "snap_mode", expand=True)
         row = box.row(align=True)
         row.prop(s, "keep_density")
