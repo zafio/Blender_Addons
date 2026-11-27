@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 5),
+    "version": (0, 9, 6),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2124,7 +2124,40 @@ class SeamMesh:
         self.merge_small(cuts, tex_px=getattr(self, "tex_px", 256 * 256))
         self.merge_face(cuts)
         self.stretch_split(cuts, types)
+        self.nose_cut(cuts)
         return cuts
+
+    def nose_cut(self, cuts, width=0.3, depth=0.25, height=0.5):
+        """Cuts the nose out as its own island: the narrow region round the face's most forward
+        point that stands out from the cheeks (matches the hand-made noses at ~0.9). Done last,
+        so no merge undoes it; the face may surround it (Blender's unwrap fills the hole)."""
+        zone = getattr(self, "face_faces", set())
+        hw = getattr(self, "head_half_width", 0.0)
+        if not zone or hw <= 0:
+            return
+        fwd = lambda f: _dot(self.fc[f], self.front)
+        upf = lambda f: _dot(self.fc[f], self.up)
+        cand = [f for f in zone if abs(self.fc[f][self.axis]) <= width * hw]
+        if not cand:
+            return
+        tip = max(cand, key=fwd)
+        lim = fwd(tip) - depth * hw
+        region, queue = {tip}, deque([tip])
+        while queue:
+            f = queue.popleft()
+            for e in self.FE[f]:
+                for g in self.EF[e]:
+                    if g not in region and abs(self.fc[g][self.axis]) <= width * hw and fwd(g) >= lim \
+                            and abs(upf(g) - upf(tip)) <= height * hw:
+                        region.add(g)
+                        queue.append(g)
+        if len(region) < 3 or len(region) > 0.4 * len(zone):
+            return
+        outline = [e for f in region for e in self.FE[f]
+                   if len(self.EF[e]) == 2 and sum(1 for g in self.EF[e] if g in region) == 1]
+        before = set(cuts)
+        self.add_mirrored(cuts, outline)
+        self.locked |= cuts - before
 
     def chart_stretch(self, chart, cuts):
         """LSCM-flattened stretch of a chart (vertices split along its seams)."""
