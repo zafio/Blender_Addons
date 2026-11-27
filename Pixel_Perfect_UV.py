@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 7, 3),
+    "version": (0, 7, 4),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2174,6 +2174,19 @@ if bpy is not None:
                 del _BM_CACHE[k]
         return bm
 
+    def face_layers(bm):
+        """The per-face density / multiplier attributes, created if missing. Call it BEFORE taking
+        any BMFace references: adding a face attribute rebuilds the face data and invalidates
+        every BMFace reference taken earlier ("BMesh data of type BMFace has been removed")."""
+        fl = bm.faces.layers.float
+        dl = fl.get(DENSITY_ATTR)
+        if dl is None:
+            fl.new(DENSITY_ATTR)
+        sl = fl.get(SCALE_ATTR)
+        if sl is None:
+            fl.new(SCALE_ATTR)
+        return fl.get(DENSITY_ATTR), fl.get(SCALE_ATTR)
+
     def find_image(context):
         sp = context.space_data
         if sp and sp.type == 'IMAGE_EDITOR' and sp.image and sp.image.size[0] > 0:
@@ -2388,7 +2401,10 @@ if bpy is not None:
             bm = edit_bm(o.data)
             if not len(bm.faces):
                 continue
-            lay = bm.faces.layers.int.get(REV_ATTR) or bm.faces.layers.int.new(REV_ATTR)
+            lay = bm.faces.layers.int.get(REV_ATTR)
+            if lay is None:  # note: invalidates BMFace references taken before (none are used after)
+                bm.faces.layers.int.new(REV_ATTR)
+                lay = bm.faces.layers.int.get(REV_ATTR)
             bm.faces.ensure_lookup_table()
             bm.faces[0][lay] = random.randint(1, 2 ** 31 - 1)
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
@@ -2772,11 +2788,10 @@ if bpy is not None:
             count = 0
             for o in edit_objects(context):
                 bm = edit_bm(o.data)
-                sel = [f for f in bm.faces if f.select and not f.hide]
-                if not sel:
+                if not any(f.select and not f.hide for f in bm.faces):
                     continue
-                dl = bm.faces.layers.float.get(DENSITY_ATTR) or bm.faces.layers.float.new(DENSITY_ATTR)
-                sl = bm.faces.layers.float.get(SCALE_ATTR) or bm.faces.layers.float.new(SCALE_ATTR)
+                dl, sl = face_layers(bm)  # before taking face references
+                sel = [f for f in bm.faces if f.select and not f.hide]
                 for f in sel:
                     if self.clear:
                         f[dl], f[sl] = 0.0, 1.0
@@ -3154,8 +3169,10 @@ if bpy is not None:
             objs = edit_objects(context)
             data = []
             zs, xs = [], []
+            kinds = object_types(context)
             for o in objs:
                 bm = edit_bm(o.data)
+                face_layers(bm)  # before taking face references
                 mw = o.matrix_world
                 cents = []
                 for f in bm.faces:
@@ -3169,10 +3186,8 @@ if bpy is not None:
             z0, z1 = min(zs), max(zs)
             hx = max(xs) or 1.0
             counts = {"head": 0, "hands": 0, "body": 0, "legs": 0, "props": 0}
-            kinds = object_types(context)
             for o, bm, cents in data:
-                dl = bm.faces.layers.float.get(DENSITY_ATTR) or bm.faces.layers.float.new(DENSITY_ATTR)
-                sl = bm.faces.layers.float.get(SCALE_ATTR) or bm.faces.layers.float.new(SCALE_ATTR)
+                dl, sl = face_layers(bm)
                 is_prop = kinds.get(o.name) == 'HARD'
                 for f, c in cents:
                     if f[dl] > 0:
