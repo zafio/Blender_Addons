@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 21),
+    "version": (0, 9, 22),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -34,7 +34,8 @@ from collections import defaultdict, deque
 try:
     import bpy
     import bmesh
-    from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty
+    from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty,
+                           StringProperty)
 except ImportError:  # allows the core to be tested outside Blender
     bpy = None
 
@@ -4378,6 +4379,10 @@ if bpy is not None:
                 ('LEARNED', "Learned", "Seams predicted by a model trained on hand-unwrapped characters"),
                 ('RULES', "Rules", "Crease angles per object type (hard-surface / organic / tube)")],
             default='MINE')
+        last_density: FloatProperty(
+            name="Last Base Density", default=0.0, options={'HIDDEN'},
+            description="Body px/unit of the last Pixel Perfect run (shown next to the multipliers)")
+        last_size: StringProperty(default="", options={'HIDDEN'})
         show_td: BoolProperty(
             name="Show Texel Density", default=True,
             description="Show the texel density of the selected UVs in the UV Editor, live (it follows "
@@ -4476,6 +4481,11 @@ if bpy is not None:
                     return {'CANCELLED'}
                 msg = "%d straightened (max stretch %.1f%%), %d kept shape, %.2f px/unit" % (
                     st["straight"], st["max_distortion"] * 100, st["aligned"], st["density"])
+                try:
+                    s.last_density = st["density"]     # shown next to the multipliers
+                    s.last_size = "%d x %d" % (W, H)
+                except Exception:
+                    pass
                 if st["mirrored"]:
                     msg += ", %d mirrored pairs stacked" % st["mirrored"]
                 if st["pixel"]:
@@ -5442,12 +5452,20 @@ if bpy is not None:
             box.prop(s, "keep_seams")
         box.prop(s, "unwrap_preset")
         if s.unwrap_preset:
-            row = box.row(align=True)
-            row.prop(s, "preset_head")
-            row.prop(s, "preset_hands")
-            row = box.row(align=True)
-            row.prop(s, "preset_legs")
-            row.prop(s, "preset_props")
+            # absolute px/unit next to each multiplier: base x multiplier (Fixed: the typed value;
+            # otherwise the body density of the last Pixel Perfect run)
+            base = s.density if s.density_mode == 'FIXED' else s.last_density
+            def lab(name, v):
+                # the field already shows the multiplier ("Head (195 px/u): 2.400")
+                return "%s (%.0f px/u)" % (name, base * v) if base > 0 else name
+            if base > 0:
+                src = "Fixed" if s.density_mode == 'FIXED' else ("last run" + (", " + s.last_size if s.last_size else ""))
+                box.label(text="Body %.1f px/unit (%s)" % (base, src))
+            col = box.column(align=True)
+            col.prop(s, "preset_head", text=lab("Head", s.preset_head))
+            col.prop(s, "preset_hands", text=lab("Hands", s.preset_hands))
+            col.prop(s, "preset_legs", text=lab("Legs", s.preset_legs))
+            col.prop(s, "preset_props", text=lab("Props", s.preset_props))
             box.operator("uv.pixel_preset_from_mesh", icon='EYEDROPPER')
             row = box.row(align=True)
             row.operator_menu_enum("uv.pixel_select_part", "part", text="Select Part", icon='RESTRICT_SELECT_OFF')
