@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 26),
+    "version": (0, 9, 27),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -4772,7 +4772,7 @@ if bpy is not None:
             region = context.region
             area = context.area
             if region is not None:
-                y = region.height - 14 * ui          # text baseline: 14 px below the top edge
+                y = region.height - 10 * ui          # text baseline: 10 px below the top edge
                 if area is not None:
                     for r in area.regions:
                         if r.type == 'TOOLS' and r.width > 1:
@@ -4782,7 +4782,7 @@ if bpy is not None:
                             if 0 < cover < region.width:
                                 x = cover + 4 * ui
                         elif r.type == 'TOOL_HEADER' and r.height > 1 and r.y >= region.y + region.height - r.height - 1:
-                            y = min(y, region.height - r.height - 12 * ui)
+                            y = min(y, region.height - r.height - 10 * ui)
             blf.color(font, 0, 0, 0, 0.7)
             blf.position(font, x + 1, y - 1, 0)
             blf.draw(font, txt)
