@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 17),
+    "version": (0, 9, 18),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -4297,9 +4297,11 @@ if bpy is not None:
                         "Ctrl+Z undoes the texture too")
         seam_method: EnumProperty(
             name="Seams", items=[
+                ('MINE', "Mine Only", "Use only the seams you marked: Auto Unwrap skips Auto Seams and "
+                                      "goes straight to unwrap, density and Pixel Perfect"),
                 ('LEARNED', "Learned", "Seams predicted by a model trained on hand-unwrapped characters"),
                 ('RULES', "Rules", "Crease angles per object type (hard-surface / organic / tube)")],
-            default='LEARNED')
+            default='MINE')
         keep_seams: BoolProperty(
             name="Keep My Seams", default=False,
             description="Keep the seams already marked (and build around them) instead of replacing them")
@@ -5067,8 +5069,9 @@ if bpy is not None:
     class UV_OT_pixel_auto_unwrap(bpy.types.Operator):
         bl_idname = "uv.pixel_auto_unwrap"
         bl_label = "Auto Unwrap Character"
-        bl_description = ("Auto Seams, unwrap, Character Density Preset, then Pixel Perfect UV "
-                          "(straighten, mirror stacking, snapping, packing) on every edited object")
+        bl_description = ("Auto Seams (or your own seams, with Seams: Mine Only), unwrap, Character "
+                          "Density Preset, then Pixel Perfect UV (straighten, mirror stacking, "
+                          "snapping, packing) on every edited object")
         bl_options = {'REGISTER', 'UNDO'}
 
         @classmethod
@@ -5094,7 +5097,15 @@ if bpy is not None:
 
             saved = []
             try:
-                stage("Seams", UV_OT_pixel_auto_seams)
+                if s.seam_method == 'MINE':
+                    marked = sum(1 for o in edit_objects(context) for e in edit_bm(o.data).edges
+                                 if e.seam and not all(f.hide for f in e.link_faces))
+                    if not marked:
+                        raise _StageError("no seams marked (Seams: Mine Only). Mark seams first, or "
+                                          "pick Learned / Rules")
+                    done.append("Seams: yours (%d marked)" % marked)
+                else:
+                    stage("Seams", UV_OT_pixel_auto_seams)
                 for o in edit_objects(context):
                     bm = edit_bm(o.data)
                     saved.append((o, bm, [v.select for v in bm.verts], [e.select for e in bm.edges],
@@ -5152,8 +5163,9 @@ if bpy is not None:
         col.operator("uv.pixel_auto_unwrap", icon='OUTLINER_OB_ARMATURE')
         row = box.row(align=True)
         row.prop(s, "seam_method", expand=True)
-        box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
-        box.prop(s, "keep_seams")
+        if s.seam_method != 'MINE':
+            box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
+            box.prop(s, "keep_seams")
         box.prop(s, "unwrap_preset")
         if s.unwrap_preset:
             row = box.row(align=True)
