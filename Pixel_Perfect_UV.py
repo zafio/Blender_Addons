@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 16),
+    "version": (0, 9, 17),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -2272,8 +2272,10 @@ class SeamMesh:
         return sum(abs(TWO_PI - s) for v, s in ang.items() if v not in bverts)
 
     # -- paths ----------------------------------------------------------------
-    def path(self, sources, targets, allowed_edges):
-        """Cheapest edge path from any source vertex to any target vertex using allowed edges."""
+    def path(self, sources, targets, allowed_edges, hop=0.0):
+        """Cheapest edge path from any source vertex to any target vertex using allowed edges.
+        hop: extra cost per edge (with a big hop the path with the fewest edges wins and the
+        learned cost only breaks ties)."""
         dist = {}
         prev = {}
         heap = []
@@ -2297,7 +2299,7 @@ class SeamMesh:
                     continue
                 a, b = self.E[e]
                 w = b if a == v else a
-                nd = d + self.cost[e]
+                nd = d + self.cost[e] + hop
                 if nd < dist.get(w, float("inf")):
                     dist[w] = nd
                     prev[w] = (e, v)
@@ -2705,6 +2707,7 @@ class SeamMesh:
         self.merge_face(cuts)
         self.stretch_split(cuts, types)
         self.overlap_split(cuts)
+        self.straight_openings(cuts)
         self.drop_inner_seams(cuts)
         self.ear_cut(cuts, types)
         self.nose_cut(cuts)
@@ -2897,6 +2900,37 @@ class SeamMesh:
         if len(faces) < 3:
             return 0.0
         return uv_overlap(lscm_uv(verts, faces), faces)
+
+    def straight_openings(self, cuts, limit=0.005, max_stretch=0.25):
+        """A ring (an arm band, a sleeve) opened by a wandering cut - a model seam that stops half
+        way, joined to the border - is opened again by the straightest cut across, when that takes
+        fewer edges and the island lies as flat (no more stretch or overlap)."""
+        locked = getattr(self, "locked", set())
+        for ch in self.charts(cuts):
+            fs = set(ch)
+            inner = {e for f in ch for e in self.FE[f] if e in cuts and len(self.EF[e]) == 2
+                     and all(g in fs for g in self.EF[e])}
+            if not inner or inner & locked:
+                continue
+            trial = cuts - inner
+            loops, genus, interior, _ = self.topology(ch, trial)
+            if len(loops) != 2 or genus != 0:
+                continue
+            lv = [{v for e in lp for v in self.E[e]} for lp in loops]
+            p = self.path(lv[0], lv[1] - lv[0], interior, hop=1.0)
+            if not p or len(p) >= len(inner):
+                continue
+            new = trial | set(p)
+            l2, g2, _, _ = self.topology(ch, new)
+            if len(l2) != 1 or g2 != 0:
+                continue
+            st0, st1 = self.chart_stretch(ch, cuts), self.chart_stretch(ch, new)
+            if st1 > max(max_stretch, st0) and st1 > st0 + 0.01:
+                continue
+            if self.chart_overlap(ch, new) > max(limit, self.chart_overlap(ch, cuts)):
+                continue
+            cuts.clear()
+            cuts.update(new)
 
     def drop_inner_seams(self, cuts, limit=0.005, max_stretch=0.25, max_iter=6):
         """Seams with the same island on both sides (dead ends running in from the border, slits)
