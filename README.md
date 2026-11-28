@@ -31,6 +31,8 @@ Makes pixel-art texturing quicker: no more trips to the Shader Editor to set Ima
 ####UV VERTEX PIVOT TRANSFORM
 Rotates, mirrors and scales the UV selection using the closest vertex below the cursor as pivot (UV Editor). Works like Blender's own transforms: type a value, hold Ctrl to snap the angle, Alt to snap to 90º, Shift for precision.
 
+Scale (<): press T while scaling and type a texel density (px/unit) to scale the selection to exactly that density (with X / Y: along that axis). The header shows the live texel density while scaling. The texture size comes from the UV Editor's image (or Pixel Perfect UV's custom size).
+
 - CTRL+R = Rotate around the nearest vertex
 - CTRL+X = Mirror around the nearest vertex (X again switches to Y axis, again turns mirror off)
 - < = Scale from the nearest vertex (X / Y to constrain the axis, Ctrl snaps in whole texture pixels, or 0.1 steps without a texture)

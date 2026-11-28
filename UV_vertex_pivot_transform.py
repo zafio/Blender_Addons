@@ -1,9 +1,9 @@
 bl_info = {
     "name": "UV Vertex Pivot Transform",
     "author": "Zafio",
-    "version": (1, 7, 1),
+    "version": (1, 8, 0),
     "blender": (4, 5, 0),
-    "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale)",
+    "location": "UV Editor > Ctrl+R (rotate), Ctrl+X (mirror), < (scale, T: texel density)",
     "description": "Allows to rotate, mirror and scale the selection using the closest vertex "
                    "below the cursor as pivot. CTRL+R, CTRL+X (twice for Y) & <",
     "category": "UV",
@@ -138,6 +138,103 @@ def _gather(context):
             objs.append((me, bm, items))
 
     return objs, selected_pts, visible_pts
+
+
+def _texture_px(context):
+    """Texture size in pixels: the UV Editor's image, else Pixel Perfect UV's custom size (when
+    that add-on is enabled), else Blender's 256 x 256 default."""
+    img = getattr(context.space_data, "image", None)
+    if img is not None and img.size[0] > 0 and img.size[1] > 0:
+        return float(img.size[0]), float(img.size[1])
+    s = getattr(context.scene, "pixel_uv", None)
+    try:
+        if s is not None and s.tex_width > 0 and s.tex_height > 0:
+            return float(s.tex_width), float(s.tex_height)
+    except Exception:
+        pass
+    return 256.0, 256.0
+
+
+def _texel_density(tris):
+    """(px/unit overall, along U, along V) of [((p0, p1, p2) 3D, (q0, q1, q2) UV px)], 3D-area
+    weighted; None if nothing has area. Same measure as Pixel Perfect UV's readout."""
+    a3 = a2 = su = sv = w = 0.0
+    for (p0, p1, p2), (q0, q1, q2) in tris:
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        l1 = math.sqrt(e1[0] ** 2 + e1[1] ** 2 + e1[2] ** 2)
+        n = (e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0])
+        ln = math.sqrt(n[0] ** 2 + n[1] ** 2 + n[2] ** 2)
+        if l1 < 1e-12 or ln < 1e-14:
+            continue
+        ar = ln / 2.0
+        x = (e1[0] / l1, e1[1] / l1, e1[2] / l1)
+        nn = (n[0] / ln, n[1] / ln, n[2] / ln)
+        y = (nn[1] * x[2] - nn[2] * x[1], nn[2] * x[0] - nn[0] * x[2], nn[0] * x[1] - nn[1] * x[0])
+        ax, ay = l1, 0.0
+        bx = e2[0] * x[0] + e2[1] * x[1] + e2[2] * x[2]
+        by = e2[0] * y[0] + e2[1] * y[1] + e2[2] * y[2]
+        cx, cy = q1[0] - q0[0], q1[1] - q0[1]
+        dx, dy = q2[0] - q0[0], q2[1] - q0[1]
+        a3 += ar
+        a2 += abs(cx * dy - cy * dx) / 2.0
+        det = ax * by - ay * bx
+        if abs(det) < 1e-14:
+            continue
+        i00, i01, i10, i11 = by / det, -bx / det, -ay / det, ax / det
+        j00, j01 = cx * i00 + dx * i10, cx * i01 + dx * i11
+        j10, j11 = cy * i00 + dy * i10, cy * i01 + dy * i11
+        jd = j00 * j11 - j01 * j10
+        if abs(jd) < 1e-14:
+            continue
+        ku = math.hypot(j11 / jd, -j10 / jd)      # 3D length of one pixel step along U
+        kv = math.hypot(-j01 / jd, j00 / jd)      # ... along V
+        if ku > 1e-12 and kv > 1e-12:
+            su += ar / ku
+            sv += ar / kv
+            w += ar
+    if a3 <= 0 or a2 <= 0:
+        return None
+    return math.sqrt(a2 / a3), (su / w if w else 0.0), (sv / w if w else 0.0)
+
+
+def _selection_density(context, objs, tex):
+    """Texel density of the selected faces (all their UVs selected) before the transform, or
+    None (only loose vertices / edges selected)."""
+    ts = context.scene.tool_settings
+    sync = ts.use_uv_select_sync
+    face_mode = sync and ts.mesh_select_mode[2] and not ts.mesh_select_mode[0]
+    by_mesh = {me: bm for me, bm, _items in objs}
+    start = {}
+    for _me, _bm, items in objs:
+        for luv, u0, v0 in items:
+            start[id(luv)] = (u0, v0)
+    w, h = tex
+    tris = []
+    for obj in context.objects_in_mode_unique_data:
+        bm = by_mesh.get(obj.data)
+        if bm is None:
+            continue
+        uvl = bm.loops.layers.uv.active
+        mw = obj.matrix_world
+        for f in bm.faces:
+            if f.hide:
+                continue
+            if sync:
+                ok = f.select if face_mode else all(l.vert.select for l in f.loops)
+            else:
+                ok = f.select and all(l[uvl].select for l in f.loops)
+            if not ok:
+                continue
+            ls = f.loops
+            p = [tuple(mw @ l.vert.co) for l in ls]
+            q = []
+            for l in ls:
+                u, v = l[uvl].uv
+                q.append((u * w, v * h))
+            for k in range(1, len(ls) - 1):
+                tris.append(((p[0], p[k], p[k + 1]), (q[0], q[k], q[k + 1])))
+    return _texel_density(tris) if tris else None
 
 
 def _update_meshes(objs):
@@ -672,8 +769,8 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
     bl_idname = "uv.vertex_pivot_scale"
     bl_label = "Scale Around Nearest Vertex"
     bl_description = ("Scale the selected UVs from the UV vertex closest to the mouse. "
-                      "Type a value, hold Ctrl to snap to texture pixels, Shift for precision, "
-                      "X/Y to constrain")
+                      "Type a value, T then a number to reach that texel density (px/unit), "
+                      "hold Ctrl to snap to texture pixels, Shift for precision, X/Y to constrain")
     bl_options = {'REGISTER', 'UNDO'}
 
     value: FloatVectorProperty(name="Scale", size=2, default=(1.0, 1.0))
@@ -705,8 +802,15 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
         self.buf = ""
         self.neg = False
         self._measure_extent(context)
+        # texel density of the selection before scaling (T: scale to a typed density)
+        self.td_mode = False
+        try:
+            self.td0 = _selection_density(context, self.objs, _texture_px(context))
+        except Exception:
+            self.td0 = None
         snap_label = "snap 1 px" if self.tex_size else "snap 0.1"
         self.status_text = ("Scale  |  Mouse / type value: factor  |  "
+                            "T: type a texel density (px/unit)  |  "
                             f"Ctrl: {snap_label}  |  "
                             "Shift: precision  |  X/Y: constrain axis  |  "
                             "LMB/Enter: confirm  |  Esc/RMB: cancel")
@@ -785,6 +889,14 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
 
         if et in {'X', 'Y'}:
             self.constraint = None if self.constraint == et else et
+        elif et == 'T':
+            if self.td0 is None:
+                self.report({'WARNING'}, "Texel density needs whole faces selected")
+                return
+            # toggle: typed numbers are a texel density (px/unit) instead of a factor
+            self.td_mode = not self.td_mode
+            self.buf, self.neg = "", False
+            self.num_active = self.td_mode
         elif et in NUM_KEYS:
             ch = NUM_KEYS[et]
             if ch == '.' and '.' in self.buf:
@@ -810,6 +922,15 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
         larger axis when unconstrained) always lands a whole number of pixels
         from the pivot. Without a texture it falls back to 0.1 / 0.01 steps.
         """
+        if self.td_mode:
+            try:
+                target = float(self.buf) if self.buf else 0.0
+            except ValueError:
+                target = 0.0
+            cur = self._td_axis()
+            if target <= 0 or not cur:
+                return 1.0, None
+            return target / cur, None
         if self.num_active:
             try:
                 f = float(self.buf) if self.buf else 1.0
@@ -824,6 +945,23 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
             inc = 0.01 if self.shift else 0.1
             return round(self.raw / inc) * inc, f"snap {inc:g}"
         return self.raw, None
+
+    def _td_axis(self):
+        """Density the typed value is compared with: along the constrained axis, else overall."""
+        if not self.td0:
+            return 0.0
+        td, tu, tv = self.td0
+        return tu if self.constraint == 'X' else tv if self.constraint == 'Y' else td
+
+    def _td_now(self, sxy):
+        """Texel density text for the header after scaling by sxy."""
+        if not self.td0:
+            return ""
+        td, tu, tv = self.td0
+        nu, nv = tu * abs(sxy[0]), tv * abs(sxy[1])
+        if abs(sxy[0] - sxy[1]) < 1e-9:
+            return f"   |  TD {td * abs(sxy[0]):.1f} px/unit"
+        return f"   |  TD {td * math.sqrt(abs(sxy[0] * sxy[1])):.1f} px/unit (X {nu:.1f}  Y {nv:.1f})"
 
     def _axes(self, f):
         if self.constraint == 'X':
@@ -840,12 +978,17 @@ class UV_OT_vertex_pivot_scale(_PivotTransform, bpy.types.Operator):
             self._applied = sxy
 
         label = "Scale" if self.constraint is None else f"Scale {self.constraint}"
-        if self.num_active:
+        if self.td_mode:
+            text = (f"{label} to texel density: {self.buf}_ px/unit   "
+                    f"(now {self._td_axis():.1f}, factor {f:.4f})")
+        elif self.num_active:
             text = f"{label}: " + ("-" if self.neg else "") + self.buf + "_"
         else:
             text = f"{label}: {f:.4f}"
         if inc is not None:
             text += f"   ({inc})"
+        if not self.td_mode:
+            text += self._td_now(sxy)
         self.area.header_text_set(text)
         self.area.tag_redraw()
 
