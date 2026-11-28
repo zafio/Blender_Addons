@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 22),
+    "version": (0, 9, 23),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -4379,6 +4379,12 @@ if bpy is not None:
                 ('LEARNED', "Learned", "Seams predicted by a model trained on hand-unwrapped characters"),
                 ('RULES', "Rules", "Crease angles per object type (hard-surface / organic / tube)")],
             default='MINE')
+        ui_auto: BoolProperty(name="Auto Unwrap", default=True, description="Show or hide this section")
+        ui_texture: BoolProperty(name="Texture", default=True, description="Show or hide this section")
+        ui_density: BoolProperty(name="Density", default=True, description="Show or hide this section")
+        ui_island: BoolProperty(name="Island Density", default=True, description="Show or hide this section")
+        ui_shape: BoolProperty(name="Shape", default=True, description="Show or hide this section")
+        ui_packing: BoolProperty(name="Packing", default=True, description="Show or hide this section")
         last_density: FloatProperty(
             name="Last Base Density", default=0.0, options={'HIDDEN'},
             description="Body px/unit of the last Pixel Perfect run (shown next to the multipliers)")
@@ -5436,109 +5442,119 @@ if bpy is not None:
             return "x%.2f" % f[sl]
         return "global"
 
+    def section(layout, s, key, title, icon):
+        """A collapsible box: arrow + title header; returns the box when open, else None."""
+        box = layout.box()
+        row = box.row(align=True)
+        is_open = getattr(s, key, True)
+        row.prop(s, key, text="", icon='TRIA_DOWN' if is_open else 'TRIA_RIGHT', emboss=False)
+        row.label(text=title, icon=icon)
+        section.last = box       # the box itself, open or not (for an always-visible button)
+        return box if is_open else None
+
     def draw_panel(layout, context):
         s = context.scene.pixel_uv
         W, H, img = texture_size(context, s)
 
-        box = layout.box()
-        box.label(text="Auto Unwrap", icon='MOD_UVPROJECT')
-        col = box.column()
+        box = section(layout, s, "ui_auto", "Auto Unwrap", 'MOD_UVPROJECT')
+        col = section.last.column()   # the main button stays visible when collapsed
         col.scale_y = 1.4
         col.operator("uv.pixel_auto_unwrap", icon='OUTLINER_OB_ARMATURE')
-        row = box.row(align=True)
-        row.prop(s, "seam_method", expand=True)
-        if s.seam_method != 'MINE':
-            box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
-            box.prop(s, "keep_seams")
-        box.prop(s, "unwrap_preset")
-        if s.unwrap_preset:
-            # absolute px/unit next to each multiplier: base x multiplier (Fixed: the typed value;
-            # otherwise the body density of the last Pixel Perfect run)
-            base = s.density if s.density_mode == 'FIXED' else s.last_density
-            def lab(name, v):
-                # the field already shows the multiplier ("Head (195 px/u): 2.400")
-                return "%s (%.0f px/u)" % (name, base * v) if base > 0 else name
-            if base > 0:
-                src = "Fixed" if s.density_mode == 'FIXED' else ("last run" + (", " + s.last_size if s.last_size else ""))
-                box.label(text="Body %.1f px/unit (%s)" % (base, src))
-            col = box.column(align=True)
-            col.prop(s, "preset_head", text=lab("Head", s.preset_head))
-            col.prop(s, "preset_hands", text=lab("Hands", s.preset_hands))
-            col.prop(s, "preset_legs", text=lab("Legs", s.preset_legs))
-            col.prop(s, "preset_props", text=lab("Props", s.preset_props))
-            box.operator("uv.pixel_preset_from_mesh", icon='EYEDROPPER')
+        if box:
             row = box.row(align=True)
-            row.operator_menu_enum("uv.pixel_select_part", "part", text="Select Part", icon='RESTRICT_SELECT_OFF')
-            row.operator_menu_enum("uv.pixel_assign_part", "part", text="Assign Part", icon='GROUP_VERTEX')
-        obj = context.edit_object
-        if obj is not None:
-            box.prop(obj, "pixuv_seam_type", text=obj.name[:18])
+            row.prop(s, "seam_method", expand=True)
+            if s.seam_method != 'MINE':
+                box.operator("uv.pixel_auto_seams", icon='MOD_EDGESPLIT')
+                box.prop(s, "keep_seams")
+            box.prop(s, "unwrap_preset")
+            if s.unwrap_preset:
+                # absolute px/unit next to each multiplier: base x multiplier (Fixed: the typed value;
+                # otherwise the body density of the last Pixel Perfect run)
+                base = s.density if s.density_mode == 'FIXED' else s.last_density
+                def lab(name, v):
+                    # the field already shows the multiplier ("Head (195 px/u): 2.400")
+                    return "%s (%.0f px/u)" % (name, base * v) if base > 0 else name
+                if base > 0:
+                    src = "Fixed" if s.density_mode == 'FIXED' else ("last run" + (", " + s.last_size if s.last_size else ""))
+                    box.label(text="Body %.1f px/unit (%s)" % (base, src))
+                col = box.column(align=True)
+                col.prop(s, "preset_head", text=lab("Head", s.preset_head))
+                col.prop(s, "preset_hands", text=lab("Hands", s.preset_hands))
+                col.prop(s, "preset_legs", text=lab("Legs", s.preset_legs))
+                col.prop(s, "preset_props", text=lab("Props", s.preset_props))
+                box.operator("uv.pixel_preset_from_mesh", icon='EYEDROPPER')
+                row = box.row(align=True)
+                row.operator_menu_enum("uv.pixel_select_part", "part", text="Select Part", icon='RESTRICT_SELECT_OFF')
+                row.operator_menu_enum("uv.pixel_assign_part", "part", text="Assign Part", icon='GROUP_VERTEX')
+            obj = context.edit_object
+            if obj is not None:
+                box.prop(obj, "pixuv_seam_type", text=obj.name[:18])
 
-        box = layout.box()
-        box.label(text="Texture", icon='IMAGE_DATA')
-        box.prop(s, "tex_source", text="")
-        if s.tex_source == 'CUSTOM' or img is None:
+        box = section(layout, s, "ui_texture", "Texture", 'IMAGE_DATA')
+        if box:
+            box.prop(s, "tex_source", text="")
+            if s.tex_source == 'CUSTOM' or img is None:
+                row = box.row(align=True)
+                row.prop(s, "tex_width")
+                row.prop(s, "tex_height")
+            box.label(text="%s: %d x %d" % (img or "Custom", W, H))
             row = box.row(align=True)
-            row.prop(s, "tex_width")
-            row.prop(s, "tex_height")
-        box.label(text="%s: %d x %d" % (img or "Custom", W, H))
-        row = box.row(align=True)
-        row.operator("uv.pixel_resize_texture", icon='FULLSCREEN_ENTER')
-        row.operator("uv.pixel_restore_texture", text="", icon='LOOP_BACK')
+            row.operator("uv.pixel_resize_texture", icon='FULLSCREEN_ENTER')
+            row.operator("uv.pixel_restore_texture", text="", icon='LOOP_BACK')
 
-        box = layout.box()
-        box.label(text="Density", icon='MOD_UVPROJECT')
-        box.prop(s, "density_mode", text="")
-        row = box.row(align=True)
-        sub = row.row(align=True)
-        sub.enabled = s.density_mode == 'FIXED'
-        sub.prop(s, "density")
-        row.operator("uv.pixel_density_from_selection", text="", icon='EYEDROPPER')
-        box.prop(s, "show_td")
+        box = section(layout, s, "ui_density", "Density", 'MOD_UVPROJECT')
+        if box:
+            box.prop(s, "density_mode", text="")
+            row = box.row(align=True)
+            sub = row.row(align=True)
+            sub.enabled = s.density_mode == 'FIXED'
+            sub.prop(s, "density")
+            row.operator("uv.pixel_density_from_selection", text="", icon='EYEDROPPER')
+            box.prop(s, "show_td")
 
-        box = layout.box()
-        box.label(text="Island Density", icon='FACESEL')
-        box.prop(s, "island_mode", text="")
-        row = box.row(align=True)
-        row.prop(s, "island_value")
-        row = box.row(align=True)
-        row.operator("uv.pixel_island_density", text="Set")
-        row.operator("uv.pixel_island_density", text="Clear").clear = True
-        row.operator("uv.pixel_select_custom_density", text="", icon='RESTRICT_SELECT_OFF')
-        box.operator("uv.pixel_character_density", icon='ARMATURE_DATA')
-        cur = active_face_density(context)
-        if cur:
-            box.label(text="Active face: " + cur)
+        box = section(layout, s, "ui_island", "Island Density", 'FACESEL')
+        if box:
+            box.prop(s, "island_mode", text="")
+            row = box.row(align=True)
+            row.prop(s, "island_value")
+            row = box.row(align=True)
+            row.operator("uv.pixel_island_density", text="Set")
+            row.operator("uv.pixel_island_density", text="Clear").clear = True
+            row.operator("uv.pixel_select_custom_density", text="", icon='RESTRICT_SELECT_OFF')
+            box.operator("uv.pixel_character_density", icon='ARMATURE_DATA')
+            cur = active_face_density(context)
+            if cur:
+                box.label(text="Active face: " + cur)
 
-        box = layout.box()
-        box.label(text="Shape", icon='MESH_GRID')
-        box.prop(s, "straighten")
-        sub = box.column()
-        sub.enabled = s.straighten
-        sub.prop(s, "max_distortion")
-        box.prop(s, "align")
-        box.prop(s, "orient")
-        box.row().prop(s, "snap_mode", expand=True)
-        row = box.row(align=True)
-        row.prop(s, "keep_density")
-        sub = row.row(align=True)
-        sub.enabled = s.keep_density
-        sub.prop(s, "density_tolerance", text="")
+        box = section(layout, s, "ui_shape", "Shape", 'MESH_GRID')
+        if box:
+            box.prop(s, "straighten")
+            sub = box.column()
+            sub.enabled = s.straighten
+            sub.prop(s, "max_distortion")
+            box.prop(s, "align")
+            box.prop(s, "orient")
+            box.row().prop(s, "snap_mode", expand=True)
+            row = box.row(align=True)
+            row.prop(s, "keep_density")
+            sub = row.row(align=True)
+            sub.enabled = s.keep_density
+            sub.prop(s, "density_tolerance", text="")
 
-        box = layout.box()
-        box.label(text="Packing", icon='PACKAGE')
-        box.prop(s, "pack")
-        sub = box.column()
-        sub.enabled = s.pack
-        sub.prop(s, "padding")
-        sub.prop(s, "pack_shapes")
-        sub.prop(s, "allow_rotate")
-        box.prop(s, "stack_mirrored")
-        box.prop(s, "preserve_texture")
-        if s.preserve_texture:
-            box.label(text="Pack, Move, Fill, Pivot Rotate / Mirror", icon='INFO')
-        if context.space_data and context.space_data.type == 'IMAGE_EDITOR':
-            box.operator("uv.pixel_move", text="Move Islands (Alt+G)", icon='VIEW_PAN')
+        box = section(layout, s, "ui_packing", "Packing", 'PACKAGE')
+        if box:
+            box.prop(s, "pack")
+            sub = box.column()
+            sub.enabled = s.pack
+            sub.prop(s, "padding")
+            sub.prop(s, "pack_shapes")
+            sub.prop(s, "allow_rotate")
+            box.prop(s, "stack_mirrored")
+            box.prop(s, "preserve_texture")
+            if s.preserve_texture:
+                box.label(text="Pack, Move, Fill, Pivot Rotate / Mirror", icon='INFO')
+            if context.space_data and context.space_data.type == 'IMAGE_EDITOR':
+                box.operator("uv.pixel_move", text="Move Islands (Alt+G)", icon='VIEW_PAN')
 
         col = layout.column()
         col.scale_y = 1.4
