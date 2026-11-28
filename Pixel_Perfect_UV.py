@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 18),
+    "version": (0, 9, 19),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -40,6 +40,8 @@ except ImportError:  # allows the core to be tested outside Blender
 
 DENSITY_ATTR = "pixuv_density"   # face float: fixed px/unit for the island (0 = use global)
 SCALE_ATTR = "pixuv_scale"       # face float: multiplier on the global density (0/1 = none)
+PART_ATTR = "pixuv_part"         # face int: body part set by hand (0 = automatic, see PART_NAMES)
+PART_NAMES = ("auto", "head", "hands", "body", "legs", "props")
 
 EPS = 1e-6
 PIXEL_UV_TEXTURE_API = None  # set while the add-on is enabled (see TextureSession)
@@ -626,7 +628,7 @@ def _fit_grid(sub, back, lay, anchors, aim=None):
     return {back[i]: p for i, p in enumerate(best[1])}
 
 
-def mixed_grid(isl, max_distortion, skip=(), parallel=True, extended=True):
+def mixed_grid(isl, max_distortion, skip=(), parallel=True, extended=True, up=None):
     """For a quad + non-quad island: straight layouts of its quad groups (every finger of a hand,
     not only the biggest group), each turned to the way it lies now and kept attached where it
     joins the rest. skip: indices of quad groups to leave out. Returns {island_vertex: (x, y)}
@@ -644,13 +646,17 @@ def mixed_grid(isl, max_distortion, skip=(), parallel=True, extended=True):
         return None
     lay = lattice_layout(sub)
     if lay is None and extended:
-        # the group has a pole: its biggest clean grid instead of nothing
+        # the group has a pole: its biggest clean grid instead of nothing - if that grid runs
+        # along the body (a grid running diagonally would leave the island tilted)
         part, pb = grid_part(sub)
         if part is not None and len(part.faces) >= 2:
-            sub, back = part, [back[i] for i in pb]
-            lay = lattice_layout(sub)
+            play = lattice_layout(part)
+            if play is not None and (up is None or _grid_along(part, play, up)):
+                sub, back, lay = part, [back[i] for i in pb], play
     if lay is None or distortion(sub, lay) > max_distortion:
         return None
+    if up is not None and not _grid_along(sub, lay, up):
+        return None              # a grid across the body would tilt the whole island
     k = math.sqrt(abs_area(sub, sub.uv) / max(abs_area(sub, lay), EPS))
     co = _centroid(sub.uv)
     pins = {back[i]: (x * k + co[0], y * k + co[1]) for i, (x, y) in enumerate(lay)}
@@ -689,6 +695,24 @@ def mixed_grid(isl, max_distortion, skip=(), parallel=True, extended=True):
                         continue  # can't join the grid without bending it
                 pins.update({v: p for v, p in placed.items() if v not in pins})
     return pins
+
+
+def _grid_along(sub, lay, up, max_deg=20.0):
+    """True if a straight grid layout has the model's up within max_deg of one of its axes."""
+    got = dir_in_uv(sub, lay, up)
+    if not got or got[2] <= 0 or math.hypot(got[0], got[1]) < 0.3 * got[2]:
+        return True              # no clear up (lying flat): nothing to tilt
+    ang = math.degrees(math.atan2(got[1], got[0])) % 90.0
+    return min(ang, 90.0 - ang) <= max_deg
+
+
+def _tilt(isl, lay, up):
+    """Degrees between the model's up in a layout and the nearest pixel axis (0 when unclear)."""
+    got = dir_in_uv(isl, lay, up)
+    if not got or got[2] <= 0 or math.hypot(got[0], got[1]) < 0.3 * got[2]:
+        return 0.0
+    ang = math.degrees(math.atan2(got[1], got[0])) % 90.0
+    return min(ang, 90.0 - ang)
 
 
 def _finger_strips(isl):
@@ -1521,6 +1545,9 @@ def build_layouts(islands, opt):
                     if turned is None and not is_grid(isl, lay):
                         turned = orient_exact(isl, lay, opt.up, opt.front)
                 lay = turned if turned is not None else orient_layout(isl, lay, opt.up, opt.front)
+                if isl.keep_rot and _tilt(isl, lay, opt.up) > 20.0:
+                    # a straightened island still standing crooked: upright wins
+                    lay = orient_exact(isl, lay, opt.up, opt.front) or lay
             if getattr(opt, "straighten_lines", False) and opt.straighten:
                 lined = straighten_lines(isl, lay, opt.max_distortion, rotate=not isl.keep_rot)
                 if lined is not None:
@@ -1607,8 +1634,11 @@ def _try_pack(islands, base, W, H, opt, shapes=None):
             sizes.append((1, 1))
             continue
         loc, w, h = _local(_place(isl, base, opt.snap, opt.snap_mode, _keep(opt)))
-        locs.append(loc)
-        sizes.append((max(1, math.ceil(w - 1e-9)), max(1, math.ceil(h - 1e-9))))
+        hc = max(1, math.ceil(h - 1e-9))
+        # packed upside down and turned back afterwards (see run): the packers fill from the
+        # bottom left, so the islands end up in the top left corner, free space below / right
+        locs.append([(px, hc - py) for px, py in loc])
+        sizes.append((max(1, math.ceil(w - 1e-9)), hc))
     if not shapes:
         return pack_rects(sizes, W, H, opt.padding, opt.allow_rotate), locs, sizes
     import numpy as np
@@ -1677,7 +1707,7 @@ def run(islands, W, H, opt):
         for isl, loc, (w, h), (x, y, rot) in zip(active, locs, sizes, res):
             if rot:
                 loc = _rot90(loc, h)
-            isl.new = [(px + x, py + y) for px, py in loc]
+            isl.new = [(px + x, H - (py + y)) for px, py in loc]   # back upright, top left
     else:
         for isl in active:
             if isl.kind == "pixel":
@@ -1848,6 +1878,7 @@ def run_pack_only(islands, W, H, opt, keep_overlaps=True):
         return "Islands don't fit in %d x %d at their current size" % (W, H), None, masks
     moves = []
     for g, (mx, my), (w, h), (x, y, rot) in zip(groups, boxes, sizes, res):
+        y = H - y - (w if rot else h)      # top left corner first (boxes: no mirroring needed)
         for k in g:
             loc = [(px - mx, py - my) for px, py in islands[k].uv]
             if rot:
@@ -3810,6 +3841,8 @@ if bpy is not None:
         sl = fl.get(SCALE_ATTR)
         if sl is None:
             fl.new(SCALE_ATTR)
+        if bm.faces.layers.int.get(PART_ATTR) is None:
+            bm.faces.layers.int.new(PART_ATTR)
         return fl.get(DENSITY_ATTR), fl.get(SCALE_ATTR)
 
     def find_image(context):
@@ -3911,7 +3944,7 @@ if bpy is not None:
         objs, recs = collect(context, W, H)
         todo = []
         for isl in find_islands(recs):
-            g = mixed_grid(isl, opt.max_distortion)
+            g = mixed_grid(isl, opt.max_distortion, up=opt.up)
             if g:
                 todo.append((isl, g))
         done = set()
@@ -3958,10 +3991,10 @@ if bpy is not None:
             if not ok:
                 # fingers each straight along their own nearest axis, then without the one finger
                 # that can't be straightened without folding the rest
-                tries = [mixed_grid(isl, opt.max_distortion, parallel=False),
-                         mixed_grid(isl, opt.max_distortion, extended=False)]   # as in 0.9.13
+                tries = [mixed_grid(isl, opt.max_distortion, parallel=False, up=opt.up),
+                         mixed_grid(isl, opt.max_distortion, extended=False, up=opt.up)]   # as in 0.9.13
                 n = len(_quad_groups(isl))
-                tries += [mixed_grid(isl, opt.max_distortion, skip={k}, parallel=p)
+                tries += [mixed_grid(isl, opt.max_distortion, skip={k}, parallel=p, up=opt.up)
                           for p in (True, False) for k in range(n)]
                 seen = [g]
                 for g2 in tries:
@@ -4850,61 +4883,13 @@ if bpy is not None:
             return context.mode == 'EDIT_MESH'
 
         def execute(self, context):
-            objs = edit_objects(context)
-            data = []
-            zs, xs = [], []
-            kinds = object_types(context)
-            for o in objs:
-                bm = edit_bm(o.data)
-                face_layers(bm)  # before taking face references
-                mw = o.matrix_world
-                cents = []
-                for f in bm.faces:
-                    c = mw @ f.calc_center_median()
-                    cents.append((f, c))
-                    zs.append(c.z)
-                data.append((o, bm, cents))
-            if not zs:
+            data = classify_parts(context, self.head_from, self.legs_to, self.hands_from,
+                                  self.uniform_islands)
+            if not data:
                 return {'CANCELLED'}
-            # sideways distances from the body's own mirror plane (it may not be at X = 0)
-            body = max((d for d in data if kinds.get(d[0].name) != 'HARD'), key=lambda d: len(d[2]),
-                       default=None)
-            off = symmetry_offset([(c.x, c.y, c.z) for _, c in body[2]], 0) if body else 0.0
-            xs = [abs(c.x - off) for _, _, cents in data for _, c in cents]
-            z0, z1 = min(zs), max(zs)
-            hx = max(xs) or 1.0
             counts = {"head": 0, "hands": 0, "body": 0, "legs": 0, "props": 0}
-            for o, bm, cents in data:
+            for o, bm, cents, parts in data:
                 dl, sl = face_layers(bm)
-                is_prop = kinds.get(o.name) == 'HARD'
-                parts = []
-                for f, c in cents:
-                    t = (c.z - z0) / (z1 - z0) if z1 > z0 else 0.5
-                    if is_prop:
-                        part = "props"
-                    elif t >= self.head_from:
-                        part = "head"
-                    elif t < self.legs_to:
-                        part = "legs"
-                    elif abs(c.x - off) / hx >= self.hands_from:
-                        part = "hands"
-                    else:
-                        part = "body"
-                    parts.append(part)
-                if self.uniform_islands and not is_prop:
-                    # one part per seam island, the same front and back (neck, arms, legs)
-                    mw = o.matrix_world
-                    nm = mw.to_3x3()
-                    fidx = {f.index: i for i, (f, _) in enumerate(cents)}
-                    links = []
-                    for e in bm.edges:
-                        lf = e.link_faces
-                        if len(lf) == 2 and lf[0].index in fidx and lf[1].index in fidx:
-                            links.append((fidx[lf[0].index], fidx[lf[1].index], e.seam))
-                    parts = harmonize_parts(
-                        parts, [(c.x, c.y, c.z) for _, c in cents],
-                        [tuple((nm @ f.normal).normalized()) for f, _ in cents],
-                        [f.calc_area() for f, _ in cents], links)
                 for (f, c), part in zip(cents, parts):
                     if f[dl] > 0:
                         continue
@@ -4913,6 +4898,190 @@ if bpy is not None:
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
             self.report({'INFO'}, "Faces: head %(head)d, hands %(hands)d, body %(body)d, legs %(legs)d, "
                                   "props %(props)d" % counts)
+            return {'FINISHED'}
+
+    def classify_parts(context, head_from=0.78, legs_to=0.45, hands_from=0.6, uniform=True):
+        """Body part of every face of the edited objects: [(object, bmesh, [(face, world centre)],
+        [part name])]. By height and distance from the body's mirror plane, one part per seam
+        island (the same front and back) when uniform; parts set by hand (Assign Part) win."""
+        objs = edit_objects(context)
+        kinds = object_types(context)
+        data, zs = [], []
+        for o in objs:
+            bm = edit_bm(o.data)
+            face_layers(bm)  # before taking face references
+            mw = o.matrix_world
+            cents = []
+            for f in bm.faces:
+                c = mw @ f.calc_center_median()
+                cents.append((f, c))
+                zs.append(c.z)
+            data.append((o, bm, cents))
+        if not zs:
+            return []
+        # sideways distances from the body's own mirror plane (it may not be at X = 0)
+        body = max((d for d in data if kinds.get(d[0].name) != 'HARD'), key=lambda d: len(d[2]),
+                   default=None)
+        off = symmetry_offset([(c.x, c.y, c.z) for _, c in body[2]], 0) if body else 0.0
+        xs = [abs(c.x - off) for _, _, cents in data for _, c in cents]
+        z0, z1 = min(zs), max(zs)
+        hx = max(xs) or 1.0
+        out = []
+        for o, bm, cents in data:
+            is_prop = kinds.get(o.name) == 'HARD'
+            pl = bm.faces.layers.int.get(PART_ATTR)
+            parts = []
+            for f, c in cents:
+                t = (c.z - z0) / (z1 - z0) if z1 > z0 else 0.5
+                if is_prop:
+                    part = "props"
+                elif t >= head_from:
+                    part = "head"
+                elif t < legs_to:
+                    part = "legs"
+                elif abs(c.x - off) / hx >= hands_from:
+                    part = "hands"
+                else:
+                    part = "body"
+                parts.append(part)
+            if uniform and not is_prop:
+                # one part per seam island, the same front and back (neck, arms, legs)
+                nm = o.matrix_world.to_3x3()
+                fidx = {f.index: i for i, (f, _) in enumerate(cents)}
+                uvl = bm.loops.layers.uv.active
+                links = []
+                for e in bm.edges:
+                    lf = e.link_faces
+                    if len(lf) == 2 and lf[0].index in fidx and lf[1].index in fidx:
+                        # islands end at marked seams and where the UVs are already split
+                        links.append((fidx[lf[0].index], fidx[lf[1].index],
+                                      e.seam or (uvl is not None and _uv_split(e, lf, uvl))))
+                parts = harmonize_parts(
+                    parts, [(c.x, c.y, c.z) for _, c in cents],
+                    [tuple((nm @ f.normal).normalized()) for f, _ in cents],
+                    [f.calc_area() for f, _ in cents], links)
+            if pl is not None:
+                for i, (f, _) in enumerate(cents):
+                    v = f[pl]
+                    if 0 < v < len(PART_NAMES):
+                        parts[i] = PART_NAMES[v]     # set by hand
+            out.append((o, bm, cents, parts))
+        return out
+
+    def _uv_split(e, lf, uvl, tol=1e-6):
+        """True if the two faces of an edge don't share its UVs (an island border in the UVs)."""
+        def uvs(f):
+            return {l.vert: tuple(l[uvl].uv) for l in f.loops}
+        a, b = uvs(lf[0]), uvs(lf[1])
+        for v in e.verts:
+            p, q = a.get(v), b.get(v)
+            if p is None or q is None or abs(p[0] - q[0]) > tol or abs(p[1] - q[1]) > tol:
+                return True
+        return False
+
+    PART_ITEMS = [('HEAD', "Head", ""), ('HANDS', "Hands", ""), ('BODY', "Body / Arms", ""),
+                  ('LEGS', "Legs / Feet", ""), ('PROPS', "Props", ""),
+                  ('AUTO', "Automatic", "Back to the automatic part (by height / distance)")]
+
+    class UV_OT_pixel_select_part(bpy.types.Operator):
+        bl_idname = "uv.pixel_select_part"
+        bl_label = "Select Part"
+        bl_description = ("Select the faces that count as this body part for the Character Density "
+                          "Preset (automatic parts plus the ones set by hand)")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        part: EnumProperty(name="Part", items=PART_ITEMS[:5])
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            want = self.part.lower()
+            n = 0
+            for o, bm, cents, parts in classify_parts(context):
+                for (f, _), part in zip(cents, parts):
+                    on = part == want and not f.hide
+                    f.select_set(on)
+                    n += on
+                bm.select_flush_mode()
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            self.report({'INFO'}, "%d faces: %s" % (n, self.part.lower()))
+            return {'FINISHED'}
+
+    class UV_OT_pixel_assign_part(bpy.types.Operator):
+        bl_idname = "uv.pixel_assign_part"
+        bl_label = "Assign Part"
+        bl_description = ("Set the body part of the selected faces by hand (the Character Density "
+                          "Preset uses it instead of the automatic one); Automatic undoes it")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        part: EnumProperty(name="Part", items=PART_ITEMS)
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            val = 0 if self.part == 'AUTO' else PART_NAMES.index(self.part.lower())
+            n = 0
+            for o in edit_objects(context):
+                bm = edit_bm(o.data)
+                face_layers(bm)  # before taking face references
+                pl = bm.faces.layers.int.get(PART_ATTR)
+                uvl = bm.loops.layers.uv.verify()
+                for f in bm.faces:
+                    if is_face_selected(context, f, uvl):
+                        f[pl] = val
+                        n += 1
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            if not n:
+                self.report({'WARNING'}, "Select the faces first")
+                return {'CANCELLED'}
+            self.report({'INFO'}, "%d faces set to %s (run the Density Preset or Auto Unwrap to apply)"
+                        % (n, self.part.lower()))
+            return {'FINISHED'}
+
+    class UV_OT_pixel_preset_from_mesh(bpy.types.Operator):
+        bl_idname = "uv.pixel_preset_from_mesh"
+        bl_label = "Get from Mesh"
+        bl_description = ("Read the Head / Hands / Legs / Props multipliers from the edited objects' "
+                          "current UVs (a character you unwrapped by hand): each part's px/unit "
+                          "divided by the body's")
+        bl_options = {'REGISTER', 'UNDO'}
+
+        @classmethod
+        def poll(cls, context):
+            return context.mode == 'EDIT_MESH'
+
+        def execute(self, context):
+            s = context.scene.pixel_uv
+            W, H, _ = texture_size(context, s)
+            a3 = defaultdict(float)
+            a2 = defaultdict(float)
+            for o, bm, cents, parts in classify_parts(context):
+                mw = o.matrix_world
+                uvl = bm.loops.layers.uv.verify()
+                for (f, _), part in zip(cents, parts):
+                    if f.hide:
+                        continue
+                    p3 = [tuple(mw @ l.vert.co) for l in f.loops]
+                    uv = [(l[uvl].uv.x * W, l[uvl].uv.y * H) for l in f.loops]
+                    a3[part] += area3d(p3)
+                    a2[part] += abs(signed_area2d(uv))
+            dens = {p: math.sqrt(a2[p] / a3[p]) for p in a3 if a3[p] > EPS and a2[p] > EPS}
+            if "body" not in dens:
+                self.report({'WARNING'}, "No unwrapped body faces to compare with")
+                return {'CANCELLED'}
+            got = []
+            for p in ("head", "hands", "legs", "props"):
+                if p in dens:
+                    v = round(dens[p] / dens["body"], 2)
+                    setattr(s, "preset_" + p, v)
+                    got.append("%s x%.2f" % (p, v))
+                else:
+                    got.append("%s: none (kept)" % p)
+            self.report({'INFO'}, "Body %.1f px/unit at %d x %d; %s" % (dens["body"], W, H, ", ".join(got)))
             return {'FINISHED'}
 
     def is_face_selected(context, f, uvl):
@@ -5174,6 +5343,10 @@ if bpy is not None:
             row = box.row(align=True)
             row.prop(s, "preset_legs")
             row.prop(s, "preset_props")
+            box.operator("uv.pixel_preset_from_mesh", icon='EYEDROPPER')
+            row = box.row(align=True)
+            row.operator_menu_enum("uv.pixel_select_part", "part", text="Select Part", icon='RESTRICT_SELECT_OFF')
+            row.operator_menu_enum("uv.pixel_assign_part", "part", text="Assign Part", icon='GROUP_VERTEX')
         obj = context.edit_object
         if obj is not None:
             box.prop(obj, "pixuv_seam_type", text=obj.name[:18])
@@ -5294,6 +5467,9 @@ if bpy is not None:
         UV_OT_pixel_restore_texture,
         UV_OT_pixel_move,
         UV_OT_pixel_character_density,
+        UV_OT_pixel_select_part,
+        UV_OT_pixel_assign_part,
+        UV_OT_pixel_preset_from_mesh,
         UV_OT_pixel_fill,
         UV_OT_pixel_auto_seams,
         UV_OT_pixel_auto_unwrap,

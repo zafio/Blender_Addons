@@ -61,6 +61,9 @@ Lays UV islands out on the texture's pixel grid for low poly / pixel art charact
 - Density: Fit Texture (biggest density that fits), Fixed px/unit (eyedropper reads it from the selection) or Current Average
 - Stack Mirrored L/R: islands that mirror each other across the object's X axis share the same pixels (the +X side is laid out, the -X one is stacked on it). Also as its own button. Islands folded onto themselves (left half over the right) are kept as they are
 - Character Density Preset: head x2.4 (ends up about x2 the body, like the sample unwraps), hands x1.3, legs x0.8 by height / distance from the centre, hard-surface props x1.5; values in the Auto Unwrap box. Each island takes the multiplier of the part covering most of it, and islands that are the front and back of the same neck, arm or leg share one (Same Front and Back, on by default), so the density matches all round
+- Get from Mesh: reads the Head / Hands / Legs / Props multipliers from a character you unwrapped by hand (each part's px/unit divided by the body's)
+- Select Part / Assign Part: see which faces count as head, hands, body, legs or props, and set them by hand (Automatic undoes it); an island still takes the multiplier covering most of its area
+- Packing fills the texture from the top left corner; islands stay upright (straightened islands whose grid runs across the body are turned upright too)
 - Single Pixel Fill: maps the selected faces onto one free pixel; with Preserve Texture it keeps their average colour
 - Island Density: give the selected faces' islands their own fixed px/unit or a multiplier (e.g. x2 for the face). Stored on the mesh, so it's kept every time you re-run
 - Straight rows and columns always snap to whole pixels and never collapse below 1 px
