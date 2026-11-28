@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 27),
+    "version": (0, 9, 28),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -5125,9 +5125,15 @@ if bpy is not None:
             want = self.part.lower()
             n = 0
             for o, bm, cents, parts in classify_parts(context):
+                uvl = bm.loops.layers.uv.active
                 for (f, _), part in zip(cents, parts):
                     on = part == want and not f.hide
                     f.select_set(on)
+                    if uvl is not None:      # the UV Editor (sync off) shows / uses the UV selection
+                        for l in f.loops:
+                            l[uvl].select = on
+                            if hasattr(l[uvl], "select_edge"):
+                                l[uvl].select_edge = on
                     n += on
                 bm.select_flush_mode()
                 bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
@@ -5150,6 +5156,7 @@ if bpy is not None:
         def execute(self, context):
             val = 0 if self.part == 'AUTO' else PART_NAMES.index(self.part.lower())
             n = 0
+            changed = {}
             for o in edit_objects(context):
                 bm = edit_bm(o.data)
                 face_layers(bm)  # before taking face references
@@ -5157,14 +5164,29 @@ if bpy is not None:
                 uvl = bm.loops.layers.uv.verify()
                 for f in bm.faces:
                     if is_face_selected(context, f, uvl):
-                        f[pl] = val
+                        f[pl] = val          # replaces any earlier assignment
+                        changed.setdefault(o.name, set()).add(f.index)
                         n += 1
-                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
             if not n:
                 self.report({'WARNING'}, "Select the faces first")
                 return {'CANCELLED'}
-            self.report({'INFO'}, "%d faces set to %s (run the Density Preset or Auto Unwrap to apply)"
-                        % (n, self.part.lower()))
+            # the new part's multiplier right away (the old part's one would stay until the
+            # Density Preset ran again)
+            s = context.scene.pixel_uv
+            mult = dict(CHARACTER_PRESET, head=s.preset_head, hands=s.preset_hands,
+                        legs=s.preset_legs, props=s.preset_props)
+            got = defaultdict(int)
+            for o, bm, cents, parts in classify_parts(context):
+                dl, sl = face_layers(bm)
+                idx = changed.get(o.name, ())
+                for (f, _), part in zip(cents, parts):
+                    if f.index in idx:
+                        if f[dl] <= 0:       # faces with a fixed px/unit keep it
+                            f[sl] = mult[part]
+                        got[part] += 1
+                bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
+            self.report({'INFO'}, "%d faces now %s (Pixel Perfect / Pack uses it)" % (
+                n, ", ".join("%s x%.2f: %d" % (p, mult[p], k) for p, k in sorted(got.items()))))
             return {'FINISHED'}
 
     class UV_OT_pixel_preset_from_mesh(bpy.types.Operator):
