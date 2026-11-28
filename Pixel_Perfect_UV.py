@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 19),
+    "version": (0, 9, 20),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -1518,6 +1518,49 @@ def straighten_lines(isl, lay, max_distortion, min_ratio=2.0, cos_lim=0.85, rota
     if d1 > max(max_distortion, d0 + 0.02):
         return None
     return new
+
+
+def texel_density(tris):
+    """Texel density of a set of triangles [(3D p0, p1, p2), (uv px q0, q1, q2)]: (overall px/unit
+    from areas, px/unit along U, px/unit along V), 3D-area weighted. None if nothing has area."""
+    a3 = a2 = 0.0
+    su = sv = w = 0.0
+    for (p0, p1, p2), (q0, q1, q2) in tris:
+        e1, e2 = _sub(p1, p0), _sub(p2, p0)
+        l1 = math.sqrt(_dot3(e1, e1))
+        n = _cross3(e1, e2)
+        ar = math.sqrt(_dot3(n, n)) / 2.0
+        if l1 < 1e-12 or ar < 1e-14:
+            continue
+        x = _mul(e1, 1.0 / l1)
+        y = _normalize(_cross3(_normalize(n), x))
+        # local 2D of the triangle (columns a, b) and its UV edges (columns c, d)
+        ax, ay, bx, by = l1, 0.0, _dot3(e2, x), _dot3(e2, y)
+        cx, cy = q1[0] - q0[0], q1[1] - q0[1]
+        dx, dy = q2[0] - q0[0], q2[1] - q0[1]
+        uv_area = abs(cx * dy - cy * dx) / 2.0
+        a3 += ar
+        a2 += uv_area
+        det = ax * by - ay * bx
+        if abs(det) < 1e-14:
+            continue
+        # J = UV * inverse(local): local 3D -> UV px
+        i00, i01, i10, i11 = by / det, -bx / det, -ay / det, ax / det
+        j00, j01 = cx * i00 + dx * i10, cx * i01 + dx * i11
+        j10, j11 = cy * i00 + dy * i10, cy * i01 + dy * i11
+        jd = j00 * j11 - j01 * j10
+        if abs(jd) < 1e-14:
+            continue
+        # one pixel step along U / V in 3D units: columns of J^-1
+        ku = math.hypot(j11 / jd, -j10 / jd)
+        kv = math.hypot(-j01 / jd, j00 / jd)
+        if ku > 1e-12 and kv > 1e-12:
+            su += ar / ku
+            sv += ar / kv
+            w += ar
+    if a3 <= 0 or a2 <= 0:
+        return None
+    return math.sqrt(a2 / a3), (su / w if w else 0.0), (sv / w if w else 0.0)
 
 
 def build_layouts(islands, opt):
@@ -4335,6 +4378,10 @@ if bpy is not None:
                 ('LEARNED', "Learned", "Seams predicted by a model trained on hand-unwrapped characters"),
                 ('RULES', "Rules", "Crease angles per object type (hard-surface / organic / tube)")],
             default='MINE')
+        show_td: BoolProperty(
+            name="Show Texel Density", default=True,
+            description="Show the texel density of the selected UVs in the UV Editor, live (it follows "
+                        "a scale while you drag)")
         keep_seams: BoolProperty(
             name="Keep My Seams", default=False,
             description="Keep the seams already marked (and build around them) instead of replacing them")
@@ -4666,6 +4713,53 @@ if bpy is not None:
         if context.tool_settings.use_uv_select_sync:
             return True
         return all(l[uvl].select for l in f.loops)
+
+    _TD_HANDLE = [None]
+
+    def _draw_texel_density():
+        """UV Editor overlay: texel density of the selected UVs, redrawn live (follows a scale
+        while you drag)."""
+        try:
+            context = bpy.context
+            s = getattr(context.scene, "pixel_uv", None)
+            if s is None or not s.show_td or context.mode != 'EDIT_MESH':
+                return
+            W, H, _ = texture_size(context, s)
+            tris = []
+            for o in edit_objects(context):
+                bm = edit_bm(o.data)
+                uvl = bm.loops.layers.uv.active
+                if uvl is None:
+                    continue
+                mw = o.matrix_world
+                for f in bm.faces:
+                    if not uv_selected(context, f, uvl):
+                        continue
+                    ls = f.loops
+                    p = [tuple(mw @ l.vert.co) for l in ls]
+                    q = [(l[uvl].uv.x * W, l[uvl].uv.y * H) for l in ls]
+                    for k in range(1, len(ls) - 1):
+                        tris.append(((p[0], p[k], p[k + 1]), (q[0], q[k], q[k + 1])))
+                    if len(tris) > 20000:
+                        break
+            got = texel_density(tris) if tris else None
+            if got is None:
+                return
+            td, tu, tv = got
+            import blf
+            font = 0
+            ui = context.preferences.view.ui_scale if context.preferences else 1.0
+            blf.size(font, 13 * ui)
+            txt = "Texel density: %.1f px/unit   (X %.1f  Y %.1f)   %d x %d" % (td, tu, tv, W, H)
+            x, y = 20 * ui, 24 * ui
+            blf.color(font, 0, 0, 0, 0.7)
+            blf.position(font, x + 1, y - 1, 0)
+            blf.draw(font, txt)
+            blf.color(font, 1, 1, 1, 0.95)
+            blf.position(font, x, y, 0)
+            blf.draw(font, txt)
+        except Exception:
+            pass                 # never break the UV Editor's drawing
 
     class UV_OT_pixel_move(bpy.types.Operator):
         bl_idname = "uv.pixel_move"
@@ -5371,6 +5465,7 @@ if bpy is not None:
         sub.enabled = s.density_mode == 'FIXED'
         sub.prop(s, "density")
         row.operator("uv.pixel_density_from_selection", text="", icon='EYEDROPPER')
+        box.prop(s, "show_td")
 
         box = layout.box()
         box.label(text="Island Density", icon='FACESEL')
@@ -5501,10 +5596,16 @@ if bpy is not None:
             description="How Auto Seams cuts this object")
         bpy.types.IMAGE_MT_uvs.append(menu_func)
         bpy.types.VIEW3D_MT_uv_map.append(menu_func)
+        if _TD_HANDLE[0] is None and hasattr(bpy.types, "SpaceImageEditor"):
+            _TD_HANDLE[0] = bpy.types.SpaceImageEditor.draw_handler_add(
+                _draw_texel_density, (), 'WINDOW', 'POST_PIXEL')
 
     def unregister():
         global PIXEL_UV_TEXTURE_API
         PIXEL_UV_TEXTURE_API = None
+        if _TD_HANDLE[0] is not None:
+            bpy.types.SpaceImageEditor.draw_handler_remove(_TD_HANDLE[0], 'WINDOW')
+            _TD_HANDLE[0] = None
         for lst, fn in _handlers():
             if fn in lst:
                 lst.remove(fn)
