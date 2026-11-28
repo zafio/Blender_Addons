@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Pixel Perfect UV",
     "author": "Zafio",
-    "version": (0, 9, 25),
+    "version": (0, 9, 26),
     "blender": (4, 5, 0),
     "location": "UV Editor / 3D View (Edit Mode) > Sidebar > Pixel UV, and the UV menus",
     "description": "Straightens, scales, snaps and packs UV islands onto the texture's pixel grid "
@@ -4776,7 +4776,11 @@ if bpy is not None:
                 if area is not None:
                     for r in area.regions:
                         if r.type == 'TOOLS' and r.width > 1:
-                            x = r.width + 4 * ui
+                            # only the part of the toolbar lying over the drawing area (none when
+                            # regions don't overlap: the area already starts after it)
+                            cover = (r.x + r.width) - region.x
+                            if 0 < cover < region.width:
+                                x = cover + 4 * ui
                         elif r.type == 'TOOL_HEADER' and r.height > 1 and r.y >= region.y + region.height - r.height - 1:
                             y = min(y, region.height - r.height - 12 * ui)
             blf.color(font, 0, 0, 0, 0.7)
